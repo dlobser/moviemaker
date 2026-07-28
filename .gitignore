@@ -1,7 +1,5 @@
 node_modules/
 config.json
-frontend/node_modules/
-frontend/dist/
 .env
 *.log
 .claude/

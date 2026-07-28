@@ -8,7 +8,9 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# dist/ is intentionally committed so GitHub Pages has something to serve.
+# Remove this exception if you switch to the build-on-push workflow in
+# .github/workflows/deploy.yml, which publishes dist without committing it.
 dist-ssr
 *.local
 
