@@ -59,8 +59,10 @@ import {
   normalizeTag
 } from './promptTags.js';
 import { buildLlmImportPrompt, normalizeImportedShotList } from './shotListImport.js';
+import { apiFetch, resolveAssetUrl, detectMode, isStatic } from './client.js';
+import { AssetImage, AssetVideo, useAssetUrl } from './AssetMedia.jsx';
+import * as projectFs from './static/fileSystem.js';
 
-const API_BASE = 'http://localhost:3001';
 
 const DEFAULT_IMAGE_SYSTEM_PROMPT = "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual description optimized for AI generation (like Flux/Midjourney or Kling). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.";
 const DEFAULT_VIDEO_SYSTEM_PROMPT = "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual video description optimized for AI generation (like Kling, Runway, or Veo). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.";
@@ -154,6 +156,8 @@ export default function App() {
   // --- PROJECTS (one folder per project) ---
   const [project, setProject] = useState({ path: null, name: 'Loading…', workingFolder: '', isLegacy: true, recent: [] });
   const [newProjectDraft, setNewProjectDraft] = useState(null); // { directory, name }
+  const [runtimeMode, setRuntimeMode] = useState(null); // 'server' | 'static'
+  const [needsFolderPermission, setNeedsFolderPermission] = useState(false);
 
   // --- SHOT LIST IMPORT ---
   const [importReport, setImportReport] = useState(null); // { added, warnings[] }
@@ -182,6 +186,7 @@ export default function App() {
 
   // --- DOUBLE CLICK PREVIEW WITH ZOOM & PAN ---
   const [zoomImage, setZoomImage] = useState(null); // { path: string, name: string }
+  const zoomImageUrl = useAssetUrl(zoomImage?.path);
   const [zoomScale, setZoomScale] = useState(1);
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
@@ -221,9 +226,25 @@ export default function App() {
 
   // On Load
   useEffect(() => {
-    fetchConfig();
-    fetchProject();
-    fetchProjectState();
+    (async () => {
+      const detected = await detectMode();
+      setRuntimeMode(detected);
+
+      if (detected === 'static') {
+        // Re-adopt last session's folder. The handle survives in IndexedDB but
+        // the browser may still want a click before granting access again.
+        const restored = await projectFs.restoreActiveProject();
+        if (restored?.needsPermission) {
+          setNeedsFolderPermission(true);
+          await fetchConfig();
+          return;
+        }
+      }
+
+      await fetchConfig();
+      await fetchProject();
+      await fetchProjectState();
+    })();
     
     // Load theme setting
     const savedTheme = localStorage.getItem('moviemaker-theme') || 'dark';
@@ -237,7 +258,7 @@ export default function App() {
 
   const fetchLlmModels = async (provider) => {
     try {
-      const res = await fetch(`${API_BASE}/api/llm/models?provider=${provider}`);
+      const res = await apiFetch(`/api/llm/models?provider=${provider}`);
       if (res.ok) {
         const list = await res.json();
         setLlmModelsList(list);
@@ -262,7 +283,7 @@ export default function App() {
 
   const fetchConfig = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/config`);
+      const res = await apiFetch(`/api/config`);
       if (res.ok) {
         const config = await res.json();
         setApiKeys(config);
@@ -275,7 +296,7 @@ export default function App() {
 
   const fetchProjectState = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/state`);
+      const res = await apiFetch(`/api/state`);
       if (res.ok) applyLoadedState(await res.json());
     } catch (err) {
       console.error(err);
@@ -397,8 +418,10 @@ export default function App() {
 
   // Auto-Save Project State
   const saveProjectState = async (updatedScenes = scenes, extra = {}) => {
+    // Nothing to write to yet in the hosted build until a folder is picked.
+    if (isStatic() && !projectFs.getActiveHandle()) return;
     try {
-      await fetch(`${API_BASE}/api/state`, {
+      await apiFetch(`/api/state`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildStatePayload(updatedScenes, extra))
@@ -422,7 +445,7 @@ export default function App() {
   // Save Credentials
   const saveConfig = async (newKeys) => {
     try {
-      const res = await fetch(`${API_BASE}/api/config`, {
+      const res = await apiFetch(`/api/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newKeys)
@@ -708,7 +731,7 @@ export default function App() {
     const promptPayload = `Write a visual prompt based on this scene description: "${shot.description}"\nCamera/Shot setup to apply: "${shot.setup}"\nAdditional Notes: "${shot.notes}"`;
 
     try {
-      const res = await fetch(`${API_BASE}/api/llm/generate`, {
+      const res = await apiFetch(`/api/llm/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -807,7 +830,7 @@ export default function App() {
 
   const runAsyncImageJob = async (jobId, shotId, existingPromptId, promptText, model, resOption, inputImagePaths = []) => {
     try {
-      const res = await fetch(`${API_BASE}/api/image/generate`, {
+      const res = await apiFetch(`/api/image/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -898,7 +921,7 @@ export default function App() {
   const runAsyncVideoJob = async (jobId, shotId, existingPromptId, promptText, model, resOption, duration, imageInput) => {
     try {
       const imageUrlsToSend = imageInput ? [imageInput] : [];
-      const res = await fetch(`${API_BASE}/api/video/generate`, {
+      const res = await apiFetch(`/api/video/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1192,7 +1215,7 @@ export default function App() {
 
     setLoadingStates(prev => ({ ...prev, [`asset_gen_${asset.id}`]: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/image/generate`, {
+      const res = await apiFetch(`/api/image/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1299,7 +1322,7 @@ Reply with ONLY a JSON object, no markdown fence:
       styleHint ? `\nProject look, for tone only — do NOT copy this into the reference prompt: ${styleHint}` : ''
     ].filter(Boolean).join('\n');
 
-    const res = await fetch(`${API_BASE}/api/llm/generate`, {
+    const res = await apiFetch(`/api/llm/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: activeLlm, model: llmModel, systemPrompt, prompt: userPrompt })
@@ -1475,7 +1498,7 @@ Reply with ONLY a JSON object, no markdown fence:
       const paths = await Promise.all(files.map(async (file) => {
         const formData = new FormData();
         formData.append('file', file);
-        const res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData });
+        const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Upload failed');
         return data.filePath;
@@ -1511,10 +1534,68 @@ Reply with ONLY a JSON object, no markdown fence:
 
   const fetchProject = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/project`);
+      if (isStatic()) {
+        const name = projectFs.getActiveName();
+        setProject({
+          path: name,
+          name: name || 'No project folder',
+          workingFolder: name || '',
+          isLegacy: false,
+          needsFolder: !name,
+          recent: (await projectFs.listRecentProjects()).map(entry => ({
+            path: entry.name, name: entry.name, handle: entry.handle, lastOpened: entry.lastOpened
+          }))
+        });
+        return;
+      }
+      const res = await apiFetch(`/api/project`);
       if (res.ok) setProject(await res.json());
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  /** Static build: adopt a folder from the picker or the recents list. */
+  const adoptStaticProject = async (handle = null) => {
+    setLoadingStates(prev => ({ ...prev, project: true }));
+    try {
+      const result = handle
+        ? await projectFs.openRecentProject(handle)
+        : await projectFs.pickProjectFolder();
+
+      projectFs.clearAssetUrlCache(); // old blob: URLs point at the previous folder
+      const state = await projectFs.readProjectState();
+      applyLoadedState(state || {});
+      if (!state) await projectFs.writeProjectState(buildStatePayload([]));
+
+      await fetchProject();
+      setNeedsFolderPermission(false);
+      setActiveOverlay(null);
+      showToast(`Project folder "${result.name}" ready.`, 'success');
+    } catch (err) {
+      console.error(err);
+      // Cancelling the OS picker is not an error worth shouting about.
+      if (err.name !== 'AbortError') showToast(err.message, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, project: false }));
+    }
+  };
+
+  /** Re-grant access to the folder remembered from last session. */
+  const handleReconnectFolder = async () => {
+    try {
+      if (await projectFs.reconnectProject()) {
+        setNeedsFolderPermission(false);
+        projectFs.clearAssetUrlCache();
+        applyLoadedState((await projectFs.readProjectState()) || {});
+        await fetchProject();
+        showToast('Project folder reconnected.', 'success');
+      } else {
+        showToast('Permission declined.', 'warning');
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(err.message, 'error');
     }
   };
 
@@ -1522,7 +1603,7 @@ Reply with ONLY a JSON object, no markdown fence:
   const browseForPath = async (mode, defaultName = '') => {
     setLoadingStates(prev => ({ ...prev, browse: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/project/browse`, {
+      const res = await apiFetch(`/api/project/browse`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode, defaultName })
@@ -1545,14 +1626,20 @@ Reply with ONLY a JSON object, no markdown fence:
     await saveProjectState();
   };
 
-  const handleOpenProject = async (explicitPath = null) => {
+  const handleOpenProject = async (explicitPath = null, handle = null) => {
+    if (isStatic()) {
+      await flushSave();
+      await adoptStaticProject(handle);
+      return;
+    }
+
     const projectPath = explicitPath || await browseForPath('open');
     if (!projectPath) return;
 
     await flushSave();
     setLoadingStates(prev => ({ ...prev, project: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/project/open`, {
+      const res = await apiFetch(`/api/project/open`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: projectPath })
@@ -1576,12 +1663,35 @@ Reply with ONLY a JSON object, no markdown fence:
   };
 
   const handleSaveProjectAs = async () => {
+    if (isStatic()) {
+      // Pick an empty destination folder; state and media are copied into it.
+      setLoadingStates(prev => ({ ...prev, project: true }));
+      try {
+        const sourceHandle = projectFs.getActiveHandle();
+        const assetPaths = collectReferencedAssetPaths();
+        await projectFs.pickProjectFolder('new');
+        const mapping = sourceHandle ? await projectFs.copyAssetsFrom(sourceHandle, assetPaths) : new Map();
+        const remapped = remapStateAssetPaths(buildStatePayload(), mapping);
+        await projectFs.writeProjectState(remapped);
+        projectFs.clearAssetUrlCache();
+        applyLoadedState(remapped);
+        await fetchProject();
+        showToast(`Branched into "${projectFs.getActiveName()}" — ${mapping.size} media file(s) copied.`, 'success');
+      } catch (err) {
+        console.error(err);
+        if (err.name !== 'AbortError') showToast(`Save As failed: ${err.message}`, 'error');
+      } finally {
+        setLoadingStates(prev => ({ ...prev, project: false }));
+      }
+      return;
+    }
+
     const chosen = await browseForPath('saveAs', `${project.name || 'Untitled'}.mmproj.json`);
     if (!chosen) return;
 
     setLoadingStates(prev => ({ ...prev, project: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/project/save-as`, {
+      const res = await apiFetch(`/api/project/save-as`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: chosen, state: buildStatePayload() })
@@ -1599,7 +1709,67 @@ Reply with ONLY a JSON object, no markdown fence:
     }
   };
 
+  /** Every assets/ path the current project state points at. */
+  const collectReferencedAssetPaths = () => {
+    const paths = new Set();
+    const add = (p) => { if (typeof p === 'string' && p.startsWith('assets/')) paths.add(p); };
+
+    scenes.forEach(scene => (scene.shots || []).forEach(shot => {
+      add(shot.selectedImage);
+      add(shot.selectedVideo);
+      add(shot.lipSyncAudio);
+      [...(shot.imagePrompts || []), ...(shot.videoPrompts || [])].forEach(group => {
+        (group.outputs || []).forEach(out => add(out.path));
+        (group.inputImagePaths || []).forEach(add);
+        add(group.imageInput);
+      });
+    }));
+    imageGallery.forEach(item => add(item.path));
+    videoGallery.forEach(item => add(item.path));
+    referenceImages.forEach(item => add(item.path));
+    assetLibrary.forEach(asset => {
+      (asset.images || []).forEach(add);
+      add(asset.primaryImage);
+    });
+    return [...paths];
+  };
+
+  /** Rewrite every assets/ path in a state blob through a copy mapping. */
+  const remapStateAssetPaths = (state, mapping) => {
+    if (mapping.size === 0) return state;
+    const swap = (value) => (typeof value === 'string' && mapping.has(value) ? mapping.get(value) : value);
+    const walk = (node) => {
+      if (Array.isArray(node)) return node.map(walk);
+      if (node && typeof node === 'object') {
+        return Object.fromEntries(Object.entries(node).map(([key, value]) => [key, walk(value)]));
+      }
+      return swap(node);
+    };
+    return walk(state);
+  };
+
   const handleCreateProject = async () => {
+    if (isStatic()) {
+      await flushSave();
+      setLoadingStates(prev => ({ ...prev, project: true }));
+      try {
+        await projectFs.pickProjectFolder('new');
+        projectFs.clearAssetUrlCache();
+        applyLoadedState({});
+        await projectFs.writeProjectState(buildStatePayload([]));
+        await fetchProject();
+        setNewProjectDraft(null);
+        setActiveOverlay(null);
+        showToast(`New project in "${projectFs.getActiveName()}".`, 'success');
+      } catch (err) {
+        console.error(err);
+        if (err.name !== 'AbortError') showToast(`Create failed: ${err.message}`, 'error');
+      } finally {
+        setLoadingStates(prev => ({ ...prev, project: false }));
+      }
+      return;
+    }
+
     if (!newProjectDraft?.directory || !newProjectDraft?.name?.trim()) {
       showToast('Pick a parent folder and give the project a name.', 'warning');
       return;
@@ -1608,7 +1778,7 @@ Reply with ONLY a JSON object, no markdown fence:
     await flushSave();
     setLoadingStates(prev => ({ ...prev, project: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/project/new`, {
+      const res = await apiFetch(`/api/project/new`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newProjectDraft)
@@ -1630,12 +1800,61 @@ Reply with ONLY a JSON object, no markdown fence:
   };
 
   const handleImportAssetsFromProject = async () => {
+    if (isStatic()) {
+      setLoadingStates(prev => ({ ...prev, project: true }));
+      try {
+        // Pick the OTHER project's folder, read its library, copy its images here.
+        const sourceHandle = await window.showDirectoryPicker({ id: 'moviemaker-import', mode: 'read' });
+        const fileHandle = await sourceHandle.getFileHandle(projectFs.PROJECT_FILENAME);
+        const raw = JSON.parse(await (await fileHandle.getFile()).text());
+        const sourceState = raw.state && typeof raw.state === 'object' ? raw.state : raw;
+        const incoming = sourceState.assetLibrary || [];
+
+        if (incoming.length === 0) {
+          showToast(`"${sourceHandle.name}" has no assets to import.`, 'warning');
+          return;
+        }
+
+        const allImages = incoming.flatMap(a => a.images || []);
+        const mapping = await projectFs.copyAssetsFrom(sourceHandle, allImages);
+
+        let skipped = 0;
+        setAssetLibrary(prev => {
+          const additions = incoming
+            .filter(asset => {
+              const clash = prev.some(existing => normalizeTag(existing.tag) === normalizeTag(asset.tag));
+              if (clash) skipped += 1;
+              return !clash;
+            })
+            .map(asset => {
+              const images = (asset.images || []).map(p => mapping.get(p)).filter(Boolean);
+              return {
+                ...asset,
+                id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                images,
+                primaryImage: mapping.get(asset.primaryImage) || images[0] || null
+              };
+            });
+          return [...prev, ...additions];
+        });
+
+        showToast(`Imported ${incoming.length - skipped} asset(s) from "${sourceHandle.name}"${skipped ? `, skipped ${skipped} duplicate tag(s)` : ''}.`, 'success');
+      } catch (err) {
+        console.error(err);
+        if (err.name === 'NotFoundError') showToast('That folder has no project file in it.', 'error');
+        else if (err.name !== 'AbortError') showToast(`Asset import failed: ${err.message}`, 'error');
+      } finally {
+        setLoadingStates(prev => ({ ...prev, project: false }));
+      }
+      return;
+    }
+
     const sourcePath = await browseForPath('open');
     if (!sourcePath) return;
 
     setLoadingStates(prev => ({ ...prev, project: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/project/import-assets`, {
+      const res = await apiFetch(`/api/project/import-assets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: sourcePath })
@@ -1696,86 +1915,107 @@ Reply with ONLY a JSON object, no markdown fence:
         showToast(`JSON parse error: ${err.message}`, 'error');
         return;
       }
-
-      let normalized;
       try {
-        normalized = normalizeImportedShotList(parsed);
+        applyImportedDocument(parsed, mode);
       } catch (err) {
         showToast(`Import failed: ${err.message}`, 'error');
-        return;
       }
-
-      const { project, assets, promptSnippets: importedSnippets, scenes: importedScenes, warnings } = normalized;
-
-      // Project-level settings
-      if (project.prePrompt !== undefined) setPrePrompt(project.prePrompt);
-      if (project.postPrompt !== undefined) setPostPrompt(project.postPrompt);
-      if (project.videoPrePrompt !== undefined) setVideoPrePrompt(project.videoPrePrompt);
-      if (project.videoPostPrompt !== undefined) setVideoPostPrompt(project.videoPostPrompt);
-      if (project.imageSystemPrompt) setImageSystemPrompt(project.imageSystemPrompt);
-      if (project.videoSystemPrompt) setVideoSystemPrompt(project.videoSystemPrompt);
-      if (project.activeLlm) setActiveLlm(project.activeLlm);
-      if (project.llmModel) setLlmModel(project.llmModel);
-      if (project.imageModel) setImageModel(project.imageModel);
-      if (project.imageResolution) setImageResolution(project.imageResolution);
-      if (project.videoModel) setVideoModel(project.videoModel);
-      if (project.videoResolution) setVideoResolution(project.videoResolution);
-      if (project.videoDuration) setVideoDuration(project.videoDuration);
-
-      // Assets merge by tag: an imported asset never clobbers reference images
-      // you have already attached locally.
-      if (assets.length > 0) {
-        setAssetLibrary(prev => {
-          const merged = [...prev];
-          assets.forEach(incoming => {
-            const existingIndex = merged.findIndex(a => normalizeTag(a.tag) === normalizeTag(incoming.tag));
-            if (existingIndex >= 0) {
-              const existing = merged[existingIndex];
-              merged[existingIndex] = {
-                ...existing,
-                type: incoming.type || existing.type,
-                name: incoming.name || existing.name,
-                description: incoming.description || existing.description,
-                images: existing.images?.length ? existing.images : incoming.images,
-                primaryImage: existing.primaryImage || incoming.primaryImage
-              };
-            } else {
-              merged.push(incoming);
-            }
-          });
-          return merged;
-        });
-      }
-
-      if (importedSnippets.length > 0) {
-        setPromptSnippets(prev => [
-          ...prev,
-          ...importedSnippets.filter(s => !prev.some(p => p.name === s.name))
-        ]);
-      }
-
-      const nextScenes = mode === 'append' ? [...scenes, ...importedScenes] : importedScenes;
-      const renumbered = nextScenes.map((s, idx) => ({ ...s, number: idx + 1 }));
-      setScenes(renumbered);
-      setActiveSceneId(importedScenes[0]?.id || renumbered[0]?.id || null);
-      setActiveShotId(importedScenes[0]?.shots?.[0]?.id || renumbered[0]?.shots?.[0]?.id || null);
-
-      const shotCount = importedScenes.reduce((sum, s) => sum + s.shots.length, 0);
-      const missingTagWarnings = collectMissingTagWarnings(importedScenes, assets);
-      setImportReport({
-        sceneCount: importedScenes.length,
-        shotCount,
-        assetCount: assets.length,
-        mode,
-        warnings: [...warnings, ...missingTagWarnings]
-      });
-      showToast(`Imported ${importedScenes.length} scene${importedScenes.length === 1 ? '' : 's'} / ${shotCount} shots.`, 'success');
     };
     reader.readAsText(file);
   };
 
-  /** Flag <Tags> used in imported prompts that no asset defines. */
-  const collectMissingTagWarnings = (importedScenes, importedAssets) => {
+  /**
+   * Load an imported document into the studio.
+   *
+   * Handles both shapes: the shot-list schema (`assets`, per-shot `imagePrompt`,
+   * nested `project` block) and a full state export (`assetLibrary`, galleries,
+   * flat settings). Throws with a readable message if the document is unusable.
+   */
+  const applyImportedDocument = (parsed, mode = 'replace', { restoreGalleries = false } = {}) => {
+    const { project, assets, promptSnippets: importedSnippets, scenes: importedScenes, warnings } =
+      normalizeImportedShotList(parsed);
+
+    // Project-level settings
+    if (project.prePrompt !== undefined) setPrePrompt(project.prePrompt);
+    if (project.postPrompt !== undefined) setPostPrompt(project.postPrompt);
+    if (project.videoPrePrompt !== undefined) setVideoPrePrompt(project.videoPrePrompt);
+    if (project.videoPostPrompt !== undefined) setVideoPostPrompt(project.videoPostPrompt);
+    if (project.imageSystemPrompt) setImageSystemPrompt(project.imageSystemPrompt);
+    if (project.videoSystemPrompt) setVideoSystemPrompt(project.videoSystemPrompt);
+    if (project.activeLlm) setActiveLlm(project.activeLlm);
+    if (project.llmModel) setLlmModel(project.llmModel);
+    if (project.imageModel) setImageModel(project.imageModel);
+    if (project.imageResolution) setImageResolution(project.imageResolution);
+    if (project.videoModel) setVideoModel(project.videoModel);
+    if (project.videoResolution) setVideoResolution(project.videoResolution);
+    if (project.videoDuration) setVideoDuration(project.videoDuration);
+
+    // A full state export also carries media libraries; a shot list does not.
+    if (restoreGalleries) {
+      setImageGallery(parsed.imageGallery || []);
+      setVideoGallery(parsed.videoGallery || []);
+      setReferenceImages(parsed.referenceImages || []);
+      setConcatenatedVideo(parsed.concatenatedVideo || null);
+    }
+
+    // Assets merge by tag: an imported asset never clobbers reference images
+    // you have already attached locally.
+    if (assets.length > 0) {
+      setAssetLibrary(prev => {
+        const merged = [...prev];
+        assets.forEach(incoming => {
+          const existingIndex = merged.findIndex(a => normalizeTag(a.tag) === normalizeTag(incoming.tag));
+          if (existingIndex >= 0) {
+            const existing = merged[existingIndex];
+            merged[existingIndex] = {
+              ...existing,
+              type: incoming.type || existing.type,
+              name: incoming.name || existing.name,
+              description: incoming.description || existing.description,
+              images: existing.images?.length ? existing.images : incoming.images,
+              primaryImage: existing.primaryImage || incoming.primaryImage
+            };
+          } else {
+            merged.push(incoming);
+          }
+        });
+        return merged;
+      });
+    }
+
+    if (importedSnippets.length > 0) {
+      setPromptSnippets(prev => [
+        ...prev,
+        ...importedSnippets.filter(s => !prev.some(p => p.name === s.name))
+      ]);
+    }
+
+    const nextScenes = mode === 'append' ? [...scenes, ...importedScenes] : importedScenes;
+    const renumbered = nextScenes.map((s, idx) => ({ ...s, number: idx + 1 }));
+    setScenes(renumbered);
+    setActiveSceneId(importedScenes[0]?.id || renumbered[0]?.id || null);
+    setActiveShotId(importedScenes[0]?.shots?.[0]?.id || renumbered[0]?.shots?.[0]?.id || null);
+
+    const shotCount = importedScenes.reduce((sum, s) => sum + s.shots.length, 0);
+    const undefinedTags = collectUndefinedTags(importedScenes, assets);
+    setImportReport({
+      sceneCount: importedScenes.length,
+      shotCount,
+      assetCount: assets.length,
+      mode,
+      undefinedTags,
+      warnings: [
+        ...warnings,
+        ...(undefinedTags.length > 0
+          ? [`Prompts reference undefined asset tag(s): <${undefinedTags.join('>, <')}>. Create them below, or they will be sent through as literal text.`]
+          : [])
+      ]
+    });
+    showToast(`Imported ${importedScenes.length} scene${importedScenes.length === 1 ? '' : 's'} / ${shotCount} shots / ${assets.length} asset${assets.length === 1 ? '' : 's'}.`, 'success');
+  };
+
+  /** <Tags> used in imported prompts that no asset defines. */
+  const collectUndefinedTags = (importedScenes, importedAssets) => {
     const known = [...assetLibrary, ...importedAssets];
     const missing = new Set();
     importedScenes.forEach(scene => (scene.shots || []).forEach(shot => {
@@ -1785,9 +2025,31 @@ Reply with ONLY a JSON object, no markdown fence:
         });
       });
     }));
-    return missing.size > 0
-      ? [`Prompts reference undefined asset tag(s): <${[...missing].join('>, <')}>. Add them in the Assets library or they will be sent as literal text.`]
-      : [];
+    return [...missing];
+  };
+
+  /** Create empty assets for tags a prompt uses but nothing defines. */
+  const handleCreateMissingAssets = (tags) => {
+    const additions = tags
+      .filter(tag => !findAssetByTag(assetLibrary, tag))
+      .map(tag => ({
+        id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        tag,
+        type: 'character',
+        name: tag,
+        description: '',
+        images: [],
+        primaryImage: null,
+        imagePrompt: '',
+        imageModel: null,
+        imageResolution: null,
+        applyGlobalPrompts: false,
+        useExistingAsReference: false
+      }));
+    if (additions.length === 0) return;
+    setAssetLibrary(prev => [...prev, ...additions]);
+    setImportReport(prev => (prev ? { ...prev, undefinedTags: [], assetCount: prev.assetCount + additions.length } : prev));
+    showToast(`Created ${additions.length} asset${additions.length === 1 ? '' : 's'}. Add descriptions, then Batch Generate.`, 'success');
   };
 
   // Delete nested variation prompt output
@@ -1866,7 +2128,7 @@ Reply with ONLY a JSON object, no markdown fence:
   // Reveal File on Disk
   const handleRevealInExplorer = async (filePath) => {
     try {
-      const res = await fetch(`${API_BASE}/api/reveal`, {
+      const res = await apiFetch(`/api/reveal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filePath })
@@ -1915,7 +2177,7 @@ Reply with ONLY a JSON object, no markdown fence:
 
       const imgElement = new Image();
       imgElement.crossOrigin = 'anonymous';
-      imgElement.src = `${API_BASE}/${zoomImage.path}`;
+      imgElement.src = zoomImageUrl || await resolveAssetUrl(zoomImage.path);
 
       imgElement.onload = async () => {
         try {
@@ -1927,7 +2189,7 @@ Reply with ONLY a JSON object, no markdown fence:
           const formData = new FormData();
           formData.append('file', blob, `crop_${Date.now()}.png`);
 
-          const res = await fetch(`${API_BASE}/api/upload`, {
+          const res = await apiFetch(`/api/upload`, {
             method: 'POST',
             body: formData
           });
@@ -1975,7 +2237,7 @@ Reply with ONLY a JSON object, no markdown fence:
 
     setLoadingStates(prev => ({ ...prev, compilation: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/concatenate`, {
+      const res = await apiFetch(`/api/concatenate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ videoPaths: selects })
@@ -1983,7 +2245,7 @@ Reply with ONLY a JSON object, no markdown fence:
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'FFmpeg failed');
 
-      window.open(`${API_BASE}/${data.filePath}`, '_blank');
+      window.open(await resolveAssetUrl(data.filePath), '_blank');
       setConcatenatedVideo(data.filePath);
       saveProjectState(scenes, { concatenatedVideo: data.filePath });
       showToast('Compilation successful! Stitched output loaded and preview available.', 'success');
@@ -2007,7 +2269,7 @@ Reply with ONLY a JSON object, no markdown fence:
 
     setLoadingStates(prev => ({ ...prev, compilation: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/concatenate`, {
+      const res = await apiFetch(`/api/concatenate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ videoPaths: selects })
@@ -2015,7 +2277,7 @@ Reply with ONLY a JSON object, no markdown fence:
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'FFmpeg failed');
 
-      window.open(`${API_BASE}/${data.filePath}`, '_blank');
+      window.open(await resolveAssetUrl(data.filePath), '_blank');
       
       const updated = scenes.map(s => {
         if (s.id === sceneId) {
@@ -2046,7 +2308,7 @@ Reply with ONLY a JSON object, no markdown fence:
     setLoadingStates(prev => ({ ...prev, [key]: true }));
 
     try {
-      const res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData });
+      const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Upload failed');
 
@@ -2071,7 +2333,7 @@ Reply with ONLY a JSON object, no markdown fence:
     setLoadingStates(prev => ({ ...prev, [key]: true }));
 
     try {
-      const res = await fetch(`${API_BASE}/api/lipsync`, {
+      const res = await apiFetch(`/api/lipsync`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2141,7 +2403,7 @@ Reply with ONLY a JSON object, no markdown fence:
       const uploaded = await Promise.all(files.map(async (file, index) => {
         const formData = new FormData();
         formData.append('file', file);
-        const res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData });
+        const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Upload failed');
         return { file, data, index };
@@ -2176,7 +2438,7 @@ Reply with ONLY a JSON object, no markdown fence:
     setLoadingStates(prev => ({ ...prev, vid_upload: true }));
 
     try {
-      const res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData });
+      const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Upload failed');
 
@@ -2194,7 +2456,7 @@ Reply with ONLY a JSON object, no markdown fence:
   const openProjectImageSelector = async (target) => {
     setLoadingStates(prev => ({ ...prev, project_images: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/project-images`);
+      const res = await apiFetch(`/api/project-images`);
       if (res.ok) {
         const list = await res.json();
         setProjectImagesList(list);
@@ -2359,92 +2621,28 @@ Reply with ONLY a JSON object, no markdown fence:
     showToast('Project State JSON exported.');
   };
 
+  // Both import buttons run the same normaliser, so a shot-list document works
+  // through "Import State JSON" and a full export works through "Import Shot
+  // List". Previously the legacy path only understood `assetLibrary`, so an
+  // LLM-authored file's `assets` were silently discarded.
   const handleImportState = (e) => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = async (evt) => {
+    reader.onload = (evt) => {
+      let parsed;
       try {
-        const parsed = JSON.parse(evt.target.result);
-        
-        let loadedScenes = parsed.scenes || [];
-        if (loadedScenes.length === 0 && parsed.shots && parsed.shots.length > 0) {
-          loadedScenes = [
-            {
-              id: 'scene_default_' + Date.now(),
-              name: 'Scene 1',
-              number: 1,
-              shots: parsed.shots,
-              sceneConcatenatedVideo: parsed.sceneConcatenatedVideo || null
-            }
-          ];
-        } else if (loadedScenes.length === 0) {
-          loadedScenes = [
-            {
-              id: 'scene_' + Date.now(),
-              name: 'Scene 1',
-              number: 1,
-              shots: [
-                {
-                  id: 'shot_' + Date.now(),
-                  name: 'Shot 1',
-                  setup: '',
-                  description: '',
-                  dialogue: '',
-                  notes: '',
-                  selectedImage: null,
-                  selectedVideo: null,
-                  referenceImages: [],
-                  lipSyncAudio: null
-                }
-              ],
-              sceneConcatenatedVideo: null
-            }
-          ];
-        }
-        setScenes(loadedScenes);
-
-        setImageGallery(parsed.imageGallery || []);
-        setVideoGallery(parsed.videoGallery || []);
-        setReferenceImages(parsed.referenceImages || []);
-        setAssetLibrary(parsed.assetLibrary || []);
-        setPromptSnippets(parsed.promptSnippets || promptSnippets);
-        setActiveLlm(parsed.activeLlm || 'gemini');
-        setLlmModel(parsed.llmModel || 'gemini-2.5-flash');
-        setActiveImageGenerator(parsed.activeImageGenerator || 'fal-ai');
-        setImageModel(parsed.imageModel || 'fal-ai/flux/schnell');
-        setImageResolution(parsed.imageResolution || '16:9');
-        setActiveVideoGenerator(parsed.activeVideoGenerator || 'fal-ai');
-        setVideoResolution(parsed.videoResolution || '1280x720');
-        setVideoModel(parsed.videoModel || 'fal-ai/kling-video');
-        setVideoDuration(parsed.videoDuration || '5');
-        setPrePrompt(parsed.prePrompt || '');
-        setPostPrompt(parsed.postPrompt || '');
-        setVideoPrePrompt(parsed.videoPrePrompt || '');
-        setVideoPostPrompt(parsed.videoPostPrompt || '');
-        setImageSystemPrompt(parsed.imageSystemPrompt || DEFAULT_IMAGE_SYSTEM_PROMPT);
-        setVideoSystemPrompt(parsed.videoSystemPrompt || DEFAULT_VIDEO_SYSTEM_PROMPT);
-        setConcatenatedVideo(parsed.concatenatedVideo || null);
-
-        const firstSceneId = loadedScenes[0]?.id;
-        setActiveSceneId(parsed.activeSceneId || firstSceneId);
-
-        let foundShotId = null;
-        if (parsed.activeShotId) {
-          const allShots = loadedScenes.flatMap(s => s.shots || []);
-          if (allShots.some(sh => sh.id === parsed.activeShotId)) {
-            foundShotId = parsed.activeShotId;
-          }
-        }
-        if (!foundShotId) {
-          foundShotId = loadedScenes[0]?.shots[0]?.id || null;
-        }
-        setActiveShotId(foundShotId);
-
-        await saveProjectState(loadedScenes, parsed);
-        showToast('Project state imported.', 'success');
+        parsed = JSON.parse(evt.target.result);
       } catch (err) {
         showToast('JSON Parse Error: ' + err.message, 'error');
+        return;
+      }
+      try {
+        applyImportedDocument(parsed, 'replace', { restoreGalleries: true });
+        showToast('Project state imported.', 'success');
+      } catch (err) {
+        showToast('Import failed: ' + err.message, 'error');
       }
     };
     reader.readAsText(file);
@@ -2456,6 +2654,77 @@ Reply with ONLY a JSON object, no markdown fence:
   const activeShotObj = shots.find(s => s.id === activeShotId);
   const activeScene = scenes.find(s => s.id === activeSceneId) || scenes[0];
   const activeSceneShots = activeScene ? (activeScene.shots || []) : [];
+
+  // Hosted build, no usable folder yet: everything else is pointless until the
+  // user grants access, so gate the whole app behind one clear choice.
+  const showStartupGate = runtimeMode === 'static'
+    && (needsFolderPermission || project.needsFolder || !projectFs.isFileSystemAccessSupported());
+
+  if (showStartupGate) {
+    const unsupported = !projectFs.isFileSystemAccessSupported();
+    return (
+      <div className="app-container">
+        {toast && (
+          <div className="toast"><Sparkles size={16} /><span>{toast.message}</span></div>
+        )}
+        <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}>
+          <div className="glass-panel" style={{ padding: '32px', maxWidth: '560px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <div className="header-logo">MM</div>
+              <div>
+                <h1 style={{ fontSize: '1.5rem' }}>MovieMaker Studio</h1>
+                <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>Hosted build — your files stay on your machine</span>
+              </div>
+            </div>
+
+            {unsupported ? (
+              <>
+                <div style={{ display: 'flex', gap: '8px', color: 'var(--accent)', fontSize: '0.9rem' }}>
+                  <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: '2px' }} />
+                  <span>This browser can't open local folders.</span>
+                </div>
+                <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                  MovieMaker stores your projects as real files on your own disk, which needs the File System
+                  Access API — currently Chrome, Edge and other Chromium browsers. Firefox and Safari don't
+                  implement it. Open this page in Chrome or Edge to continue.
+                </p>
+              </>
+            ) : needsFolderPermission ? (
+              <>
+                <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                  Welcome back. Your browser needs one click to re-grant access to
+                  {' '}<strong style={{ color: 'var(--text-main)' }}>{projectFs.getActiveName()}</strong>.
+                </p>
+                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                  <button className="btn btn-primary" onClick={handleReconnectFolder}>
+                    <FolderOpen size={16} /> Reconnect "{projectFs.getActiveName()}"
+                  </button>
+                  <button className="btn btn-secondary" onClick={() => adoptStaticProject()}>
+                    Choose a different folder…
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                  Pick a folder to work in. The project file and every generated image and video are written
+                  straight into it — nothing is uploaded to this site, and there's no server involved.
+                  An empty folder starts a new project; a folder you've used before reopens it.
+                </p>
+                <button className="btn btn-primary" style={{ alignSelf: 'flex-start' }} disabled={loadingStates.project} onClick={() => adoptStaticProject()}>
+                  {loadingStates.project ? <RefreshCw className="spinner" size={16} /> : <FolderOpen size={16} />} Choose Project Folder…
+                </button>
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                  You'll also need API keys — add them under Settings once you're in. They're stored in this
+                  browser only.
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app-container">
@@ -2483,16 +2752,26 @@ Reply with ONLY a JSON object, no markdown fence:
                 {project.name}
               </span>
               <ChevronDown size={11} />
+              <span
+                title={isStatic()
+                  ? 'Hosted build: files on your disk, keys in this browser, no server'
+                  : 'Local server build: FFmpeg stitching and native dialogs available'}
+                style={{ marginLeft: '2px', fontSize: '0.6rem', letterSpacing: '0.04em', textTransform: 'uppercase', padding: '1px 5px', borderRadius: '3px', background: 'rgba(255,255,255,0.08)', color: 'var(--text-dim)' }}
+              >
+                {runtimeMode === 'static' ? 'local files' : 'server'}
+              </span>
             </button>
           </div>
         </div>
 
         <div className="header-actions">
-          {/* FFmpeg Video Concatenator Trigger */}
+          {/* FFmpeg Video Concatenator Trigger — needs the local server */}
           <button
             className="btn btn-accent"
             onClick={handleStitchCompilation}
-            disabled={loadingStates.compilation}
+            disabled={loadingStates.compilation || isStatic()}
+            title={isStatic() ? 'Stitching needs FFmpeg — only available in the local server build' : 'Stitch all selected shot videos'}
+            style={isStatic() ? { opacity: 0.45 } : undefined}
           >
             {loadingStates.compilation ? (
               <>
@@ -2525,9 +2804,30 @@ Reply with ONLY a JSON object, no markdown fence:
           </div>
 
           {/* Overlays Toggles */}
-          <button className={`btn btn-secondary ${activeOverlay === 'assets' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'assets' ? null : 'assets')} title="Character / environment library">
-            <Users size={16} /> Assets
-          </button>
+          {(() => {
+            const missingImages = assetLibrary.filter(a => (a.images || []).length === 0).length;
+            return (
+              <button
+                className={`btn btn-secondary ${activeOverlay === 'assets' ? 'active' : ''}`}
+                onClick={() => setActiveOverlay(activeOverlay === 'assets' ? null : 'assets')}
+                title={assetLibrary.length === 0
+                  ? 'Character / environment library'
+                  : `${assetLibrary.length} asset${assetLibrary.length === 1 ? '' : 's'}${missingImages ? `, ${missingImages} still without an image` : ', all have images'}`}
+              >
+                <Users size={16} /> Assets
+                {assetLibrary.length > 0 && (
+                  <span style={{
+                    marginLeft: '2px', fontSize: '0.7rem', fontWeight: 'bold',
+                    padding: '1px 6px', borderRadius: '9px',
+                    background: missingImages ? 'var(--accent)' : 'rgba(16,185,129,0.25)',
+                    color: missingImages ? '#fff' : 'var(--success)'
+                  }}>
+                    {missingImages ? `${missingImages} / ${assetLibrary.length}` : assetLibrary.length}
+                  </span>
+                )}
+              </button>
+            );
+          })()}
           <button className={`btn btn-secondary ${activeOverlay === 'images' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'images' ? null : 'images')}>
             <ImageIcon size={16} /> Images
           </button>
@@ -2572,7 +2872,7 @@ Reply with ONLY a JSON object, no markdown fence:
                   Clear Preview
                 </button>
               </div>
-              <video src={`${API_BASE}/${concatenatedVideo}`} controls style={{ width: '100%', borderRadius: '6px', maxHeight: '250px', background: '#000' }} />
+              <AssetVideo path={concatenatedVideo} controls style={{ width: '100%', borderRadius: '6px', maxHeight: '250px', background: '#000' }} />
             </div>
           )}
 
@@ -2647,8 +2947,9 @@ Reply with ONLY a JSON object, no markdown fence:
                 <button
                   className="btn btn-secondary"
                   onClick={() => handleConcatenateScene(activeScene.id)}
-                  disabled={loadingStates.compilation}
-                  style={{ fontSize: '0.8rem', padding: '6px 12px', marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px' }}
+                  disabled={loadingStates.compilation || isStatic()}
+                  title={isStatic() ? 'Stitching needs FFmpeg — only available in the local server build' : undefined}
+                  style={{ fontSize: '0.8rem', padding: '6px 12px', marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px', opacity: isStatic() ? 0.45 : 1 }}
                 >
                   <Film size={12} /> Compile Scene Video
                 </button>
@@ -2728,7 +3029,7 @@ Reply with ONLY a JSON object, no markdown fence:
                   Clear Preview
                 </button>
               </div>
-              <video src={`${API_BASE}/${activeScene.sceneConcatenatedVideo}`} controls style={{ width: '100%', borderRadius: '4px', maxHeight: '180px', background: '#000' }} />
+              <AssetVideo path={activeScene.sceneConcatenatedVideo} controls style={{ width: '100%', borderRadius: '4px', maxHeight: '180px', background: '#000' }} />
             </div>
           )}
 
@@ -2798,7 +3099,7 @@ Reply with ONLY a JSON object, no markdown fence:
                         onDoubleClick={() => shot.selectedImage && handleImageDoubleClick(shot.selectedImage, shot.name)}
                       >
                         {shot.selectedImage ? (
-                          <img src={`${API_BASE}/${shot.selectedImage}`} alt="select visual" />
+                          <AssetImage path={shot.selectedImage} alt="select visual" />
                         ) : (
                           'No Image'
                         )}
@@ -2806,7 +3107,7 @@ Reply with ONLY a JSON object, no markdown fence:
 
                       <div className="mini-preview" title="Active Video Select">
                         {shot.selectedVideo ? (
-                          <video src={`${API_BASE}/${shot.selectedVideo}`} />
+                          <AssetVideo path={shot.selectedVideo} />
                         ) : (
                           'No Video'
                         )}
@@ -2929,7 +3230,7 @@ Reply with ONLY a JSON object, no markdown fence:
                             <div className="slot-label">Active Image Select</div>
                             {shot.selectedImage ? (
                               <>
-                                <img src={`${API_BASE}/${shot.selectedImage}`} alt="active visual" />
+                                <AssetImage path={shot.selectedImage} alt="active visual" />
                                 <button
                                   className="btn btn-danger"
                                   style={{ position: 'absolute', bottom: '6px', right: '6px', padding: '4px' }}
@@ -2968,7 +3269,7 @@ Reply with ONLY a JSON object, no markdown fence:
                             <div className="slot-label">Active Video Select</div>
                             {shot.selectedVideo ? (
                               <>
-                                <video src={`${API_BASE}/${shot.selectedVideo}`} controls />
+                                <AssetVideo path={shot.selectedVideo} controls />
                                 <button
                                   className="btn btn-danger"
                                   style={{ position: 'absolute', bottom: '6px', right: '6px', padding: '4px' }}
@@ -3058,7 +3359,7 @@ Reply with ONLY a JSON object, no markdown fence:
                                           className={`iteration-card ${shot.selectedImage === out.path ? 'active-select' : ''}`}
                                           onDoubleClick={() => handleImageDoubleClick(out.path, out.name)}
                                         >
-                                          <img src={`${API_BASE}/${out.path}`} alt={out.name} />
+                                          <AssetImage path={out.path} alt={out.name} />
                                           <div className="iteration-badge">{out.name}</div>
                                           <div className="iteration-hover-actions">
                                             <button
@@ -3142,7 +3443,7 @@ Reply with ONLY a JSON object, no markdown fence:
                                           key={out.id}
                                           className={`iteration-card ${shot.selectedVideo === out.path ? 'active-select' : ''}`}
                                         >
-                                          <video src={`${API_BASE}/${out.path}`} />
+                                          <AssetVideo path={out.path} />
                                           <div className="iteration-badge">{out.name}</div>
                                           <div className="iteration-hover-actions">
                                             <button
@@ -3387,7 +3688,7 @@ Reply with ONLY a JSON object, no markdown fence:
                           })}
                           title={selected ? `Remove ${ref.name}` : `Add ${ref.name}`}
                         >
-                          <img src={`${API_BASE}/${ref.path}`} alt={ref.name} />
+                          <AssetImage path={ref.path} alt={ref.name} />
                           {selected && <Check className="generation-reference-check" size={16} />}
                           <span>{ref.name}</span>
                         </button>
@@ -3462,7 +3763,7 @@ Reply with ONLY a JSON object, no markdown fence:
                                   title={img.name}
                                 >
                                   <div style={{ height: '70px', width: '100%', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-                                    <img src={`${API_BASE}/${img.path}`} alt={img.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                                    <AssetImage path={img.path} alt={img.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
                                   </div>
                                   {isSelected && <Check className="generation-reference-check" size={14} style={{ position: 'absolute', top: '4px', right: '4px', background: 'var(--success)', color: '#fff', borderRadius: '50%', padding: '2px' }} />}
                                   <span style={{ fontSize: '0.65rem', padding: '4px', width: '90%', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', color: 'var(--text-muted)', textAlign: 'center' }}>
@@ -3524,18 +3825,27 @@ Reply with ONLY a JSON object, no markdown fence:
                 <code style={{ fontSize: '0.75rem', color: 'var(--text-muted)', wordBreak: 'break-all' }}>
                   {project.path || 'project_state.json (legacy loose file)'}
                 </code>
-                <span style={{ fontSize: '0.78rem', color: 'var(--success)', display: 'flex', alignItems: 'center', gap: '5px', marginTop: '4px' }}>
-                  <Check size={12} /> Autosaves continuously — no save button needed.
-                </span>
+                {!project.needsFolder && (
+                  <span style={{ fontSize: '0.78rem', color: 'var(--success)', display: 'flex', alignItems: 'center', gap: '5px', marginTop: '4px' }}>
+                    <Check size={12} /> Autosaves continuously — no save button needed.
+                  </span>
+                )}
 
-                {project.isLegacy && (
+                {project.needsFolder && (
+                  <div style={{ fontSize: '0.8rem', color: 'var(--accent)', display: 'flex', alignItems: 'flex-start', gap: '5px', marginTop: '4px' }}>
+                    <AlertTriangle size={12} style={{ marginTop: '3px', flexShrink: 0 }} />
+                    <span>Nothing is being saved yet. Choose a folder on your machine — the project file and every generated image and video land there.</span>
+                  </div>
+                )}
+
+                {project.isLegacy && !isStatic() && (
                   <div style={{ fontSize: '0.78rem', color: 'var(--accent)', display: 'flex', alignItems: 'flex-start', gap: '5px', marginTop: '4px' }}>
                     <AlertTriangle size={12} style={{ marginTop: '3px', flexShrink: 0 }} />
                     <span>Not a real project file yet. Use <strong>Save As</strong> to turn this into a proper project folder you can reopen later.</span>
                   </div>
                 )}
 
-                {project.path && (
+                {project.path && !isStatic() && (
                   <button
                     className="btn btn-secondary"
                     style={{ alignSelf: 'flex-start', fontSize: '0.75rem', padding: '4px 10px', marginTop: '6px' }}
@@ -3548,8 +3858,12 @@ Reply with ONLY a JSON object, no markdown fence:
 
               {/* Actions */}
               <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                <button className="btn btn-primary" disabled={loadingStates.browse || loadingStates.project} onClick={() => setNewProjectDraft({ directory: '', name: '' })}>
-                  <Plus size={14} /> New Project
+                <button
+                  className="btn btn-primary"
+                  disabled={loadingStates.browse || loadingStates.project}
+                  onClick={() => (isStatic() ? handleCreateProject() : setNewProjectDraft({ directory: '', name: '' }))}
+                >
+                  <Plus size={14} /> New Project{isStatic() ? ' Folder…' : ''}
                 </button>
                 <button className="btn btn-secondary" disabled={loadingStates.browse || loadingStates.project} onClick={() => handleOpenProject()}>
                   {loadingStates.browse ? <RefreshCw className="spinner" size={14} /> : <FolderOpen size={14} />} Open Project…
@@ -3562,8 +3876,9 @@ Reply with ONLY a JSON object, no markdown fence:
                 </button>
               </div>
 
-              {/* New project inline form */}
-              {newProjectDraft && (
+              {/* New project inline form (server build only — the hosted build
+                  uses the browser's own folder picker) */}
+              {newProjectDraft && !isStatic() && (
                 <div className="glass-panel" style={{ padding: '16px', background: 'rgba(128,128,128,0.04)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                   <h3 style={{ fontSize: '0.95rem' }}>New Project</h3>
                   <div className="form-group">
@@ -3636,7 +3951,7 @@ Reply with ONLY a JSON object, no markdown fence:
                           className="btn btn-secondary"
                           style={{ fontSize: '0.75rem', padding: '4px 10px', flexShrink: 0 }}
                           disabled={isActive || loadingStates.project}
-                          onClick={() => handleOpenProject(entry.path)}
+                          onClick={() => handleOpenProject(entry.path, entry.handle)}
                         >
                           {isActive ? 'Open' : 'Switch'}
                         </button>
@@ -3647,9 +3962,20 @@ Reply with ONLY a JSON object, no markdown fence:
               </div>
 
               <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                A project is a folder: <code>MyFilm/MyFilm.mmproj.json</code> plus <code>MyFilm/assets/</code>.
-                Zip it, move it, or drop it on a shared drive — the project re-anchors to wherever the file
-                actually is, so media keeps resolving.
+                {isStatic() ? (
+                  <>
+                    A project is a folder you pick on your own machine: <code>project.mmproj.json</code> plus
+                    an <code>assets/</code> directory holding every generated image and video. Nothing is
+                    uploaded to the site — the page reads and writes those files directly. Browsers only allow
+                    this in Chrome or Edge.
+                  </>
+                ) : (
+                  <>
+                    A project is a folder: <code>MyFilm/MyFilm.mmproj.json</code> plus <code>MyFilm/assets/</code>.
+                    Zip it, move it, or drop it on a shared drive — the project re-anchors to wherever the file
+                    actually is, so media keeps resolving.
+                  </>
+                )}
               </div>
             </div>
 
@@ -3715,7 +4041,7 @@ Reply with ONLY a JSON object, no markdown fence:
                             Generating…
                           </div>
                         ) : asset.primaryImage ? (
-                          <img src={`${API_BASE}/${asset.primaryImage}`} alt={asset.tag} />
+                          <AssetImage path={asset.primaryImage} alt={asset.tag} />
                         ) : (
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-dim)', fontSize: '0.78rem', textAlign: 'center', padding: '10px' }}>
                             No reference image — text substitution only
@@ -4063,7 +4389,7 @@ Reply with ONLY a JSON object, no markdown fence:
                         onDoubleClick={() => handleImageDoubleClick(imagePath, assetEditor.tag || 'asset')}
                         title={isPrimary ? 'Primary reference' : 'Click to make primary, double-click to enlarge'}
                       >
-                        <img src={`${API_BASE}/${imagePath}`} alt="asset reference" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                        <AssetImage path={imagePath} alt="asset reference" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                         {isPrimary && <Check size={14} style={{ position: 'absolute', top: '4px', left: '4px', background: 'var(--success)', color: '#fff', borderRadius: '50%', padding: '2px' }} />}
                         <button
                           className="btn btn-danger"
@@ -4229,16 +4555,35 @@ Reply with ONLY a JSON object, no markdown fence:
                 <div style={{ fontSize: '0.88rem', color: 'var(--success)' }}>No warnings — everything resolved cleanly.</div>
               )}
 
+              {importReport.undefinedTags?.length > 0 && (
+                <div className="glass-panel" style={{ padding: '14px', background: 'rgba(139,92,246,0.06)', display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '12px' }}>
+                  <span style={{ fontSize: '0.85rem' }}>
+                    {importReport.undefinedTags.length} tag{importReport.undefinedTags.length === 1 ? ' is' : 's are'} used in prompts but not defined:
+                    {' '}<strong style={{ color: 'var(--primary-hover)' }}>&lt;{importReport.undefinedTags.join('&gt; &lt;')}&gt;</strong>
+                  </span>
+                  <button
+                    className="btn btn-primary"
+                    style={{ alignSelf: 'flex-start' }}
+                    onClick={() => handleCreateMissingAssets(importReport.undefinedTags)}
+                  >
+                    <Plus size={14} /> Create {importReport.undefinedTags.length} missing asset{importReport.undefinedTags.length === 1 ? '' : 's'}
+                  </button>
+                </div>
+              )}
+
               {importReport.assetCount > 0 && (
-                <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginTop: '12px' }}>
-                  Imported assets have descriptions but no images yet. Open <strong>Assets</strong> and upload a
-                  reference image for each character so tagged prompts can carry it into generation.
+                <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginTop: '12px', lineHeight: 1.6 }}>
+                  Your {importReport.assetCount} asset{importReport.assetCount === 1 ? '' : 's'} came in with descriptions but no
+                  images. Open <strong>Assets</strong> and hit <strong>Batch Generate</strong> to make a reference image for each —
+                  after that, every <code>&lt;Tag&gt;</code> in a shot prompt carries that image into generation.
                 </div>
               )}
             </div>
             <div className="modal-footer">
-              <button className="btn btn-secondary" onClick={() => { setImportReport(null); setActiveOverlay('assets'); }}>Open Assets</button>
-              <button className="btn btn-primary" onClick={() => setImportReport(null)}>Done</button>
+              <button className="btn btn-primary" onClick={() => { setImportReport(null); setActiveOverlay('assets'); }}>
+                <Users size={14} /> Open Assets ({importReport.assetCount})
+              </button>
+              <button className="btn btn-secondary" onClick={() => setImportReport(null)}>Done</button>
             </div>
           </div>
         </div>
@@ -4270,7 +4615,7 @@ Reply with ONLY a JSON object, no markdown fence:
                   {imageGallery.map((img) => (
                     <div key={img.id} className="media-card">
                       <div className="media-thumb-container" onDoubleClick={() => handleImageDoubleClick(img.path, img.name)}>
-                        <img src={`${API_BASE}/${img.path}`} alt={img.name} />
+                        <AssetImage path={img.path} alt={img.name} />
                       </div>
                       <div className="media-info">
                         <input
@@ -4355,7 +4700,7 @@ Reply with ONLY a JSON object, no markdown fence:
                 {videoGallery.map((vid) => (
                   <div key={vid.id} className="media-card">
                     <div className="media-thumb-container">
-                      <video src={`${API_BASE}/${vid.path}`} controls />
+                      <AssetVideo path={vid.path} controls />
                     </div>
                     <div className="media-info">
                       <input
@@ -4454,7 +4799,7 @@ Reply with ONLY a JSON object, no markdown fence:
                       style={{ cursor: 'pointer' }}
                     >
                       <div className="media-thumb-container">
-                        <img src={`${API_BASE}/${ref.path}`} alt={ref.name} />
+                        <AssetImage path={ref.path} alt={ref.name} />
                         {isAssigned && <div className="media-badge">Assigned</div>}
                       </div>
                       <div className="media-info">
@@ -4515,7 +4860,7 @@ Reply with ONLY a JSON object, no markdown fence:
                       style={{ cursor: 'pointer', border: '1px solid var(--border-color)', borderRadius: '6px', overflow: 'hidden', display: 'flex', flexDirection: 'column', background: 'rgba(255,255,255,0.02)' }}
                     >
                       <div className="media-thumb-container" style={{ height: '90px', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <img src={`${API_BASE}/${img.path}`} alt={img.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                        <AssetImage path={img.path} alt={img.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
                       </div>
                       <div className="media-info" style={{ padding: '6px', fontSize: '0.75rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }} title={img.name}>
                         {img.name}
@@ -4611,7 +4956,15 @@ Reply with ONLY a JSON object, no markdown fence:
               {/* API Credentials */}
               <div className="glass-panel" style={{ padding: '16px', background: 'rgba(128,128,128,0.02)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
                 <h3 style={{ fontSize: '0.95rem', color: 'var(--primary-hover)', display: 'flex', alignItems: 'center', gap: '6px' }}><Settings size={16} /> API Key Setup</h3>
-                
+
+                {isStatic() && (
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                    Keys are saved in this browser's localStorage and sent straight from this page to each
+                    provider — this site has no server to receive them. Anything running on this origin can
+                    read them, so prefer keys you can rotate.
+                  </span>
+                )}
+
                 <div className="form-group">
                   <label className="form-label">Google AI Studio Key (Gemini)</label>
                   <input
@@ -4701,19 +5054,37 @@ Reply with ONLY a JSON object, no markdown fence:
                   </div>
                 </div>
 
-                <div className="form-group">
-                  <label className="form-label">Local Working Folder Path (Optional - Shared Drive)</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={apiKeys.workingFolder || ''}
-                    onChange={(e) => setApiKeys({ ...apiKeys, workingFolder: e.target.value })}
-                    placeholder="e.g. X:\SharedFolder or C:\SharedProjects"
-                  />
-                  <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginTop: '2px', display: 'block' }}>
-                    If specified and exists, project assets and states will save to/load from this folder.
-                  </small>
-                </div>
+                {isStatic() ? (
+                  <div className="form-group">
+                    <label className="form-label">CORS Proxy (Optional)</label>
+                    <input
+                      type="text"
+                      className="input-field"
+                      value={apiKeys.corsProxy || ''}
+                      onChange={(e) => setApiKeys({ ...apiKeys, corsProxy: e.target.value })}
+                      placeholder="https://my-proxy.example/?url={url}"
+                    />
+                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginTop: '2px', display: 'block' }}>
+                      Only needed if a provider refuses direct browser calls. Requests are rewritten to this
+                      URL, with <code>{'{url}'}</code> replaced by the encoded target (appended if you omit it).
+                      Use a proxy you control — it will see your API keys.
+                    </small>
+                  </div>
+                ) : (
+                  <div className="form-group">
+                    <label className="form-label">Local Working Folder Path (Optional - Shared Drive)</label>
+                    <input
+                      type="text"
+                      className="input-field"
+                      value={apiKeys.workingFolder || ''}
+                      onChange={(e) => setApiKeys({ ...apiKeys, workingFolder: e.target.value })}
+                      placeholder="e.g. X:\SharedFolder or C:\SharedProjects"
+                    />
+                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginTop: '2px', display: 'block' }}>
+                      If specified and exists, project assets and states will save to/load from this folder.
+                    </small>
+                  </div>
+                )}
 
                 <button className="btn btn-primary" onClick={() => saveConfig(apiKeys)} style={{ alignSelf: 'flex-end', marginTop: '6px' }}>
                   <Save size={14} /> Save Credentials & Settings
@@ -5249,7 +5620,7 @@ Reply with ONLY a JSON object, no markdown fence:
                 >
                   <img
                     ref={cropImgRef}
-                    src={`${API_BASE}/${zoomImage.path}`}
+                    src={zoomImageUrl || undefined}
                     alt="to crop"
                     onLoad={(e) => {
                       setImgNaturalSize({ width: e.target.naturalWidth, height: e.target.naturalHeight });
@@ -5297,8 +5668,7 @@ Reply with ONLY a JSON object, no markdown fence:
                 onMouseUp={handleDragEnd}
                 onMouseLeave={handleDragEnd}
               >
-                <img
-                  src={`${API_BASE}/${zoomImage.path}`}
+                <AssetImage path={zoomImage.path}
                   className="zoom-image"
                   style={{
                     transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoomScale})`
