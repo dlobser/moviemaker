@@ -1,0 +1,711 @@
+{
+  "scenes": [
+    {
+      "id": "scene_1",
+      "name": "Act 1 - Welcome to the Brain Candy Lab",
+      "number": 1,
+      "shots": [
+        {
+          "id": "shot_1_1",
+          "name": "Shot 1.1 - Candy Factory Exterior",
+          "setup": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING.",
+          "description": "A colorful factory shaped like a giant brain sits atop a hill, with candy-colored smoke drifting from whimsical chimneys and tiny robots delivering glowing lollipops.",
+          "dialogue": "Narrator: 'Hidden beyond the ordinary world stood the famous Brain Candy Lab.'",
+          "notes": "Playful, saturated colors. Slow crane shot.",
+          "selectedImage": "assets/img_1784054578922.png",
+          "selectedVideo": "assets/vid_1784055363288.mp4",
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [
+            {
+              "id": "prompt_img_1784054555446",
+              "prompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A gigantic factory sculpted in the shape of an enormous whimsical brain, its glossy folds rendered in bubblegum pink, electric lilac, and mint green, perched triumphantly atop a rolling green hill beneath a soft pastel-blue sky streaked with cotton-candy clouds. Dozens of quirky, twisted chimneys sprout from the brain's ridges like candy canes and swirled soft-serve cones, exhaling plumes of colorful smoke in bubblegum-blue, sunshine-yellow, and cherry-red that drift lazily upward and dissolve into playful sparkle particles. Scattered across the hillside and winding pathways, tiny chrome-and-candy-colored robots with round glass domes trundle along, carrying trays of oversized glowing lollipops that pulse with soft neon light in rainbow hues. The hill itself is dotted with oversized gumdrop rocks, licorice-vine fences, and lollipop-shaped lampposts, all bathed in warm golden morning light casting long, soft shadows. The camera performs a slow, majestic crane shot, rising steadily from a low angle near the base of the hill to reveal the full scale and whimsical grandeur of the brain-shaped factory, sweeping upward past drifting candy smoke to frame the entire fantastical structure against the brightening sky. The color palette is highly saturated and joyful—vivid pinks, purples, teals, and golds—rendered with a glossy, storybook-illustration quality, hyper-detailed textures resembling polished candy, glass, and metal, cinematic depth of field, soft volumetric lighting, and a sense of magical wonder permeating the entire scene.",
+              "model": "fal-ai/flux/schnell",
+              "resolution": "16:9",
+              "inputImagePaths": [],
+              "outputs": [
+                {
+                  "id": "out_img_1784054555446",
+                  "path": "assets/img_1784054555159.png",
+                  "name": "Iteration 5446",
+                  "createdAt": "2026-07-14T18:42:35.446Z"
+                },
+                {
+                  "id": "out_img_1784054579129",
+                  "path": "assets/img_1784054578922.png",
+                  "name": "Iteration 9129",
+                  "createdAt": "2026-07-14T18:42:59.129Z"
+                }
+              ]
+            }
+          ],
+          "videoPrompts": [
+            {
+              "id": "prompt_vid_1784055364677",
+              "prompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A slow, sweeping crane shot rises to reveal a whimsical factory shaped like a giant candy-colored brain, its glossy pink and lavender folds glistening under soft morning light, perched atop a lush emerald hill dotted with lollipop-shaped trees. Playful chimneys shaped like swirled candy canes puff soft plumes of pastel smoke—cotton-candy pink, minty green, and bubblegum blue—drifting lazily into a golden sky streaked with sherbet-orange clouds. Tiny chrome robots with glowing antennae zip along winding candy-cane rails encircling the structure, each carrying luminous, oversized lollipops that pulse with soft internal light. The hillside sparkles with dew, catching prismatic reflections from the factory's sugary sheen. As the camera glides upward and forward, the scale of the brain-shaped building becomes awe-inspiring, its folds pulsing faintly as if alive, synapses glowing like veins of light beneath the candy shell. The atmosphere is joyful and hyper-saturated, rendered in a hyperreal storybook style with soft volumetric lighting, gentle lens flares, and a dreamy, magical morning haze settling over the fantastical landscape.",
+              "model": "fal-ai/kling-video",
+              "resolution": "1280x720",
+              "duration": "5",
+              "imageInput": "assets/img_1784054578922.png",
+              "outputs": [
+                {
+                  "id": "out_vid_1784055364676",
+                  "path": "assets/vid_1784055363288.mp4",
+                  "name": "Iteration 4676",
+                  "createdAt": "2026-07-14T18:56:04.676Z"
+                }
+              ]
+            }
+          ],
+          "draftImagePrompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A gigantic factory sculpted in the shape of an enormous whimsical brain, its glossy folds rendered in bubblegum pink, electric lilac, and mint green, perched triumphantly atop a rolling green hill beneath a soft pastel-blue sky streaked with cotton-candy clouds. Dozens of quirky, twisted chimneys sprout from the brain's ridges like candy canes and swirled soft-serve cones, exhaling plumes of colorful smoke in bubblegum-blue, sunshine-yellow, and cherry-red that drift lazily upward and dissolve into playful sparkle particles. Scattered across the hillside and winding pathways, tiny chrome-and-candy-colored robots with round glass domes trundle along, carrying trays of oversized glowing lollipops that pulse with soft neon light in rainbow hues. The hill itself is dotted with oversized gumdrop rocks, licorice-vine fences, and lollipop-shaped lampposts, all bathed in warm golden morning light casting long, soft shadows. The camera performs a slow, majestic crane shot, rising steadily from a low angle near the base of the hill to reveal the full scale and whimsical grandeur of the brain-shaped factory, sweeping upward past drifting candy smoke to frame the entire fantastical structure against the brightening sky. The color palette is highly saturated and joyful—vivid pinks, purples, teals, and golds—rendered with a glossy, storybook-illustration quality, hyper-detailed textures resembling polished candy, glass, and metal, cinematic depth of field, soft volumetric lighting, and a sense of magical wonder permeating the entire scene.",
+          "draftVideoPrompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A slow, sweeping crane shot rises to reveal a whimsical factory shaped like a giant candy-colored brain, its glossy pink and lavender folds glistening under soft morning light, perched atop a lush emerald hill dotted with lollipop-shaped trees. Playful chimneys shaped like swirled candy canes puff soft plumes of pastel smoke—cotton-candy pink, minty green, and bubblegum blue—drifting lazily into a golden sky streaked with sherbet-orange clouds. Tiny chrome robots with glowing antennae zip along winding candy-cane rails encircling the structure, each carrying luminous, oversized lollipops that pulse with soft internal light. The hillside sparkles with dew, catching prismatic reflections from the factory's sugary sheen. As the camera glides upward and forward, the scale of the brain-shaped building becomes awe-inspiring, its folds pulsing faintly as if alive, synapses glowing like veins of light beneath the candy shell. The atmosphere is joyful and hyper-saturated, rendered in a hyperreal storybook style with soft volumetric lighting, gentle lens flares, and a dreamy, magical morning haze settling over the fantastical landscape."
+        },
+        {
+          "id": "shot_1_2",
+          "name": "Shot 1.2 - Meet Professor Fizzlebop",
+          "setup": "Medium shot, INT. MAIN LAB - DAY.",
+          "description": "Professor Fizzlebop, a wild-haired scientist wearing oversized goggles, juggles bubbling beakers while chewing neon gum that sparks tiny lightning bolts.",
+          "dialogue": "Professor Fizzlebop: 'Science should always be a little delicious!'",
+          "notes": "Comedic timing with exaggerated facial expressions.",
+          "selectedImage": "assets/img_1784054983458.png",
+          "selectedVideo": "assets/vid_1784056077692.mp4",
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [
+            {
+              "id": "prompt_img_1784054984043",
+              "prompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop, a frizzy-haired mad scientist with electrified white curls shooting in every direction, huge oversized steampunk goggles magnifying his wide, cartoonishly bugged-out eyes, stands center-frame mid-juggle. Three bubbling glass beakers filled with glowing neon-green and violet liquid arc through the air above his outstretched hands, trails of fizzy bubbles and steam following their motion. His mouth is stretched into an exaggerated comic grin as he chomps on a wad of electric-blue neon gum, tiny jagged lightning bolts crackling and sparking from his lips with each chew, illuminating his face in flashes of blue-white light. His lab coat, stained with colorful chemical splashes, flares dramatically as he twists his torso for comedic balance, one foot lifted mid-stagger. Background shows a cluttered mad-science lab: shelves stacked with glowing potions, smoking beakers, tangled wires, chalkboards covered in wild equations, and warm daylight streaming through tall industrial windows. Lighting is bright and playful, with dynamic highlights bouncing off the goggles and beakers, emphasizing the frenetic, comedic energy of the scene. Sharp focus on his exaggerated expression, slight motion blur on the flying beakers and sparking gum for comedic dynamism.",
+              "model": "fal-ai/flux/schnell",
+              "resolution": "16:9",
+              "inputImagePaths": [],
+              "outputs": [
+                {
+                  "id": "out_img_1784054984041",
+                  "path": "assets/img_1784054983458.png",
+                  "name": "Iteration 4041",
+                  "createdAt": "2026-07-14T18:49:44.041Z"
+                }
+              ]
+            }
+          ],
+          "videoPrompts": [
+            {
+              "id": "prompt_vid_1784056078231",
+              "prompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop—a frizzy-haired scientist with wild static-charged curls and oversized goggles magnifying his bulging, expressive eyes—juggles three bubbling beakers filled with glowing green and purple liquids, each fizzing and sloshing precariously with every arc through the air. He chomps rhythmically on a wad of neon-blue gum, which crackles and pops with tiny sparking lightning bolts between his teeth, illuminating his face in flickering electric light. His exaggerated expressions shift comically—eyes widening in mock panic as a beaker wobbles, cheeks puffing with an exaggerated grin as he catches it, eyebrows shooting up in cartoonish surprise. Chaotic lab shelves cluttered with mismatched bottles, tesla coils sparking softly, and steam vents hissing in the background add kinetic energy. Warm overhead lighting mixes with the cool blue-green glow of the chemicals, casting dynamic shadows that dance with his movements. The camera holds steady at medium framing, capturing his full comedic physicality—the wobbly juggling, the snapping gum sparks, the frantic yet joyful energy—timed for punchy comedic beats, with quick reaction pauses emphasizing each near-mishap.",
+              "model": "fal-ai/kling-video",
+              "resolution": "1280x720",
+              "duration": "5",
+              "imageInput": "assets/img_1784054983458.png",
+              "outputs": [
+                {
+                  "id": "out_vid_1784056078230",
+                  "path": "assets/vid_1784056077692.mp4",
+                  "name": "Iteration 8230",
+                  "createdAt": "2026-07-14T19:07:58.230Z"
+                }
+              ]
+            }
+          ],
+          "draftImagePrompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop, a frizzy-haired mad scientist with electrified white curls shooting in every direction, huge oversized steampunk goggles magnifying his wide, cartoonishly bugged-out eyes, stands center-frame mid-juggle. Three bubbling glass beakers filled with glowing neon-green and violet liquid arc through the air above his outstretched hands, trails of fizzy bubbles and steam following their motion. His mouth is stretched into an exaggerated comic grin as he chomps on a wad of electric-blue neon gum, tiny jagged lightning bolts crackling and sparking from his lips with each chew, illuminating his face in flashes of blue-white light. His lab coat, stained with colorful chemical splashes, flares dramatically as he twists his torso for comedic balance, one foot lifted mid-stagger. Background shows a cluttered mad-science lab: shelves stacked with glowing potions, smoking beakers, tangled wires, chalkboards covered in wild equations, and warm daylight streaming through tall industrial windows. Lighting is bright and playful, with dynamic highlights bouncing off the goggles and beakers, emphasizing the frenetic, comedic energy of the scene. Sharp focus on his exaggerated expression, slight motion blur on the flying beakers and sparking gum for comedic dynamism. <Fizzlebop>",
+          "draftVideoPrompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop—a frizzy-haired scientist with wild static-charged curls and oversized goggles magnifying his bulging, expressive eyes—juggles three bubbling beakers filled with glowing green and purple liquids, each fizzing and sloshing precariously with every arc through the air. He chomps rhythmically on a wad of neon-blue gum, which crackles and pops with tiny sparking lightning bolts between his teeth, illuminating his face in flickering electric light. His exaggerated expressions shift comically—eyes widening in mock panic as a beaker wobbles, cheeks puffing with an exaggerated grin as he catches it, eyebrows shooting up in cartoonish surprise. Chaotic lab shelves cluttered with mismatched bottles, tesla coils sparking softly, and steam vents hissing in the background add kinetic energy. Warm overhead lighting mixes with the cool blue-green glow of the chemicals, casting dynamic shadows that dance with his movements. The camera holds steady at medium framing, capturing his full comedic physicality—the wobbly juggling, the snapping gum sparks, the frantic yet joyful energy—timed for punchy comedic beats, with quick reaction pauses emphasizing each near-mishap."
+        },
+        {
+          "id": "shot_1_3",
+          "name": "Shot 1.3 - The Secret Recipe",
+          "setup": "Close-up, INT. EXPERIMENT TABLE - DAY.",
+          "description": "A glowing recipe card labeled 'Brain Candy Formula 42½' floats above a swirling candy cauldron.",
+          "dialogue": "Professor Fizzlebop: 'Just one tiny pinch of imagination...'",
+          "notes": "Soft magical glow and floating particles.",
+          "selectedImage": "assets/img_1784055030445.png",
+          "selectedVideo": "assets/vid_1784056425386.mp4",
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [
+            {
+              "id": "prompt_img_1784055030928",
+              "prompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+              "model": "fal-ai/flux/schnell",
+              "resolution": "16:9",
+              "inputImagePaths": [],
+              "outputs": [
+                {
+                  "id": "out_img_1784055030928",
+                  "path": "assets/img_1784055030445.png",
+                  "name": "Iteration 0928",
+                  "createdAt": "2026-07-14T18:50:30.928Z"
+                }
+              ]
+            },
+            {
+              "id": "prompt_img_1784055047024",
+              "prompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+              "model": "fal-ai/flux/dev",
+              "resolution": "16:9",
+              "inputImagePaths": [],
+              "outputs": [
+                {
+                  "id": "out_img_1784055047023",
+                  "path": "assets/img_1784055046677.png",
+                  "name": "Iteration 7023",
+                  "createdAt": "2026-07-14T18:50:47.023Z"
+                }
+              ]
+            }
+          ],
+          "videoPrompts": [
+            {
+              "id": "prompt_vid_1784056426239",
+              "prompt": "Close-up, INT. EXPERIMENT TABLE - DAY. A shimmering, translucent recipe card labeled \"Brain Candy Formula 42½\" in elegant glowing script hovers suspended above a bubbling cauldron of swirling candy-colored liquid—streams of pink, electric blue, and gold twisting hypnotically beneath it. Soft magical light pulses from the card's edges, casting warm reflections across the tabletop and nearby glass beakers and jars filled with colorful confections. Tiny luminous particles drift lazily upward from the cauldron's surface, catching the light like enchanted dust, some circling the card as if drawn to its glow. Wisps of fragrant steam curl and dissolve into the air, subtly shifting hues in sync with the bubbling brew below. The focus stays sharp on the card and cauldron's surface, with a gentle shallow depth of field blurring the background into a dreamy bokeh of warm ambient light. The overall atmosphere feels whimsical yet scientific—an enchanted kitchen-lab where magic and experimentation blend seamlessly.",
+              "model": "fal-ai/kling-video",
+              "resolution": "1280x720",
+              "duration": "5",
+              "imageInput": "assets/img_1784055030445.png",
+              "outputs": [
+                {
+                  "id": "out_vid_1784056426236",
+                  "path": "assets/vid_1784056425386.mp4",
+                  "name": "Iteration 6236",
+                  "createdAt": "2026-07-14T19:13:46.236Z"
+                }
+              ]
+            }
+          ],
+          "draftImagePrompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+          "draftVideoPrompt": "Close-up, INT. EXPERIMENT TABLE - DAY. A shimmering, translucent recipe card labeled \"Brain Candy Formula 42½\" in elegant glowing script hovers suspended above a bubbling cauldron of swirling candy-colored liquid—streams of pink, electric blue, and gold twisting hypnotically beneath it. Soft magical light pulses from the card's edges, casting warm reflections across the tabletop and nearby glass beakers and jars filled with colorful confections. Tiny luminous particles drift lazily upward from the cauldron's surface, catching the light like enchanted dust, some circling the card as if drawn to its glow. Wisps of fragrant steam curl and dissolve into the air, subtly shifting hues in sync with the bubbling brew below. The focus stays sharp on the card and cauldron's surface, with a gentle shallow depth of field blurring the background into a dreamy bokeh of warm ambient light. The overall atmosphere feels whimsical yet scientific—an enchanted kitchen-lab where magic and experimentation blend seamlessly."
+        }
+      ]
+    },
+    {
+      "id": "scene_2",
+      "name": "Act 2 - The Candy Comes Alive",
+      "number": 2,
+      "shots": [
+        {
+          "id": "shot_2_1",
+          "name": "Shot 2.1 - Unexpected Reaction",
+          "setup": "Medium wide shot, INT. TEST KITCHEN - DAY.",
+          "description": "The bubbling mixture suddenly erupts into colorful clouds shaped like cartoon brains wearing sunglasses.",
+          "dialogue": "Assistant Bot: 'Warning! Delicious anomaly detected!'",
+          "notes": "Fast zoom with comic sound effects.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        },
+        {
+          "id": "shot_2_2",
+          "name": "Shot 2.2 - Dancing Brain Candy",
+          "setup": "Tracking shot, INT. LAB FLOOR - DAY.",
+          "description": "Tiny pieces of Brain Candy hop off conveyor belts and begin dancing in synchronized choreography.",
+          "dialogue": "Professor Fizzlebop: 'Well... that's new.'",
+          "notes": "Playful camera movement following the dancing candy.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        },
+        {
+          "id": "shot_2_3",
+          "name": "Shot 2.3 - Genius Overload",
+          "setup": "Close-up, INT. LAB - DAY.",
+          "description": "One candy lands on Professor Fizzlebop's tongue, causing equations, doodles, and inventions to rapidly appear around his head as holograms.",
+          "dialogue": "Professor Fizzlebop: 'I just invented reversible toast!'",
+          "notes": "Rapid montage-style visual effects.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        }
+      ]
+    },
+    {
+      "id": "scene_3",
+      "name": "Act 3 - Chaos in the Lab",
+      "number": 3,
+      "shots": [
+        {
+          "id": "shot_3_1",
+          "name": "Shot 3.1 - Runaway Conveyor",
+          "setup": "Wide shot, INT. FACTORY FLOOR - DAY.",
+          "description": "Conveyor belts twist through the laboratory as runaway Brain Candy bounces everywhere, activating strange inventions.",
+          "dialogue": "Assistant Bot: 'Containment has become... unlikely.'",
+          "notes": "Dynamic handheld feel with exaggerated action.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        },
+        {
+          "id": "shot_3_2",
+          "name": "Shot 3.2 - Bubble Brain Storm",
+          "setup": "High angle shot, INT. CENTRAL ATRIUM - DAY.",
+          "description": "Gigantic floating bubbles filled with colorful ideas drift through the lab while scientists chase them with butterfly nets.",
+          "dialogue": "Professor Fizzlebop: 'Catch the good ideas before they float away!'",
+          "notes": "Bright whimsical lighting.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        },
+        {
+          "id": "shot_3_3",
+          "name": "Shot 3.3 - Candy Cannon",
+          "setup": "Medium action shot, INT. INVENTION BAY - DAY.",
+          "description": "Fizzlebop aims a gigantic candy cannon that fires marshmallow confetti, slowing the runaway Brain Candy.",
+          "dialogue": "Professor Fizzlebop: 'Time for Plan Marshmallow!'",
+          "notes": "Slow motion as colorful candy fills the frame.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        }
+      ]
+    },
+    {
+      "id": "scene_4",
+      "name": "Act 4 - Sweet Success",
+      "number": 4,
+      "shots": [
+        {
+          "id": "shot_4_1",
+          "name": "Shot 4.1 - The Perfect Formula",
+          "setup": "Medium shot, INT. MAIN LAB - SUNSET.",
+          "description": "Professor Fizzlebop carefully adds one final sparkling ingredient, calming the glowing Brain Candy into perfect harmony.",
+          "dialogue": "Professor Fizzlebop: 'Every great experiment needs just the right amount of wonder.'",
+          "notes": "Warm golden lighting with magical sparkle.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        },
+        {
+          "id": "shot_4_2",
+          "name": "Shot 4.2 - Happy Ending",
+          "setup": "Wide hero shot, INT. BRAIN CANDY LAB - SUNSET.",
+          "description": "Scientists, robots, and cheerful Brain Candy celebrate together beneath a glowing rainbow made of colorful neural pathways.",
+          "dialogue": "Narrator: 'And from that day on, every brilliant idea began with a little Brain Candy.'",
+          "notes": "Epic pullback ending with whimsical orchestral feel.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null,
+          "imagePrompts": [],
+          "videoPrompts": []
+        }
+      ]
+    }
+  ],
+  "shots": [
+    {
+      "id": "shot_1_1",
+      "name": "Shot 1.1 - Candy Factory Exterior",
+      "setup": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING.",
+      "description": "A colorful factory shaped like a giant brain sits atop a hill, with candy-colored smoke drifting from whimsical chimneys and tiny robots delivering glowing lollipops.",
+      "dialogue": "Narrator: 'Hidden beyond the ordinary world stood the famous Brain Candy Lab.'",
+      "notes": "Playful, saturated colors. Slow crane shot.",
+      "selectedImage": "assets/img_1784054578922.png",
+      "selectedVideo": "assets/vid_1784055363288.mp4",
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [
+        {
+          "id": "prompt_img_1784054555446",
+          "prompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A gigantic factory sculpted in the shape of an enormous whimsical brain, its glossy folds rendered in bubblegum pink, electric lilac, and mint green, perched triumphantly atop a rolling green hill beneath a soft pastel-blue sky streaked with cotton-candy clouds. Dozens of quirky, twisted chimneys sprout from the brain's ridges like candy canes and swirled soft-serve cones, exhaling plumes of colorful smoke in bubblegum-blue, sunshine-yellow, and cherry-red that drift lazily upward and dissolve into playful sparkle particles. Scattered across the hillside and winding pathways, tiny chrome-and-candy-colored robots with round glass domes trundle along, carrying trays of oversized glowing lollipops that pulse with soft neon light in rainbow hues. The hill itself is dotted with oversized gumdrop rocks, licorice-vine fences, and lollipop-shaped lampposts, all bathed in warm golden morning light casting long, soft shadows. The camera performs a slow, majestic crane shot, rising steadily from a low angle near the base of the hill to reveal the full scale and whimsical grandeur of the brain-shaped factory, sweeping upward past drifting candy smoke to frame the entire fantastical structure against the brightening sky. The color palette is highly saturated and joyful—vivid pinks, purples, teals, and golds—rendered with a glossy, storybook-illustration quality, hyper-detailed textures resembling polished candy, glass, and metal, cinematic depth of field, soft volumetric lighting, and a sense of magical wonder permeating the entire scene.",
+          "model": "fal-ai/flux/schnell",
+          "resolution": "16:9",
+          "inputImagePaths": [],
+          "outputs": [
+            {
+              "id": "out_img_1784054555446",
+              "path": "assets/img_1784054555159.png",
+              "name": "Iteration 5446",
+              "createdAt": "2026-07-14T18:42:35.446Z"
+            },
+            {
+              "id": "out_img_1784054579129",
+              "path": "assets/img_1784054578922.png",
+              "name": "Iteration 9129",
+              "createdAt": "2026-07-14T18:42:59.129Z"
+            }
+          ]
+        }
+      ],
+      "videoPrompts": [
+        {
+          "id": "prompt_vid_1784055364677",
+          "prompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A slow, sweeping crane shot rises to reveal a whimsical factory shaped like a giant candy-colored brain, its glossy pink and lavender folds glistening under soft morning light, perched atop a lush emerald hill dotted with lollipop-shaped trees. Playful chimneys shaped like swirled candy canes puff soft plumes of pastel smoke—cotton-candy pink, minty green, and bubblegum blue—drifting lazily into a golden sky streaked with sherbet-orange clouds. Tiny chrome robots with glowing antennae zip along winding candy-cane rails encircling the structure, each carrying luminous, oversized lollipops that pulse with soft internal light. The hillside sparkles with dew, catching prismatic reflections from the factory's sugary sheen. As the camera glides upward and forward, the scale of the brain-shaped building becomes awe-inspiring, its folds pulsing faintly as if alive, synapses glowing like veins of light beneath the candy shell. The atmosphere is joyful and hyper-saturated, rendered in a hyperreal storybook style with soft volumetric lighting, gentle lens flares, and a dreamy, magical morning haze settling over the fantastical landscape.",
+          "model": "fal-ai/kling-video",
+          "resolution": "1280x720",
+          "duration": "5",
+          "imageInput": "assets/img_1784054578922.png",
+          "outputs": [
+            {
+              "id": "out_vid_1784055364676",
+              "path": "assets/vid_1784055363288.mp4",
+              "name": "Iteration 4676",
+              "createdAt": "2026-07-14T18:56:04.676Z"
+            }
+          ]
+        }
+      ],
+      "draftImagePrompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A gigantic factory sculpted in the shape of an enormous whimsical brain, its glossy folds rendered in bubblegum pink, electric lilac, and mint green, perched triumphantly atop a rolling green hill beneath a soft pastel-blue sky streaked with cotton-candy clouds. Dozens of quirky, twisted chimneys sprout from the brain's ridges like candy canes and swirled soft-serve cones, exhaling plumes of colorful smoke in bubblegum-blue, sunshine-yellow, and cherry-red that drift lazily upward and dissolve into playful sparkle particles. Scattered across the hillside and winding pathways, tiny chrome-and-candy-colored robots with round glass domes trundle along, carrying trays of oversized glowing lollipops that pulse with soft neon light in rainbow hues. The hill itself is dotted with oversized gumdrop rocks, licorice-vine fences, and lollipop-shaped lampposts, all bathed in warm golden morning light casting long, soft shadows. The camera performs a slow, majestic crane shot, rising steadily from a low angle near the base of the hill to reveal the full scale and whimsical grandeur of the brain-shaped factory, sweeping upward past drifting candy smoke to frame the entire fantastical structure against the brightening sky. The color palette is highly saturated and joyful—vivid pinks, purples, teals, and golds—rendered with a glossy, storybook-illustration quality, hyper-detailed textures resembling polished candy, glass, and metal, cinematic depth of field, soft volumetric lighting, and a sense of magical wonder permeating the entire scene.",
+      "draftVideoPrompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A slow, sweeping crane shot rises to reveal a whimsical factory shaped like a giant candy-colored brain, its glossy pink and lavender folds glistening under soft morning light, perched atop a lush emerald hill dotted with lollipop-shaped trees. Playful chimneys shaped like swirled candy canes puff soft plumes of pastel smoke—cotton-candy pink, minty green, and bubblegum blue—drifting lazily into a golden sky streaked with sherbet-orange clouds. Tiny chrome robots with glowing antennae zip along winding candy-cane rails encircling the structure, each carrying luminous, oversized lollipops that pulse with soft internal light. The hillside sparkles with dew, catching prismatic reflections from the factory's sugary sheen. As the camera glides upward and forward, the scale of the brain-shaped building becomes awe-inspiring, its folds pulsing faintly as if alive, synapses glowing like veins of light beneath the candy shell. The atmosphere is joyful and hyper-saturated, rendered in a hyperreal storybook style with soft volumetric lighting, gentle lens flares, and a dreamy, magical morning haze settling over the fantastical landscape."
+    },
+    {
+      "id": "shot_1_2",
+      "name": "Shot 1.2 - Meet Professor Fizzlebop",
+      "setup": "Medium shot, INT. MAIN LAB - DAY.",
+      "description": "Professor Fizzlebop, a wild-haired scientist wearing oversized goggles, juggles bubbling beakers while chewing neon gum that sparks tiny lightning bolts.",
+      "dialogue": "Professor Fizzlebop: 'Science should always be a little delicious!'",
+      "notes": "Comedic timing with exaggerated facial expressions.",
+      "selectedImage": "assets/img_1784054983458.png",
+      "selectedVideo": "assets/vid_1784056077692.mp4",
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [
+        {
+          "id": "prompt_img_1784054984043",
+          "prompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop, a frizzy-haired mad scientist with electrified white curls shooting in every direction, huge oversized steampunk goggles magnifying his wide, cartoonishly bugged-out eyes, stands center-frame mid-juggle. Three bubbling glass beakers filled with glowing neon-green and violet liquid arc through the air above his outstretched hands, trails of fizzy bubbles and steam following their motion. His mouth is stretched into an exaggerated comic grin as he chomps on a wad of electric-blue neon gum, tiny jagged lightning bolts crackling and sparking from his lips with each chew, illuminating his face in flashes of blue-white light. His lab coat, stained with colorful chemical splashes, flares dramatically as he twists his torso for comedic balance, one foot lifted mid-stagger. Background shows a cluttered mad-science lab: shelves stacked with glowing potions, smoking beakers, tangled wires, chalkboards covered in wild equations, and warm daylight streaming through tall industrial windows. Lighting is bright and playful, with dynamic highlights bouncing off the goggles and beakers, emphasizing the frenetic, comedic energy of the scene. Sharp focus on his exaggerated expression, slight motion blur on the flying beakers and sparking gum for comedic dynamism.",
+          "model": "fal-ai/flux/schnell",
+          "resolution": "16:9",
+          "inputImagePaths": [],
+          "outputs": [
+            {
+              "id": "out_img_1784054984041",
+              "path": "assets/img_1784054983458.png",
+              "name": "Iteration 4041",
+              "createdAt": "2026-07-14T18:49:44.041Z"
+            }
+          ]
+        }
+      ],
+      "videoPrompts": [
+        {
+          "id": "prompt_vid_1784056078231",
+          "prompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop—a frizzy-haired scientist with wild static-charged curls and oversized goggles magnifying his bulging, expressive eyes—juggles three bubbling beakers filled with glowing green and purple liquids, each fizzing and sloshing precariously with every arc through the air. He chomps rhythmically on a wad of neon-blue gum, which crackles and pops with tiny sparking lightning bolts between his teeth, illuminating his face in flickering electric light. His exaggerated expressions shift comically—eyes widening in mock panic as a beaker wobbles, cheeks puffing with an exaggerated grin as he catches it, eyebrows shooting up in cartoonish surprise. Chaotic lab shelves cluttered with mismatched bottles, tesla coils sparking softly, and steam vents hissing in the background add kinetic energy. Warm overhead lighting mixes with the cool blue-green glow of the chemicals, casting dynamic shadows that dance with his movements. The camera holds steady at medium framing, capturing his full comedic physicality—the wobbly juggling, the snapping gum sparks, the frantic yet joyful energy—timed for punchy comedic beats, with quick reaction pauses emphasizing each near-mishap.",
+          "model": "fal-ai/kling-video",
+          "resolution": "1280x720",
+          "duration": "5",
+          "imageInput": "assets/img_1784054983458.png",
+          "outputs": [
+            {
+              "id": "out_vid_1784056078230",
+              "path": "assets/vid_1784056077692.mp4",
+              "name": "Iteration 8230",
+              "createdAt": "2026-07-14T19:07:58.230Z"
+            }
+          ]
+        }
+      ],
+      "draftImagePrompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop, a frizzy-haired mad scientist with electrified white curls shooting in every direction, huge oversized steampunk goggles magnifying his wide, cartoonishly bugged-out eyes, stands center-frame mid-juggle. Three bubbling glass beakers filled with glowing neon-green and violet liquid arc through the air above his outstretched hands, trails of fizzy bubbles and steam following their motion. His mouth is stretched into an exaggerated comic grin as he chomps on a wad of electric-blue neon gum, tiny jagged lightning bolts crackling and sparking from his lips with each chew, illuminating his face in flashes of blue-white light. His lab coat, stained with colorful chemical splashes, flares dramatically as he twists his torso for comedic balance, one foot lifted mid-stagger. Background shows a cluttered mad-science lab: shelves stacked with glowing potions, smoking beakers, tangled wires, chalkboards covered in wild equations, and warm daylight streaming through tall industrial windows. Lighting is bright and playful, with dynamic highlights bouncing off the goggles and beakers, emphasizing the frenetic, comedic energy of the scene. Sharp focus on his exaggerated expression, slight motion blur on the flying beakers and sparking gum for comedic dynamism. <Fizzlebop>",
+      "draftVideoPrompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop—a frizzy-haired scientist with wild static-charged curls and oversized goggles magnifying his bulging, expressive eyes—juggles three bubbling beakers filled with glowing green and purple liquids, each fizzing and sloshing precariously with every arc through the air. He chomps rhythmically on a wad of neon-blue gum, which crackles and pops with tiny sparking lightning bolts between his teeth, illuminating his face in flickering electric light. His exaggerated expressions shift comically—eyes widening in mock panic as a beaker wobbles, cheeks puffing with an exaggerated grin as he catches it, eyebrows shooting up in cartoonish surprise. Chaotic lab shelves cluttered with mismatched bottles, tesla coils sparking softly, and steam vents hissing in the background add kinetic energy. Warm overhead lighting mixes with the cool blue-green glow of the chemicals, casting dynamic shadows that dance with his movements. The camera holds steady at medium framing, capturing his full comedic physicality—the wobbly juggling, the snapping gum sparks, the frantic yet joyful energy—timed for punchy comedic beats, with quick reaction pauses emphasizing each near-mishap."
+    },
+    {
+      "id": "shot_1_3",
+      "name": "Shot 1.3 - The Secret Recipe",
+      "setup": "Close-up, INT. EXPERIMENT TABLE - DAY.",
+      "description": "A glowing recipe card labeled 'Brain Candy Formula 42½' floats above a swirling candy cauldron.",
+      "dialogue": "Professor Fizzlebop: 'Just one tiny pinch of imagination...'",
+      "notes": "Soft magical glow and floating particles.",
+      "selectedImage": "assets/img_1784055030445.png",
+      "selectedVideo": "assets/vid_1784056425386.mp4",
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [
+        {
+          "id": "prompt_img_1784055030928",
+          "prompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+          "model": "fal-ai/flux/schnell",
+          "resolution": "16:9",
+          "inputImagePaths": [],
+          "outputs": [
+            {
+              "id": "out_img_1784055030928",
+              "path": "assets/img_1784055030445.png",
+              "name": "Iteration 0928",
+              "createdAt": "2026-07-14T18:50:30.928Z"
+            }
+          ]
+        },
+        {
+          "id": "prompt_img_1784055047024",
+          "prompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+          "model": "fal-ai/flux/dev",
+          "resolution": "16:9",
+          "inputImagePaths": [],
+          "outputs": [
+            {
+              "id": "out_img_1784055047023",
+              "path": "assets/img_1784055046677.png",
+              "name": "Iteration 7023",
+              "createdAt": "2026-07-14T18:50:47.023Z"
+            }
+          ]
+        }
+      ],
+      "videoPrompts": [
+        {
+          "id": "prompt_vid_1784056426239",
+          "prompt": "Close-up, INT. EXPERIMENT TABLE - DAY. A shimmering, translucent recipe card labeled \"Brain Candy Formula 42½\" in elegant glowing script hovers suspended above a bubbling cauldron of swirling candy-colored liquid—streams of pink, electric blue, and gold twisting hypnotically beneath it. Soft magical light pulses from the card's edges, casting warm reflections across the tabletop and nearby glass beakers and jars filled with colorful confections. Tiny luminous particles drift lazily upward from the cauldron's surface, catching the light like enchanted dust, some circling the card as if drawn to its glow. Wisps of fragrant steam curl and dissolve into the air, subtly shifting hues in sync with the bubbling brew below. The focus stays sharp on the card and cauldron's surface, with a gentle shallow depth of field blurring the background into a dreamy bokeh of warm ambient light. The overall atmosphere feels whimsical yet scientific—an enchanted kitchen-lab where magic and experimentation blend seamlessly.",
+          "model": "fal-ai/kling-video",
+          "resolution": "1280x720",
+          "duration": "5",
+          "imageInput": "assets/img_1784055030445.png",
+          "outputs": [
+            {
+              "id": "out_vid_1784056426236",
+              "path": "assets/vid_1784056425386.mp4",
+              "name": "Iteration 6236",
+              "createdAt": "2026-07-14T19:13:46.236Z"
+            }
+          ]
+        }
+      ],
+      "draftImagePrompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+      "draftVideoPrompt": "Close-up, INT. EXPERIMENT TABLE - DAY. A shimmering, translucent recipe card labeled \"Brain Candy Formula 42½\" in elegant glowing script hovers suspended above a bubbling cauldron of swirling candy-colored liquid—streams of pink, electric blue, and gold twisting hypnotically beneath it. Soft magical light pulses from the card's edges, casting warm reflections across the tabletop and nearby glass beakers and jars filled with colorful confections. Tiny luminous particles drift lazily upward from the cauldron's surface, catching the light like enchanted dust, some circling the card as if drawn to its glow. Wisps of fragrant steam curl and dissolve into the air, subtly shifting hues in sync with the bubbling brew below. The focus stays sharp on the card and cauldron's surface, with a gentle shallow depth of field blurring the background into a dreamy bokeh of warm ambient light. The overall atmosphere feels whimsical yet scientific—an enchanted kitchen-lab where magic and experimentation blend seamlessly."
+    },
+    {
+      "id": "shot_2_1",
+      "name": "Shot 2.1 - Unexpected Reaction",
+      "setup": "Medium wide shot, INT. TEST KITCHEN - DAY.",
+      "description": "The bubbling mixture suddenly erupts into colorful clouds shaped like cartoon brains wearing sunglasses.",
+      "dialogue": "Assistant Bot: 'Warning! Delicious anomaly detected!'",
+      "notes": "Fast zoom with comic sound effects.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    },
+    {
+      "id": "shot_2_2",
+      "name": "Shot 2.2 - Dancing Brain Candy",
+      "setup": "Tracking shot, INT. LAB FLOOR - DAY.",
+      "description": "Tiny pieces of Brain Candy hop off conveyor belts and begin dancing in synchronized choreography.",
+      "dialogue": "Professor Fizzlebop: 'Well... that's new.'",
+      "notes": "Playful camera movement following the dancing candy.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    },
+    {
+      "id": "shot_2_3",
+      "name": "Shot 2.3 - Genius Overload",
+      "setup": "Close-up, INT. LAB - DAY.",
+      "description": "One candy lands on Professor Fizzlebop's tongue, causing equations, doodles, and inventions to rapidly appear around his head as holograms.",
+      "dialogue": "Professor Fizzlebop: 'I just invented reversible toast!'",
+      "notes": "Rapid montage-style visual effects.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    },
+    {
+      "id": "shot_3_1",
+      "name": "Shot 3.1 - Runaway Conveyor",
+      "setup": "Wide shot, INT. FACTORY FLOOR - DAY.",
+      "description": "Conveyor belts twist through the laboratory as runaway Brain Candy bounces everywhere, activating strange inventions.",
+      "dialogue": "Assistant Bot: 'Containment has become... unlikely.'",
+      "notes": "Dynamic handheld feel with exaggerated action.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    },
+    {
+      "id": "shot_3_2",
+      "name": "Shot 3.2 - Bubble Brain Storm",
+      "setup": "High angle shot, INT. CENTRAL ATRIUM - DAY.",
+      "description": "Gigantic floating bubbles filled with colorful ideas drift through the lab while scientists chase them with butterfly nets.",
+      "dialogue": "Professor Fizzlebop: 'Catch the good ideas before they float away!'",
+      "notes": "Bright whimsical lighting.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    },
+    {
+      "id": "shot_3_3",
+      "name": "Shot 3.3 - Candy Cannon",
+      "setup": "Medium action shot, INT. INVENTION BAY - DAY.",
+      "description": "Fizzlebop aims a gigantic candy cannon that fires marshmallow confetti, slowing the runaway Brain Candy.",
+      "dialogue": "Professor Fizzlebop: 'Time for Plan Marshmallow!'",
+      "notes": "Slow motion as colorful candy fills the frame.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    },
+    {
+      "id": "shot_4_1",
+      "name": "Shot 4.1 - The Perfect Formula",
+      "setup": "Medium shot, INT. MAIN LAB - SUNSET.",
+      "description": "Professor Fizzlebop carefully adds one final sparkling ingredient, calming the glowing Brain Candy into perfect harmony.",
+      "dialogue": "Professor Fizzlebop: 'Every great experiment needs just the right amount of wonder.'",
+      "notes": "Warm golden lighting with magical sparkle.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    },
+    {
+      "id": "shot_4_2",
+      "name": "Shot 4.2 - Happy Ending",
+      "setup": "Wide hero shot, INT. BRAIN CANDY LAB - SUNSET.",
+      "description": "Scientists, robots, and cheerful Brain Candy celebrate together beneath a glowing rainbow made of colorful neural pathways.",
+      "dialogue": "Narrator: 'And from that day on, every brilliant idea began with a little Brain Candy.'",
+      "notes": "Epic pullback ending with whimsical orchestral feel.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null,
+      "imagePrompts": [],
+      "videoPrompts": []
+    }
+  ],
+  "imageGallery": [
+    {
+      "id": "img_1784055047024",
+      "path": "assets/img_1784055046677.png",
+      "prompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+      "name": "Iteration 7023",
+      "createdAt": "2026-07-14T18:50:47.024Z"
+    },
+    {
+      "id": "img_1784055030928",
+      "path": "assets/img_1784055030445.png",
+      "prompt": "Close-up, INT. EXPERIMENT TABLE – DAY. A luminous recipe card labeled \"Brain Candy Formula 42½\" hovers weightlessly above a swirling candy cauldron, its edges shimmering with soft golden-pink magical light. The card's ornate handwritten script pulses gently, illuminated from within, casting a warm ethereal glow across the scene. Below, the cauldron bubbles with iridescent molten candy in shifting hues of violet, teal, and amber, thick swirls twisting hypnotically like liquid galaxies. Delicate motes of glowing particles drift upward from the cauldron's surface, catching the light like suspended fireflies, some clustering near the card as if drawn to its magic. Faint wisps of sweet-scented steam curl into the air, softly blurred at the edges for a dreamlike depth of field. The experiment table beneath is cluttered with mismatched vials, sugar crystals, and scattered ingredient jars, all rendered in soft focus to keep attention on the glowing card and cauldron. Warm daylight filters through unseen windows, mixing with the magical glow to create a rich interplay of natural and supernatural light. The overall atmosphere feels whimsical and enchanted, hyper-detailed textures on the card's parchment and the cauldron's glossy candy surface, cinematic lighting with soft bloom, shallow depth of field emphasizing the floating card as the focal point.",
+      "name": "Iteration 0928",
+      "createdAt": "2026-07-14T18:50:30.928Z"
+    },
+    {
+      "id": "img_1784054984044",
+      "path": "assets/img_1784054983458.png",
+      "prompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop, a frizzy-haired mad scientist with electrified white curls shooting in every direction, huge oversized steampunk goggles magnifying his wide, cartoonishly bugged-out eyes, stands center-frame mid-juggle. Three bubbling glass beakers filled with glowing neon-green and violet liquid arc through the air above his outstretched hands, trails of fizzy bubbles and steam following their motion. His mouth is stretched into an exaggerated comic grin as he chomps on a wad of electric-blue neon gum, tiny jagged lightning bolts crackling and sparking from his lips with each chew, illuminating his face in flashes of blue-white light. His lab coat, stained with colorful chemical splashes, flares dramatically as he twists his torso for comedic balance, one foot lifted mid-stagger. Background shows a cluttered mad-science lab: shelves stacked with glowing potions, smoking beakers, tangled wires, chalkboards covered in wild equations, and warm daylight streaming through tall industrial windows. Lighting is bright and playful, with dynamic highlights bouncing off the goggles and beakers, emphasizing the frenetic, comedic energy of the scene. Sharp focus on his exaggerated expression, slight motion blur on the flying beakers and sparking gum for comedic dynamism.",
+      "name": "Iteration 4041",
+      "createdAt": "2026-07-14T18:49:44.044Z"
+    },
+    {
+      "id": "img_1784054579130",
+      "path": "assets/img_1784054578922.png",
+      "prompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A gigantic factory sculpted in the shape of an enormous whimsical brain, its glossy folds rendered in bubblegum pink, electric lilac, and mint green, perched triumphantly atop a rolling green hill beneath a soft pastel-blue sky streaked with cotton-candy clouds. Dozens of quirky, twisted chimneys sprout from the brain's ridges like candy canes and swirled soft-serve cones, exhaling plumes of colorful smoke in bubblegum-blue, sunshine-yellow, and cherry-red that drift lazily upward and dissolve into playful sparkle particles. Scattered across the hillside and winding pathways, tiny chrome-and-candy-colored robots with round glass domes trundle along, carrying trays of oversized glowing lollipops that pulse with soft neon light in rainbow hues. The hill itself is dotted with oversized gumdrop rocks, licorice-vine fences, and lollipop-shaped lampposts, all bathed in warm golden morning light casting long, soft shadows. The camera performs a slow, majestic crane shot, rising steadily from a low angle near the base of the hill to reveal the full scale and whimsical grandeur of the brain-shaped factory, sweeping upward past drifting candy smoke to frame the entire fantastical structure against the brightening sky. The color palette is highly saturated and joyful—vivid pinks, purples, teals, and golds—rendered with a glossy, storybook-illustration quality, hyper-detailed textures resembling polished candy, glass, and metal, cinematic depth of field, soft volumetric lighting, and a sense of magical wonder permeating the entire scene.",
+      "name": "Iteration 9129",
+      "createdAt": "2026-07-14T18:42:59.130Z"
+    },
+    {
+      "id": "img_1784054555446",
+      "path": "assets/img_1784054555159.png",
+      "prompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A gigantic factory sculpted in the shape of an enormous whimsical brain, its glossy folds rendered in bubblegum pink, electric lilac, and mint green, perched triumphantly atop a rolling green hill beneath a soft pastel-blue sky streaked with cotton-candy clouds. Dozens of quirky, twisted chimneys sprout from the brain's ridges like candy canes and swirled soft-serve cones, exhaling plumes of colorful smoke in bubblegum-blue, sunshine-yellow, and cherry-red that drift lazily upward and dissolve into playful sparkle particles. Scattered across the hillside and winding pathways, tiny chrome-and-candy-colored robots with round glass domes trundle along, carrying trays of oversized glowing lollipops that pulse with soft neon light in rainbow hues. The hill itself is dotted with oversized gumdrop rocks, licorice-vine fences, and lollipop-shaped lampposts, all bathed in warm golden morning light casting long, soft shadows. The camera performs a slow, majestic crane shot, rising steadily from a low angle near the base of the hill to reveal the full scale and whimsical grandeur of the brain-shaped factory, sweeping upward past drifting candy smoke to frame the entire fantastical structure against the brightening sky. The color palette is highly saturated and joyful—vivid pinks, purples, teals, and golds—rendered with a glossy, storybook-illustration quality, hyper-detailed textures resembling polished candy, glass, and metal, cinematic depth of field, soft volumetric lighting, and a sense of magical wonder permeating the entire scene.",
+      "name": "Iteration 5446",
+      "createdAt": "2026-07-14T18:42:35.446Z"
+    }
+  ],
+  "videoGallery": [
+    {
+      "id": "vid_1784056426239",
+      "path": "assets/vid_1784056425386.mp4",
+      "prompt": "Close-up, INT. EXPERIMENT TABLE - DAY. A shimmering, translucent recipe card labeled \"Brain Candy Formula 42½\" in elegant glowing script hovers suspended above a bubbling cauldron of swirling candy-colored liquid—streams of pink, electric blue, and gold twisting hypnotically beneath it. Soft magical light pulses from the card's edges, casting warm reflections across the tabletop and nearby glass beakers and jars filled with colorful confections. Tiny luminous particles drift lazily upward from the cauldron's surface, catching the light like enchanted dust, some circling the card as if drawn to its glow. Wisps of fragrant steam curl and dissolve into the air, subtly shifting hues in sync with the bubbling brew below. The focus stays sharp on the card and cauldron's surface, with a gentle shallow depth of field blurring the background into a dreamy bokeh of warm ambient light. The overall atmosphere feels whimsical yet scientific—an enchanted kitchen-lab where magic and experimentation blend seamlessly.",
+      "name": "Iteration 6236",
+      "createdAt": "2026-07-14T19:13:46.239Z"
+    },
+    {
+      "id": "vid_1784056078231",
+      "path": "assets/vid_1784056077692.mp4",
+      "prompt": "Medium shot, INT. MAIN LAB - DAY. Professor Fizzlebop—a frizzy-haired scientist with wild static-charged curls and oversized goggles magnifying his bulging, expressive eyes—juggles three bubbling beakers filled with glowing green and purple liquids, each fizzing and sloshing precariously with every arc through the air. He chomps rhythmically on a wad of neon-blue gum, which crackles and pops with tiny sparking lightning bolts between his teeth, illuminating his face in flickering electric light. His exaggerated expressions shift comically—eyes widening in mock panic as a beaker wobbles, cheeks puffing with an exaggerated grin as he catches it, eyebrows shooting up in cartoonish surprise. Chaotic lab shelves cluttered with mismatched bottles, tesla coils sparking softly, and steam vents hissing in the background add kinetic energy. Warm overhead lighting mixes with the cool blue-green glow of the chemicals, casting dynamic shadows that dance with his movements. The camera holds steady at medium framing, capturing his full comedic physicality—the wobbly juggling, the snapping gum sparks, the frantic yet joyful energy—timed for punchy comedic beats, with quick reaction pauses emphasizing each near-mishap.",
+      "name": "Iteration 8230",
+      "createdAt": "2026-07-14T19:07:58.231Z"
+    },
+    {
+      "id": "vid_1784055364677",
+      "path": "assets/vid_1784055363288.mp4",
+      "prompt": "Wide establishing shot, EXT. BRAIN CANDY LAB - MORNING. A slow, sweeping crane shot rises to reveal a whimsical factory shaped like a giant candy-colored brain, its glossy pink and lavender folds glistening under soft morning light, perched atop a lush emerald hill dotted with lollipop-shaped trees. Playful chimneys shaped like swirled candy canes puff soft plumes of pastel smoke—cotton-candy pink, minty green, and bubblegum blue—drifting lazily into a golden sky streaked with sherbet-orange clouds. Tiny chrome robots with glowing antennae zip along winding candy-cane rails encircling the structure, each carrying luminous, oversized lollipops that pulse with soft internal light. The hillside sparkles with dew, catching prismatic reflections from the factory's sugary sheen. As the camera glides upward and forward, the scale of the brain-shaped building becomes awe-inspiring, its folds pulsing faintly as if alive, synapses glowing like veins of light beneath the candy shell. The atmosphere is joyful and hyper-saturated, rendered in a hyperreal storybook style with soft volumetric lighting, gentle lens flares, and a dreamy, magical morning haze settling over the fantastical landscape.",
+      "name": "Iteration 4676",
+      "createdAt": "2026-07-14T18:56:04.677Z"
+    }
+  ],
+  "referenceImages": [],
+  "assetLibrary": [
+    {
+      "id": "asset_1785160909910",
+      "tag": "Fizzlebop",
+      "type": "character",
+      "name": "Professor Fizzlebop",
+      "description": "wild-haired scientist, oversized brass goggles, stained lab coat",
+      "images": [],
+      "primaryImage": null
+    }
+  ],
+  "promptSnippets": [
+    {
+      "id": "s1",
+      "name": "Establish",
+      "text": "wide establishing shot, scale detail"
+    },
+    {
+      "id": "s2",
+      "name": "Close Up",
+      "text": "cinematic macro close up shot, shallow depth of field"
+    },
+    {
+      "id": "s3",
+      "name": "Cyberpunk",
+      "text": "neon cyberpunk aesthetic, volumetric haze, atmospheric reflections"
+    },
+    {
+      "id": "s4",
+      "name": "Tracking",
+      "text": "slow smooth tracking shot, camera moving forward"
+    },
+    {
+      "id": "s5",
+      "name": "8K Film",
+      "text": "photorealistic 8k octane render, cinematic lighting, 35mm film grain"
+    }
+  ],
+  "activeLlm": "claude",
+  "llmModel": "claude-sonnet-5",
+  "activeImageGenerator": "fal-ai",
+  "imageModel": "fal-ai/flux/dev/redux",
+  "imageResolution": "16:9",
+  "activeVideoGenerator": "fal-ai",
+  "videoResolution": "1280x720",
+  "videoModel": "fal-ai/kling-video",
+  "videoDuration": "5",
+  "prePrompt": "",
+  "postPrompt": "",
+  "videoPrePrompt": "",
+  "videoPostPrompt": "",
+  "imageSystemPrompt": "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual description optimized for AI generation (like Flux/Midjourney or Kling). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.",
+  "videoSystemPrompt": "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual video description optimized for AI generation (like Kling, Runway, or Veo). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.",
+  "concatenatedVideo": "assets/master_1784056469606.mp4",
+  "activeSceneId": "scene_1",
+  "activeShotId": "shot_1_1"
+}
