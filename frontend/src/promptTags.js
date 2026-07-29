@@ -76,6 +76,18 @@ export function defaultAssetPrompt(asset) {
   return template(name || description, description);
 }
 
+/**
+ * The single image an asset contributes to a generation.
+ *
+ * `images` holds every reference generated or uploaded for the asset; the
+ * primary is the one the user chose to represent it. Falls back to the first
+ * image for assets saved before a primary was picked.
+ */
+export function assetPrimaryImage(asset) {
+  if (!asset) return null;
+  return asset.primaryImage || (asset.images || [])[0] || null;
+}
+
 /** The text an asset contributes when its tag is substituted into a prompt. */
 export function assetPromptText(asset) {
   if (!asset) return '';
@@ -111,15 +123,15 @@ export function resolvePromptTags(text, assetLibrary) {
     }
     if (!resolved.some(a => a.id === asset.id)) {
       resolved.push(asset);
-      const assetImages = asset.primaryImage
-        ? [asset.primaryImage, ...(asset.images || []).filter(p => p !== asset.primaryImage)]
-        : (asset.images || []);
-      assetImages.forEach(imagePath => {
-        if (imagePath && !seenPaths.has(imagePath)) {
-          seenPaths.add(imagePath);
-          imagePaths.push(imagePath);
-        }
-      });
+      // Exactly one image per asset: the primary. `images` is the asset's
+      // iteration gallery — the rejected takes — so sending all of them lets a
+      // single character with a long history eat every input slot and starve
+      // the other tags in the prompt.
+      const imagePath = assetPrimaryImage(asset);
+      if (imagePath && !seenPaths.has(imagePath)) {
+        seenPaths.add(imagePath);
+        imagePaths.push(imagePath);
+      }
     }
     return assetPromptText(asset) || whole;
   });
@@ -136,37 +148,73 @@ function joinFragments(fragments) {
 }
 
 /**
- * Build the exact string sent to a generation model.
+ * Build the exact string sent to a generation model, and decide which
+ * reference images travel with it.
  *
- * Applies the global pre-prompt, the shot prompt with its <Tag>s substituted,
- * and the global post-prompt, then works out which reference images travel with
- * it — tagged assets first, then whatever the user picked by hand, trimmed to
- * what the target model actually accepts.
+ * Ordering is deliberate and never reshuffled: **primaryImagePaths first**,
+ * tagged-asset images after. The primary slot is what the user explicitly
+ * chose for this generation — the shot's selected still for a video, or the
+ * references picked by hand for an image. Tagged assets are supporting
+ * material, so when a model accepts only one input (Kling, most i2v models)
+ * the explicit choice is the one that survives the trim.
+ *
+ * Getting this backwards silently swaps a shot's own frame for a character
+ * portrait, which is both wrong and expensive, so `imageSources` reports the
+ * final list with provenance for the UI to display before anything is spent.
  */
 export function composeGenerationPrompt({
   prompt,
   prePrompt = '',
   postPrompt = '',
   assetLibrary = [],
-  manualImagePaths = [],
+  primaryImagePaths = [],
+  attachTaggedImages = true,
+  excludedImagePaths = [],
   type = 'image',
   modelId = ''
 }) {
   const resolution = resolvePromptTags(prompt, assetLibrary);
   const finalPrompt = joinFragments([prePrompt, resolution.text, postPrompt]);
 
-  const capacity = refImageCapacity(type, modelId);
-  const merged = [];
-  [...resolution.imagePaths, ...manualImagePaths].forEach(imagePath => {
-    if (imagePath && !merged.includes(imagePath)) merged.push(imagePath);
+  // Map each tagged image back to the asset it came from, for labelling.
+  const tagByPath = new Map();
+  resolution.assets.forEach(asset => {
+    const imagePath = assetPrimaryImage(asset);
+    if (imagePath && !tagByPath.has(imagePath)) tagByPath.set(imagePath, asset.tag);
   });
-  const inputImagePaths = capacity > 0 ? merged.slice(0, capacity) : [];
+
+  const ordered = [];
+  const seen = new Set();
+  const push = (imagePath, origin, label) => {
+    if (!imagePath || seen.has(imagePath) || (Array.isArray(excludedImagePaths) && excludedImagePaths.includes(imagePath))) return;
+    seen.add(imagePath);
+    ordered.push({ path: imagePath, origin, label });
+  };
+
+  primaryImagePaths.forEach(p => push(p, 'primary', type === 'video' ? 'Shot image' : 'Selected reference'));
+  if (attachTaggedImages) {
+    resolution.imagePaths.forEach(p => push(p, 'tag', `<${tagByPath.get(p) || '?'}>`));
+  }
+
+  const capacity = refImageCapacity(type, modelId);
+  const kept = capacity > 0 ? ordered.slice(0, capacity) : [];
+  const dropped = ordered.slice(kept.length);
 
   return {
     prompt: finalPrompt,
-    inputImagePaths,
-    droppedImagePaths: merged.slice(inputImagePaths.length),
+    inputImagePaths: kept.map(entry => entry.path),
+    imageSources: kept,
+    droppedImageSources: dropped,
+    droppedImagePaths: dropped.map(entry => entry.path),
     taggedAssets: resolution.assets,
+    // Assets whose images were left out entirely — the caller may want to warn.
+    unusedTaggedAssets: attachTaggedImages
+      ? resolution.assets.filter(a => {
+        const imagePath = assetPrimaryImage(a);
+        return imagePath && !kept.some(k => k.path === imagePath);
+      })
+      : resolution.assets,
+    attachTaggedImages,
     missingTags: resolution.missing,
     capacity
   };

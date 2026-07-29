@@ -458,6 +458,17 @@ app.get('/api/project-images', (req, res) => {
   }
 });
 
+// Pull text out of a provider response, failing readably. Models return empty
+// candidates more often than you'd expect (safety stops, token limits), and
+// reaching straight for .text turns those into a cryptic undefined error.
+function requireText(value, providerLabel, detail) {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  throw new Error(
+    `${providerLabel} returned no text${detail ? ` (${detail})` : ''}. ` +
+    'The response was likely blocked or cut short - try rewording, or a different model.'
+  );
+}
+
 // --- LLM PROXY ENDPOINTS ---
 app.post('/api/llm/generate', async (req, res) => {
   const { provider, prompt, systemPrompt, model } = req.body;
@@ -482,7 +493,10 @@ app.post('/api/llm/generate', async (req, res) => {
 
       const data = await response.json();
       if (data.error) throw new Error(data.error.message || 'Gemini API Error');
-      responseText = data.candidates[0].content.parts[0].text;
+      const candidate = data.candidates?.[0];
+      responseText = requireText(
+        candidate?.content?.parts?.map(p => p.text).filter(Boolean).join('\n'),
+        'Gemini', candidate?.finishReason || data.promptFeedback?.blockReason);
 
     } else if (provider === 'chatgpt') {
       const apiKey = config.openaiKey;
@@ -507,7 +521,8 @@ app.post('/api/llm/generate', async (req, res) => {
 
       const data = await response.json();
       if (data.error) throw new Error(data.error.message || 'OpenAI API Error');
-      responseText = data.choices[0].message.content;
+      const choice = data.choices?.[0];
+      responseText = requireText(choice?.message?.content, 'OpenAI', choice?.finish_reason);
 
     } else if (provider === 'claude') {
       const apiKey = config.claudeKey;
@@ -533,7 +548,9 @@ app.post('/api/llm/generate', async (req, res) => {
 
       const data = await response.json();
       if (data.error) throw new Error(data.error.message || 'Claude API Error');
-      responseText = data.content[0].text;
+      responseText = requireText(
+        data.content?.filter(b => b.type === 'text').map(b => b.text).join('\n'),
+        'Claude', data.stop_reason);
     } else {
       throw new Error(`Unsupported LLM provider: ${provider}`);
     }
@@ -1264,52 +1281,119 @@ app.post('/api/lipsync', async (req, res) => {
   }
 });
 
-// --- FFMEG VIDEO CONCATENATION ENDPOINT ---
+// --- FFMPEG VIDEO CONCATENATION ENDPOINT ---
+
+function runFfmpeg(args, label) {
+  return new Promise((resolve, reject) => {
+    const command = `ffmpeg -y ${args}`;
+    exec(command, { maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`FFmpeg (${label}) failed:`, stderr?.slice(-1500));
+        reject(new Error(`${label} failed. ${stderr ? stderr.trim().split('\n').slice(-3).join(' ') : error.message}`));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+/**
+ * Concatenate a timeline into one file.
+ *
+ * `items` is an ordered list of { video?, image?, duration? }. A shot with no
+ * video contributes its still image held for `duration` seconds, so a partly
+ * generated edit still plays end to end as an animatic.
+ *
+ * Every segment is re-encoded to identical parameters first. The concat demuxer
+ * with `-c copy` only works when inputs already agree on codec, resolution and
+ * timebase, which generated clips and stills never do.
+ */
 app.post('/api/concatenate', async (req, res) => {
-  const { videoPaths } = req.body; // Array of relative paths e.g. ["assets/vid1.mp4", "assets/vid2.mp4"]
-  
-  if (!videoPaths || !Array.isArray(videoPaths) || videoPaths.length === 0) {
-    return res.status(400).json({ error: 'No video files provided for concatenation.' });
+  const { videoPaths, items, width = 1280, height = 720, fps = 24, placeholderSeconds = 5 } = req.body;
+
+  // Accept the legacy videoPaths array as well as the richer items list.
+  const timeline = Array.isArray(items) && items.length > 0
+    ? items
+    : (Array.isArray(videoPaths) ? videoPaths.map(v => ({ video: v })) : []);
+
+  if (timeline.length === 0) {
+    return res.status(400).json({ error: 'Nothing to concatenate.' });
   }
 
+  const root = getWorkingRoot();
+  const resolve = (relative) => {
+    if (!relative) return null;
+    const absolute = path.join(root, relative);
+    return fs.existsSync(absolute) ? absolute : null;
+  };
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mm_concat_'));
+  const segments = [];
+  let videoCount = 0;
+  let stillCount = 0;
+  const skipped = [];
+
   try {
-    // Generate absolute paths and verify files exist
-    const validPaths = videoPaths.map(p => path.join(getWorkingRoot(), p)).filter(p => fs.existsSync(p));
-    
-    if (validPaths.length === 0) {
-      throw new Error('None of the selected video files exist on the server.');
+    // Normalise every entry to one common encode.
+    const commonVideo = `-vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}" `
+      + `-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p`;
+
+    for (let index = 0; index < timeline.length; index++) {
+      const entry = timeline[index] || {};
+      const videoPath = resolve(entry.video);
+      const imagePath = resolve(entry.image);
+      const segmentPath = path.join(workDir, `seg_${String(index).padStart(3, '0')}.mp4`);
+
+      if (videoPath) {
+        // Silent audio keeps every segment's stream layout identical, so clips
+        // with and without sound can be concatenated together.
+        await runFfmpeg(
+          `-i "${videoPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 `
+          + `${commonVideo} -c:a aac -shortest -map 0:v:0 -map 1:a:0 "${segmentPath}"`,
+          `segment ${index + 1} (video)`
+        );
+        videoCount++;
+      } else if (imagePath) {
+        const seconds = Number(entry.duration) > 0 ? Number(entry.duration) : placeholderSeconds;
+        await runFfmpeg(
+          `-loop 1 -t ${seconds} -i "${imagePath}" -f lavfi -t ${seconds} -i anullsrc=channel_layout=stereo:sample_rate=44100 `
+          + `${commonVideo} -c:a aac -map 0:v:0 -map 1:a:0 "${segmentPath}"`,
+          `segment ${index + 1} (still)`
+        );
+        stillCount++;
+      } else {
+        skipped.push(entry.name || `#${index + 1}`);
+        continue;
+      }
+      segments.push(segmentPath);
     }
 
-    // Create file list for ffmpeg concat demuxer
-    const listFilePath = path.join(getWorkingRoot(), 'concat_list.txt');
-    const listContent = validPaths.map(p => `file '${p.replace(/\\/g, '/')}'`).join('\n');
-    fs.writeFileSync(listFilePath, listContent, 'utf8');
+    if (segments.length === 0) {
+      throw new Error('No shot had a video or an image to use.');
+    }
+
+    const listFilePath = path.join(workDir, 'concat_list.txt');
+    fs.writeFileSync(listFilePath, segments.map(p => `file '${p.replace(/\\/g, '/')}'`).join('\n'), 'utf8');
 
     const outputFilename = `master_${Date.now()}.mp4`;
     const outputFilePath = path.join(getAssetsDir(), outputFilename);
+    await runFfmpeg(`-f concat -safe 0 -i "${listFilePath}" -c copy "${outputFilePath}"`, 'concatenation');
 
-    // Run FFmpeg command
-    // Using -safe 0 because we pass absolute paths, and -c copy to quickly stitch them without re-encoding
-    const ffmpegCmd = `ffmpeg -y -f concat -safe 0 -i "${listFilePath}" -c copy "${outputFilePath}"`;
-    
-    console.log('Running FFmpeg Command:', ffmpegCmd);
-    exec(ffmpegCmd, (error, stdout, stderr) => {
-      // Clean up temporary list file
-      try { fs.unlinkSync(listFilePath); } catch (e) {}
-
-      if (error) {
-        console.error('FFmpeg Concatenation Error:', error);
-        console.error('stderr:', stderr);
-        return res.status(500).json({ error: 'FFmpeg processing failed. Make sure all select videos have the same resolution/codec, and FFmpeg is installed.', details: stderr });
-      }
-
-      console.log('FFmpeg finished successfully');
-      res.json({ filePath: `assets/${outputFilename}` });
+    res.json({
+      filePath: `assets/${outputFilename}`,
+      videoCount,
+      stillCount,
+      skipped
     });
-
   } catch (error) {
-    console.error('Concatenation endpoint error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Concatenation error:', error);
+    res.status(500).json({
+      error: /not recognized|ENOENT/i.test(error.message)
+        ? 'FFmpeg is not installed or not on PATH.'
+        : error.message
+    });
+  } finally {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
 

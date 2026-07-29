@@ -33,7 +33,8 @@ import {
   Layers,
   Copy,
   Zap,
-  StopCircle
+  StopCircle,
+  LayoutGrid
 } from 'lucide-react';
 import {
   IMAGE_MODELS,
@@ -135,6 +136,15 @@ export default function App() {
   const [videoDuration, setVideoDuration] = useState('5');
   const [videoSystemPrompt, setVideoSystemPrompt] = useState(DEFAULT_VIDEO_SYSTEM_PROMPT);
 
+  // --- REFERENCE IMAGE ATTACHMENT DEFAULTS ---
+  // Images want the tagged character/environment art for consistency. Video is
+  // driven by the shot's own still, and most i2v models take a single input —
+  // attaching a character portrait there silently replaces the frame you meant
+  // to animate, so it is off unless explicitly asked for.
+  const [attachTagsForImages, setAttachTagsForImages] = useState(true);
+  const [attachTagsForVideos, setAttachTagsForVideos] = useState(false);
+  const [genModalAttachTags, setGenModalAttachTags] = useState(true);
+
   // --- GLOBAL PRE/POST PROMPTS (wrapped around every generated prompt) ---
   const [prePrompt, setPrePrompt] = useState('');
   const [postPrompt, setPostPrompt] = useState('');
@@ -183,6 +193,7 @@ export default function App() {
   const [genModalDuration, setGenModalDuration] = useState('5');
   const [genModalModel, setGenModalModel] = useState('');
   const [genModalRes, setGenModalRes] = useState('');
+  const [genModalExcludedImages, setGenModalExcludedImages] = useState([]);
 
   // --- DOUBLE CLICK PREVIEW WITH ZOOM & PAN ---
   const [zoomImage, setZoomImage] = useState(null); // { path: string, name: string }
@@ -361,6 +372,8 @@ export default function App() {
     setPostPrompt(state.postPrompt || '');
     setVideoPrePrompt(state.videoPrePrompt || '');
     setVideoPostPrompt(state.videoPostPrompt || '');
+    setAttachTagsForImages(state.attachTagsForImages !== false);
+    setAttachTagsForVideos(state.attachTagsForVideos === true);
     setImageSystemPrompt(state.imageSystemPrompt || DEFAULT_IMAGE_SYSTEM_PROMPT);
     setVideoSystemPrompt(state.videoSystemPrompt || DEFAULT_VIDEO_SYSTEM_PROMPT);
     setConcatenatedVideo(state.concatenatedVideo || null);
@@ -407,6 +420,8 @@ export default function App() {
       postPrompt,
       videoPrePrompt,
       videoPostPrompt,
+      attachTagsForImages,
+      attachTagsForVideos,
       imageSystemPrompt,
       videoSystemPrompt,
       concatenatedVideo: extra.concatenatedVideo !== undefined ? extra.concatenatedVideo : concatenatedVideo,
@@ -666,6 +681,9 @@ export default function App() {
       .filter(Boolean)
       .slice(0, 3));
     setGenModalDuration(videoDuration);
+    setGenModalExcludedImages([]);
+
+    setGenModalAttachTags(type === 'image' ? attachTagsForImages : attachTagsForVideos);
 
     // Per-shot overrides (set by shot list import) win over project defaults.
     if (type === 'image') {
@@ -679,16 +697,34 @@ export default function App() {
 
     let initialPromptText = '';
     if (existingPromptId) {
-      const promptList = type === 'image' ? shot.imagePrompts : shot.videoPrompts;
+      // "Add Iteration" must reproduce the group exactly — prompt *and* every
+      // setting — or the result lands in a new group instead of this gallery.
+      const promptList = (type === 'image' ? shot.imagePrompts : shot.videoPrompts) || [];
       const found = promptList.find(p => p.id === existingPromptId);
-      if (found) initialPromptText = found.prompt;
+      if (found) {
+        // Reload the RAW prompt. `found.prompt` is the composed text with the
+        // global pre/post already baked in — feeding that back would apply them
+        // twice and fork a new group instead of adding to this one.
+        // Older groups predate rawPrompt, so fall back to the composed text.
+        initialPromptText = found.rawPrompt ?? found.prompt ?? '';
+        if (found.model) setGenModalModel(found.model);
+        if (found.resolution) setGenModalRes(found.resolution);
+        if (found.attachTaggedImages !== undefined) setGenModalAttachTags(found.attachTaggedImages !== false);
+        setGenModalExcludedImages(found.excludedImagePaths || []);
+        if (type === 'image') {
+          setGenModalInputImages(found.primaryImagePaths || found.inputImagePaths || []);
+        } else {
+          if (found.duration) setGenModalDuration(found.duration);
+          setGenModalImageInput((found.primaryImagePaths || [])[0] ?? found.imageInput ?? '');
+        }
+      }
     } else {
       const draftField = type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
       initialPromptText = shot[draftField] !== undefined && shot[draftField] !== null && shot[draftField] !== '' ? shot[draftField] : (shot.description || '');
+      setGenModalImageInput(shot.selectedImage || '');
     }
 
     setGenModalPrompt(initialPromptText);
-    setGenModalImageInput(shot.selectedImage || '');
   };
 
   const updateDraftPrompt = (val) => {
@@ -744,6 +780,7 @@ export default function App() {
 
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed prompt generation');
+      if (!data.text?.trim()) throw new Error('The model returned an empty prompt.');
 
       setGenModalPrompt(data.text);
       updateDraftPrompt(data.text);
@@ -756,18 +793,60 @@ export default function App() {
     }
   };
 
+  // Identity of a prompt group.
+  //
+  // Keyed on the RAW inputs the user controls, never the composed output. The
+  // composed prompt already has the global pre/post text baked in, so matching
+  // on it meant "+ Add Iteration" — which reloads the group and recomposes —
+  // produced a different string every time and forked a fresh group.
+  const imagePromptSignature = (group) => JSON.stringify([
+    group.rawPrompt ?? group.prompt ?? '',
+    group.model || '',
+    group.resolution || '',
+    group.primaryImagePaths || [],
+    group.attachTaggedImages !== false,
+    group.excludedImagePaths || []
+  ]);
+
+  const videoPromptSignature = (group) => JSON.stringify([
+    group.rawPrompt ?? group.prompt ?? '',
+    group.model || '',
+    group.resolution || '',
+    group.duration || '',
+    group.primaryImagePaths || [],
+    group.attachTaggedImages !== false,
+    group.excludedImagePaths || []
+  ]);
+
   // --- PROMPT COMPOSITION ---
   // The single place where a raw shot prompt becomes the string a model sees:
   // global pre/post prompt + <Tag> substitution + reference image resolution.
-  const buildPrompt = (type, rawPrompt, modelId, manualImagePaths = []) => composeGenerationPrompt({
+  const buildPrompt = (type, rawPrompt, modelId, primaryImagePaths = [], attachTaggedImages = null, excludedImagePaths = []) => composeGenerationPrompt({
     prompt: rawPrompt,
     prePrompt: type === 'image' ? prePrompt : videoPrePrompt,
     postPrompt: type === 'image' ? postPrompt : videoPostPrompt,
     assetLibrary,
-    manualImagePaths,
+    primaryImagePaths,
+    attachTaggedImages: attachTaggedImages === null
+      ? (type === 'image' ? attachTagsForImages : attachTagsForVideos)
+      : attachTaggedImages,
+    excludedImagePaths,
     type,
     modelId
   });
+
+  const handleDeselectSentImage = (imagePath, origin) => {
+    if (origin === 'primary') {
+      if (generationModal?.type === 'image') {
+        setGenModalInputImages(prev => prev.filter(p => p !== imagePath));
+      } else {
+        if (genModalImageInput === imagePath) {
+          setGenModalImageInput('');
+        }
+      }
+    }
+    setGenModalExcludedImages(prev => [...prev, imagePath]);
+  };
 
   // --- BACKGROUND GENERATION SUBMISSION ---
   const handleTriggerGeneration = () => {
@@ -787,9 +866,11 @@ export default function App() {
       model: genModalModel,
       resolution: genModalRes,
       duration: genModalDuration,
-      manualImagePaths: type === 'image'
+      primaryImagePaths: type === 'image'
         ? genModalInputImages
-        : (genModalImageInput ? [genModalImageInput] : [])
+        : (genModalImageInput ? [genModalImageInput] : []),
+      attachTaggedImages: genModalAttachTags,
+      excludedImagePaths: genModalExcludedImages
     });
   };
 
@@ -799,11 +880,15 @@ export default function App() {
    * Resolves (never rejects) once the job settles.
    */
   const submitGenerationJob = async ({
-    type, shotId, shotName, existingPromptId = null,
-    rawPrompt, model, resolution, duration, manualImagePaths = []
+    type, shotId, shotName,
+    // existingPromptId is no longer needed: groups are matched by their recipe,
+    // so a generation lands in the right gallery regardless of where it started.
+    rawPrompt, model, resolution, duration,
+    primaryImagePaths = [], attachTaggedImages = null,
+    excludedImagePaths = []
   }) => {
     const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const composed = buildPrompt(type, rawPrompt, model, manualImagePaths);
+    const composed = buildPrompt(type, rawPrompt, model, primaryImagePaths, attachTaggedImages, excludedImagePaths);
 
     setBatchJobs(prev => [{
       id: jobId,
@@ -822,13 +907,26 @@ export default function App() {
       showToast(`Unknown asset tag${composed.missingTags.length === 1 ? '' : 's'}: <${composed.missingTags.join('>, <')}> — sent as literal text.`, 'warning');
     }
 
+    // What the group is keyed on: exactly what the user chose, so reopening it
+    // reproduces this generation byte for byte.
+    const recipe = {
+      rawPrompt: rawPrompt || '',
+      model,
+      resolution,
+      duration,
+      primaryImagePaths,
+      attachTaggedImages: composed.attachTaggedImages,
+      excludedImagePaths
+    };
+
     if (type === 'image') {
-      return runAsyncImageJob(jobId, shotId, existingPromptId, composed.prompt, model, resolution, composed.inputImagePaths);
+      return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe);
     }
-    return runAsyncVideoJob(jobId, shotId, existingPromptId, composed.prompt, model, resolution, duration, composed.inputImagePaths[0] || '');
+    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths[0] || '', recipe);
   };
 
-  const runAsyncImageJob = async (jobId, shotId, existingPromptId, promptText, model, resOption, inputImagePaths = []) => {
+  const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}) => {
+    const { model, resolution: resOption } = recipe;
     try {
       const res = await apiFetch(`/api/image/generate`, {
         method: 'POST',
@@ -852,6 +950,7 @@ export default function App() {
         createdAt: new Date().toISOString()
       };
 
+      let groupId = null;
       setScenes(prevScenes => prevScenes.map(scene => {
         const hasShot = (scene.shots || []).some(s => s.id === shotId);
         if (!hasShot) return scene;
@@ -860,41 +959,44 @@ export default function App() {
           ...scene,
           shots: scene.shots.map(s => {
             if (s.id === shotId) {
+              // Match on the settings themselves, across every group — not just
+              // the one this generation was launched from. Re-running with
+              // identical settings belongs in the same gallery, otherwise the
+              // dropdown fills with indistinguishable duplicates.
               let updatedPrompts = [...(s.imagePrompts || [])];
-              const existingGroup = existingPromptId ? updatedPrompts.find(p => p.id === existingPromptId) : null;
-              
-              // Verify if prompt AND settings match exactly
-              const isMatch = existingGroup &&
-                existingGroup.prompt === promptText &&
-                existingGroup.model === model &&
-                existingGroup.resolution === resOption &&
-                JSON.stringify(existingGroup.inputImagePaths || []) === JSON.stringify(inputImagePaths || []);
+              const signature = imagePromptSignature(recipe);
+              const matchIndex = updatedPrompts.findIndex(p => imagePromptSignature(p) === signature);
 
-              if (isMatch) {
-                updatedPrompts = updatedPrompts.map(p => 
-                  p.id === existingPromptId ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
-                );
+              if (matchIndex >= 0) {
+                updatedPrompts = updatedPrompts.map((p, i) => (
+                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
+                ));
+                groupId = updatedPrompts[matchIndex].id;
               } else {
+                groupId = 'prompt_img_' + Date.now();
                 updatedPrompts.push({
-                  id: 'prompt_img_' + Date.now(),
-                  prompt: promptText,
-                  model: model,
-                  resolution: resOption,
-                  inputImagePaths: inputImagePaths,
+                  id: groupId,
+                  ...recipe,
+                  prompt: promptText,          // composed, for display
+                  inputImagePaths,             // what actually went to the model
                   outputs: [newOutput]
                 });
               }
 
-              return { 
-                ...s, 
+              return {
+                ...s,
                 imagePrompts: updatedPrompts,
-                selectedImage: s.selectedImage ? s.selectedImage : newOutput.path 
+                // Always jump to what was just made — you asked for it, so show it.
+                selectedImage: newOutput.path
               };
             }
             return s;
           })
         };
       }));
+
+      // Show the gallery the new image landed in.
+      if (groupId) setActiveShotImagePromptGroup(prev => ({ ...prev, [shotId]: groupId }));
 
       // Append to global gallery
       setImageGallery(prevGal => [{
@@ -918,7 +1020,8 @@ export default function App() {
     }
   };
 
-  const runAsyncVideoJob = async (jobId, shotId, existingPromptId, promptText, model, resOption, duration, imageInput) => {
+  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInput, recipe = {}) => {
+    const { model, resolution: resOption, duration } = recipe;
     try {
       const imageUrlsToSend = imageInput ? [imageInput] : [];
       const res = await apiFetch(`/api/video/generate`, {
@@ -945,6 +1048,7 @@ export default function App() {
         createdAt: new Date().toISOString()
       };
 
+      let groupId = null;
       setScenes(prevScenes => prevScenes.map(scene => {
         const hasShot = (scene.shots || []).some(s => s.id === shotId);
         if (!hasShot) return scene;
@@ -953,43 +1057,39 @@ export default function App() {
           ...scene,
           shots: scene.shots.map(s => {
             if (s.id === shotId) {
+              // Same rule as images: identical settings share one gallery.
               let updatedPrompts = [...(s.videoPrompts || [])];
-              const existingGroup = existingPromptId ? updatedPrompts.find(p => p.id === existingPromptId) : null;
-              
-              // Verify if prompt and settings match exactly
-              const isMatch = existingGroup &&
-                existingGroup.prompt === promptText &&
-                existingGroup.model === model &&
-                existingGroup.resolution === resOption &&
-                existingGroup.duration === duration &&
-                existingGroup.imageInput === imageInput;
+              const signature = videoPromptSignature(recipe);
+              const matchIndex = updatedPrompts.findIndex(p => videoPromptSignature(p) === signature);
 
-              if (isMatch) {
-                updatedPrompts = updatedPrompts.map(p => 
-                  p.id === existingPromptId ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
-                );
+              if (matchIndex >= 0) {
+                updatedPrompts = updatedPrompts.map((p, i) => (
+                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
+                ));
+                groupId = updatedPrompts[matchIndex].id;
               } else {
+                groupId = 'prompt_vid_' + Date.now();
                 updatedPrompts.push({
-                  id: 'prompt_vid_' + Date.now(),
-                  prompt: promptText,
-                  model: model,
-                  resolution: resOption,
-                  duration: duration,
-                  imageInput: imageInput,
+                  id: groupId,
+                  ...recipe,
+                  prompt: promptText,          // composed, for display
+                  imageInput,
                   outputs: [newOutput]
                 });
               }
 
-              return { 
-                ...s, 
+              return {
+                ...s,
                 videoPrompts: updatedPrompts,
-                selectedVideo: s.selectedVideo ? s.selectedVideo : newOutput.path 
+                selectedVideo: newOutput.path
               };
             }
             return s;
           })
         };
       }));
+
+      if (groupId) setActiveShotVideoPromptGroup(prev => ({ ...prev, [shotId]: groupId }));
 
       // Append to global video gallery
       setVideoGallery(prevGal => [{
@@ -1088,9 +1188,9 @@ export default function App() {
           ? (shot.imageResolution || imageResolution)
           : (shot.videoResolution || videoResolution);
 
-        // Video batches default to driving from the shot's selected still, which
-        // is the usual storyboard-to-motion flow.
-        const manualImagePaths = isImage
+        // Video batches animate the shot's own selected still. That image is
+        // the primary input and must never be displaced by a tagged asset.
+        const primaryImagePaths = isImage
           ? (shot.referenceImages || []).map(refId => referenceImages.find(r => r.id === refId)?.path).filter(Boolean)
           : (shot.selectedImage ? [shot.selectedImage] : []);
 
@@ -1102,7 +1202,8 @@ export default function App() {
           model,
           resolution,
           duration: shot.videoDuration || videoDuration,
-          manualImagePaths
+          primaryImagePaths,
+          attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
         });
 
         if (result?.ok) completed += 1; else failed += 1;
@@ -1159,7 +1260,8 @@ export default function App() {
       prePrompt: draft.applyGlobalPrompts ? prePrompt : '',
       postPrompt: draft.applyGlobalPrompts ? postPrompt : '',
       assetLibrary: others,
-      manualImagePaths: useRef ? [draft.primaryImage] : [],
+      primaryImagePaths: useRef ? [draft.primaryImage] : [],
+      attachTaggedImages: true,
       type: 'image',
       modelId
     });
@@ -2227,11 +2329,92 @@ Reply with ONLY a JSON object, no markdown fence:
     }
   };
 
+  /** Say plainly how much of a compile was real footage vs held stills. */
+  const describeCompile = (data) => {
+    const parts = [];
+    if (data.videoCount) parts.push(`${data.videoCount} video${data.videoCount === 1 ? '' : 's'}`);
+    if (data.stillCount) parts.push(`${data.stillCount} still${data.stillCount === 1 ? '' : 's'} held as placeholders`);
+    const skipped = data.skipped?.length ? ` ${data.skipped.length} shot(s) skipped (no media).` : '';
+    return `Compiled ${parts.join(' + ') || 'timeline'}.${skipped}`;
+  };
+
+  /**
+   * Grab the frame a <video> is currently showing and save it as a project
+   * image, so you can continue a shot from an exact moment.
+   *
+   * Reads straight from the element rather than re-fetching, so it captures the
+   * frame you are actually looking at. Needs the video to be CORS-clean or the
+   * canvas is tainted and toBlob() throws.
+   */
+  const handleCaptureVideoFrame = async (videoEl, shotId, label = 'frame') => {
+    if (!videoEl || !videoEl.videoWidth) {
+      showToast('Let the video load a frame first.', 'warning');
+      return;
+    }
+    const at = videoEl.currentTime;
+    setLoadingStates(prev => ({ ...prev, capture: true }));
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = videoEl.videoWidth;
+      canvas.height = videoEl.videoHeight;
+      canvas.getContext('2d').drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+
+      const blob = await new Promise((resolve, reject) => {
+        try {
+          canvas.toBlob(b => (b ? resolve(b) : reject(new Error('Frame capture produced no data.'))), 'image/png');
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      const formData = new FormData();
+      formData.append('file', blob, `frame_${Math.round(at * 1000)}.png`);
+      const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not save the frame.');
+
+      const name = `${label} @ ${at.toFixed(2)}s`;
+      setImageGallery(prev => [{
+        id: `img_frame_${Date.now()}`,
+        path: data.filePath,
+        prompt: `Frame captured at ${at.toFixed(2)}s`,
+        name,
+        createdAt: new Date().toISOString()
+      }, ...prev]);
+
+      // Make it the shot's image so the next video can start from this moment.
+      if (shotId) {
+        handleUpdateShotField(shotId, 'selectedImage', data.filePath);
+        showToast(`Captured ${name} — now the shot's image.`, 'success');
+      } else {
+        showToast(`Captured ${name} — saved to the image gallery.`, 'success');
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(
+        /tainted|SecurityError/i.test(err.message || err.name)
+          ? 'The browser blocked reading this video (CORS). Reload the page and try again.'
+          : `Frame capture failed: ${err.message}`,
+        'error'
+      );
+    } finally {
+      setLoadingStates(prev => ({ ...prev, capture: false }));
+    }
+  };
+
   // --- FFMEG COMPILATION ---
   const handleStitchCompilation = async () => {
-    const selects = scenes.flatMap(s => (s.shots || []).map(sh => sh.selectedVideo)).filter(Boolean);
-    if (selects.length === 0) {
-      showToast('No active selected videos found on timeline.', 'warning');
+    // Shots with no video contribute their still, so a partly generated edit
+    // still plays end to end as an animatic.
+    const timeline = scenes.flatMap(s => (s.shots || []).map(sh => ({
+      video: sh.selectedVideo || null,
+      image: sh.selectedImage || null,
+      duration: Number(sh.videoDuration || videoDuration) || 5,
+      name: sh.name
+    }))).filter(entry => entry.video || entry.image);
+
+    if (timeline.length === 0) {
+      showToast('No shot has a video or an image to compile.', 'warning');
       return;
     }
 
@@ -2240,7 +2423,7 @@ Reply with ONLY a JSON object, no markdown fence:
       const res = await apiFetch(`/api/concatenate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videoPaths: selects })
+        body: JSON.stringify({ items: timeline })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'FFmpeg failed');
@@ -2248,7 +2431,7 @@ Reply with ONLY a JSON object, no markdown fence:
       window.open(await resolveAssetUrl(data.filePath), '_blank');
       setConcatenatedVideo(data.filePath);
       saveProjectState(scenes, { concatenatedVideo: data.filePath });
-      showToast('Compilation successful! Stitched output loaded and preview available.', 'success');
+      showToast(describeCompile(data), 'success');
     } catch (err) {
       console.error(err);
       showToast(`Compilation failed: ${err.message}`, 'error');
@@ -2261,9 +2444,15 @@ Reply with ONLY a JSON object, no markdown fence:
     const targetScene = scenes.find(s => s.id === sceneId);
     if (!targetScene) return;
 
-    const selects = (targetScene.shots || []).map(s => s.selectedVideo).filter(Boolean);
-    if (selects.length === 0) {
-      showToast('No active selected videos found in this scene.', 'warning');
+    const timeline = (targetScene.shots || []).map(sh => ({
+      video: sh.selectedVideo || null,
+      image: sh.selectedImage || null,
+      duration: Number(sh.videoDuration || videoDuration) || 5,
+      name: sh.name
+    })).filter(entry => entry.video || entry.image);
+
+    if (timeline.length === 0) {
+      showToast('No shot in this scene has a video or an image.', 'warning');
       return;
     }
 
@@ -2272,7 +2461,7 @@ Reply with ONLY a JSON object, no markdown fence:
       const res = await apiFetch(`/api/concatenate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ videoPaths: selects })
+        body: JSON.stringify({ items: timeline })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'FFmpeg failed');
@@ -2287,7 +2476,7 @@ Reply with ONLY a JSON object, no markdown fence:
       });
       setScenes(updated);
       saveProjectState(updated);
-      showToast('Scene compiled successfully! Preview is active.', 'success');
+      showToast(describeCompile(data), 'success');
     } catch (err) {
       console.error(err);
       showToast(`Scene compilation failed: ${err.message}`, 'error');
@@ -2779,7 +2968,7 @@ Reply with ONLY a JSON object, no markdown fence:
               </>
             ) : (
               <>
-                <Film size={16} /> Concatenate Video
+                <Film size={16} /> <span className="btn-label-optional">Concatenate Video</span>
               </>
             )}
           </button>
@@ -2804,6 +2993,9 @@ Reply with ONLY a JSON object, no markdown fence:
           </div>
 
           {/* Overlays Toggles */}
+          <button className={`btn btn-secondary ${activeOverlay === 'storyboard' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'storyboard' ? null : 'storyboard')} title="Storyboard: every shot's selected image, in order">
+            <LayoutGrid size={16} /> <span className="btn-label-optional">Storyboard</span>
+          </button>
           {(() => {
             const missingImages = assetLibrary.filter(a => (a.images || []).length === 0).length;
             return (
@@ -2814,7 +3006,7 @@ Reply with ONLY a JSON object, no markdown fence:
                   ? 'Character / environment library'
                   : `${assetLibrary.length} asset${assetLibrary.length === 1 ? '' : 's'}${missingImages ? `, ${missingImages} still without an image` : ', all have images'}`}
               >
-                <Users size={16} /> Assets
+                <Users size={16} /> <span className="btn-label-optional">Assets</span>
                 {assetLibrary.length > 0 && (
                   <span style={{
                     marginLeft: '2px', fontSize: '0.7rem', fontWeight: 'bold',
@@ -2828,17 +3020,17 @@ Reply with ONLY a JSON object, no markdown fence:
               </button>
             );
           })()}
-          <button className={`btn btn-secondary ${activeOverlay === 'images' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'images' ? null : 'images')}>
-            <ImageIcon size={16} /> Images
+          <button className={`btn btn-secondary ${activeOverlay === 'images' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'images' ? null : 'images')} title="Master image library">
+            <ImageIcon size={16} /> <span className="btn-label-optional">Images</span>
           </button>
-          <button className={`btn btn-secondary ${activeOverlay === 'videos' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'videos' ? null : 'videos')}>
-            <Film size={16} /> Videos
+          <button className={`btn btn-secondary ${activeOverlay === 'videos' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'videos' ? null : 'videos')} title="Master video library">
+            <Film size={16} /> <span className="btn-label-optional">Videos</span>
           </button>
-          <button className={`btn btn-secondary ${activeOverlay === 'reference' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'reference' ? null : 'reference')}>
-            <FolderOpen size={16} /> Reference
+          <button className={`btn btn-secondary ${activeOverlay === 'reference' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'reference' ? null : 'reference')} title="Reference imagery mood board">
+            <FolderOpen size={16} /> <span className="btn-label-optional">Reference</span>
           </button>
-          <button className={`btn btn-secondary ${activeOverlay === 'snippets' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'snippets' ? null : 'snippets')}>
-            <MessageSquare size={16} /> Snippets
+          <button className={`btn btn-secondary ${activeOverlay === 'snippets' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'snippets' ? null : 'snippets')} title="Prompt snippet library">
+            <MessageSquare size={16} /> <span className="btn-label-optional">Snippets</span>
           </button>
 
           {/* Combined Settings Gear */}
@@ -2868,9 +3060,24 @@ Reply with ONLY a JSON object, no markdown fence:
             <div className="glass-panel" style={{ padding: '16px', background: 'rgba(0,0,0,0.3)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', alignSelf: 'center', width: '100%', maxWidth: '50%', marginBottom: '10px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center' }}>
                 <span style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--accent)' }}>Global Compiled Video Preview</span>
-                <button className="btn btn-secondary" style={{ padding: '2px 6px', fontSize: '0.7rem' }} onClick={() => setConcatenatedVideo(null)}>
-                  Clear Preview
-                </button>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ padding: '2px 6px', fontSize: '0.7rem' }}
+                    disabled={loadingStates.capture}
+                    title="Save the frame at the playhead as an image, for use on any following shot"
+                    onClick={(e) => handleCaptureVideoFrame(
+                      e.currentTarget.closest('.glass-panel')?.querySelector('video'),
+                      null,
+                      'Compiled frame'
+                    )}
+                  >
+                    <ImageIcon size={11} /> Capture Frame
+                  </button>
+                  <button className="btn btn-secondary" style={{ padding: '2px 6px', fontSize: '0.7rem' }} onClick={() => setConcatenatedVideo(null)}>
+                    Clear Preview
+                  </button>
+                </div>
               </div>
               <AssetVideo path={concatenatedVideo} controls style={{ width: '100%', borderRadius: '6px', maxHeight: '250px', background: '#000' }} />
             </div>
@@ -3021,13 +3228,28 @@ Reply with ONLY a JSON object, no markdown fence:
             <div className="glass-panel" style={{ padding: '12px', marginTop: '8px', background: 'rgba(0,0,0,0.2)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', alignSelf: 'center', width: '100%', maxWidth: '40%', marginBottom: '10px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center' }}>
                 <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: 'var(--accent)' }}>Scene Compiled Video Preview</span>
-                <button className="btn btn-secondary" style={{ padding: '1px 4px', fontSize: '0.65rem' }} onClick={() => {
-                  const updated = scenes.map(s => s.id === activeScene.id ? { ...s, sceneConcatenatedVideo: null } : s);
-                  setScenes(updated);
-                  saveProjectState(updated);
-                }}>
-                  Clear Preview
-                </button>
+                <div style={{ display: 'flex', gap: '4px' }}>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ padding: '1px 4px', fontSize: '0.65rem' }}
+                    disabled={loadingStates.capture}
+                    title="Save the frame at the playhead as an image, for use on any following shot"
+                    onClick={(e) => handleCaptureVideoFrame(
+                      e.currentTarget.closest('.glass-panel')?.querySelector('video'),
+                      null,
+                      'Scene frame'
+                    )}
+                  >
+                    <ImageIcon size={10} /> Capture Frame
+                  </button>
+                  <button className="btn btn-secondary" style={{ padding: '1px 4px', fontSize: '0.65rem' }} onClick={() => {
+                    const updated = scenes.map(s => s.id === activeScene.id ? { ...s, sceneConcatenatedVideo: null } : s);
+                    setScenes(updated);
+                    saveProjectState(updated);
+                  }}>
+                    Clear Preview
+                  </button>
+                </div>
               </div>
               <AssetVideo path={activeScene.sceneConcatenatedVideo} controls style={{ width: '100%', borderRadius: '4px', maxHeight: '180px', background: '#000' }} />
             </div>
@@ -3139,6 +3361,17 @@ Reply with ONLY a JSON object, no markdown fence:
                   {!isCollapsed && (
                     <div className="shot-expanded-details" onClick={(e) => e.stopPropagation()}>
                       
+                      <div className="form-group" style={{ marginBottom: '12px' }}>
+                        <label className="form-label">Shot Name</label>
+                        <input
+                          type="text"
+                          className="input-field"
+                          value={shot.name || ''}
+                          onChange={(e) => handleUpdateShotField(shot.id, 'name', e.target.value)}
+                          placeholder={`Shot ${index + 1}`}
+                        />
+                      </div>
+
                       <div className="shot-textareas">
                         <div className="form-group">
                           <label className="form-label">Visual / Camera Setup</label>
@@ -3271,6 +3504,19 @@ Reply with ONLY a JSON object, no markdown fence:
                               <>
                                 <AssetVideo path={shot.selectedVideo} controls />
                                 <button
+                                  className="btn btn-primary"
+                                  style={{ position: 'absolute', bottom: '6px', left: '6px', padding: '4px 8px', fontSize: '0.7rem' }}
+                                  disabled={loadingStates.capture}
+                                  title="Save the frame at the playhead as an image, and make it this shot's image"
+                                  onClick={(e) => handleCaptureVideoFrame(
+                                    e.currentTarget.closest('.preview-slot')?.querySelector('video'),
+                                    shot.id,
+                                    shot.name || 'Frame'
+                                  )}
+                                >
+                                  <ImageIcon size={11} /> Capture Frame
+                                </button>
+                                <button
                                   className="btn btn-danger"
                                   style={{ position: 'absolute', bottom: '6px', right: '6px', padding: '4px' }}
                                   onClick={() => handleUpdateShotField(shot.id, 'selectedVideo', null)}
@@ -3321,9 +3567,10 @@ Reply with ONLY a JSON object, no markdown fence:
                                     onChange={(e) => setActiveShotImagePromptGroup(prev => ({ ...prev, [shot.id]: e.target.value }))}
                                     style={{ flex: 1, fontSize: '0.8rem', padding: '6px' }}
                                   >
-                                    {shot.imagePrompts.map(pg => (
+                                    {shot.imagePrompts.map((pg, i) => (
                                       <option key={pg.id} value={pg.id}>
-                                        {pg.prompt.length > 35 ? pg.prompt.substring(0, 35) + '...' : pg.prompt}
+                                        {`#${i + 1} (${(pg.outputs || []).length}) `}
+                                        {pg.prompt.length > 40 ? pg.prompt.substring(0, 40) + '...' : pg.prompt}
                                       </option>
                                     ))}
                                   </select>
@@ -3406,9 +3653,10 @@ Reply with ONLY a JSON object, no markdown fence:
                                     onChange={(e) => setActiveShotVideoPromptGroup(prev => ({ ...prev, [shot.id]: e.target.value }))}
                                     style={{ flex: 1, fontSize: '0.8rem', padding: '6px' }}
                                   >
-                                    {shot.videoPrompts.map(pg => (
+                                    {shot.videoPrompts.map((pg, i) => (
                                       <option key={pg.id} value={pg.id}>
-                                        {pg.prompt.length > 35 ? pg.prompt.substring(0, 35) + '...' : pg.prompt}
+                                        {`#${i + 1} (${(pg.outputs || []).length}) `}
+                                        {pg.prompt.length > 40 ? pg.prompt.substring(0, 40) + '...' : pg.prompt}
                                       </option>
                                     ))}
                                   </select>
@@ -3443,7 +3691,7 @@ Reply with ONLY a JSON object, no markdown fence:
                                           key={out.id}
                                           className={`iteration-card ${shot.selectedVideo === out.path ? 'active-select' : ''}`}
                                         >
-                                          <AssetVideo path={out.path} />
+                                          <AssetVideo path={out.path} controls />
                                           <div className="iteration-badge">{out.name}</div>
                                           <div className="iteration-hover-actions">
                                             <button
@@ -3452,6 +3700,19 @@ Reply with ONLY a JSON object, no markdown fence:
                                               onClick={() => handleUpdateShotField(shot.id, 'selectedVideo', out.path)}
                                             >
                                               Select
+                                            </button>
+                                            <button
+                                              className="btn btn-secondary"
+                                              style={{ padding: '2px 6px', fontSize: '0.7rem' }}
+                                              disabled={loadingStates.capture}
+                                              title="Save the frame at the playhead as an image"
+                                              onClick={(e) => handleCaptureVideoFrame(
+                                                e.currentTarget.closest('.iteration-card')?.querySelector('video'),
+                                                shot.id,
+                                                out.name
+                                              )}
+                                            >
+                                              <ImageIcon size={10} /> Frame
                                             </button>
                                             <button
                                               className="btn btn-danger"
@@ -3507,7 +3768,7 @@ Reply with ONLY a JSON object, no markdown fence:
                   disabled={loadingStates.modal_llm}
                 >
                   {loadingStates.modal_llm ? <RefreshCw className="spinner" size={14} /> : <Sparkles size={14} />}
-                  Auto-Prompt from Visual Description
+                  Auto Prompt
                 </button>
               </div>
 
@@ -3567,7 +3828,9 @@ Reply with ONLY a JSON object, no markdown fence:
                   generationModal.type,
                   genModalPrompt,
                   genModalModel,
-                  generationModal.type === 'image' ? genModalInputImages : (genModalImageInput ? [genModalImageInput] : [])
+                  generationModal.type === 'image' ? genModalInputImages : (genModalImageInput ? [genModalImageInput] : []),
+                  genModalAttachTags,
+                  genModalExcludedImages
                 );
                 return (
                   <div className="form-group">
@@ -3581,17 +3844,6 @@ Reply with ONLY a JSON object, no markdown fence:
                       {preview.prompt || <em style={{ color: 'var(--text-dim)' }}>Empty — nothing will be generated.</em>}
                     </div>
 
-                    {preview.taggedAssets.length > 0 && (
-                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px', alignItems: 'center' }}>
-                        <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>Attaching:</span>
-                        {preview.taggedAssets.map(asset => (
-                          <span key={asset.id} style={{ fontSize: '0.72rem', background: 'rgba(16,185,129,0.15)', color: 'var(--success)', padding: '2px 8px', borderRadius: '10px' }}>
-                            &lt;{asset.tag}&gt;{asset.primaryImage ? '' : ' (no image)'}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-
                     {preview.missingTags.length > 0 && (
                       <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px', alignItems: 'center' }}>
                         <AlertTriangle size={12} style={{ color: 'var(--accent)' }} />
@@ -3601,11 +3853,93 @@ Reply with ONLY a JSON object, no markdown fence:
                       </div>
                     )}
 
-                    {preview.droppedImagePaths.length > 0 && (
-                      <div style={{ fontSize: '0.72rem', color: 'var(--accent)', marginTop: '6px' }}>
-                        {preview.droppedImagePaths.length} reference image{preview.droppedImagePaths.length === 1 ? '' : 's'} dropped — this model accepts at most {preview.capacity}.
+                    {/* Exactly which images go with the request, in send order. */}
+                    <div style={{ marginTop: '12px', border: '1px solid var(--border-light)', borderRadius: '6px', padding: '10px', background: 'rgba(0,0,0,0.18)' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', flexWrap: 'wrap', marginBottom: '8px' }}>
+                        <span style={{ fontSize: '0.78rem', fontWeight: 'bold' }}>
+                          Images sent with this request
+                          <span style={{ marginLeft: '6px', fontWeight: 'normal', color: 'var(--text-dim)' }}>
+                            {preview.imageSources.length} of {preview.capacity} slot{preview.capacity === 1 ? '' : 's'}
+                          </span>
+                        </span>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                          <input
+                            type="checkbox"
+                            checked={genModalAttachTags}
+                            onChange={(e) => setGenModalAttachTags(e.target.checked)}
+                          />
+                          Attach tagged images
+                        </label>
                       </div>
-                    )}
+
+                      {preview.imageSources.length === 0 ? (
+                        <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                          {preview.capacity === 0
+                            ? 'This model takes no image input — text only.'
+                            : generationModal.type === 'video'
+                              ? 'None — this will be text-to-video. Pick a shot image below to animate it instead.'
+                              : 'None — this will be generated from the prompt alone.'}
+                        </span>
+                      ) : (
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                          {preview.imageSources.map((entry, index) => (
+                            <div key={entry.path} style={{ width: '86px', textAlign: 'center', position: 'relative' }}>
+                              <div style={{ position: 'relative', height: '58px', borderRadius: '4px', overflow: 'hidden', border: `2px solid ${entry.origin === 'primary' ? 'var(--success)' : 'var(--primary)'}`, background: '#000' }}>
+                                <AssetImage path={entry.path} alt={entry.label} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                                <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '0.6rem', fontWeight: 'bold', background: 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '0 4px' }}>
+                                  {index + 1}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="btn btn-danger"
+                                  style={{
+                                    position: 'absolute',
+                                    top: '2px',
+                                    right: '2px',
+                                    padding: '2px',
+                                    borderRadius: '50%',
+                                    width: '18px',
+                                    height: '18px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    zIndex: 3,
+                                    cursor: 'pointer'
+                                  }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeselectSentImage(entry.path, entry.origin);
+                                  }}
+                                  title={`Deselect ${entry.label}`}
+                                >
+                                  <X size={10} />
+                                </button>
+                              </div>
+                              <span style={{ fontSize: '0.62rem', color: entry.origin === 'primary' ? 'var(--success)' : 'var(--primary-hover)', display: 'block', marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {entry.label}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {preview.droppedImageSources.length > 0 && (
+                        <div style={{ fontSize: '0.72rem', color: 'var(--accent)', marginTop: '8px', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
+                          <AlertTriangle size={11} style={{ marginTop: '2px', flexShrink: 0 }} />
+                          <span>
+                            Not sent (model takes {preview.capacity}):{' '}
+                            {/* Collapse repeats so eight images from one asset
+                                read as "<Sara> ×8" rather than eight entries. */}
+                            {Object.entries(
+                              preview.droppedImageSources.reduce((acc, entry) => {
+                                acc[entry.label] = (acc[entry.label] || 0) + 1;
+                                return acc;
+                              }, {})
+                            ).map(([label, count]) => (count > 1 ? `${label} ×${count}` : label)).join(', ')}
+                          </span>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 );
               })()}
@@ -3671,21 +4005,24 @@ Reply with ONLY a JSON object, no markdown fence:
                   <span className="input-help">Manually picked references. Images pulled in by &lt;Tag&gt;s are added automatically and take priority.</span>
                   <div className="generation-reference-grid">
                     {referenceImages.map(ref => {
-                      const selected = genModalInputImages.includes(ref.path);
+                      const selected = genModalInputImages.includes(ref.path) && !genModalExcludedImages.includes(ref.path);
                       return (
                         <button
                           key={ref.id}
                           type="button"
                           className={`generation-reference-card ${selected ? 'selected' : ''}`}
-                          onClick={() => setGenModalInputImages(prev => {
-                            if (prev.includes(ref.path)) return prev.filter(path => path !== ref.path);
-                            const capacity = refImageCapacity('image', genModalModel);
-                            if (prev.length >= capacity) {
-                              showToast(`This model accepts up to ${capacity} input image${capacity === 1 ? '' : 's'}.`, 'warning');
-                              return prev;
-                            }
-                            return [...prev, ref.path];
-                          })}
+                          onClick={() => {
+                            setGenModalExcludedImages(prev => prev.filter(p => p !== ref.path));
+                            setGenModalInputImages(prev => {
+                              if (prev.includes(ref.path)) return prev.filter(path => path !== ref.path);
+                              const capacity = refImageCapacity('image', genModalModel);
+                              if (prev.length >= capacity) {
+                                showToast(`This model accepts up to ${capacity} input image${capacity === 1 ? '' : 's'}.`, 'warning');
+                                return prev;
+                              }
+                              return [...prev, ref.path];
+                            });
+                          }}
                           title={selected ? `Remove ${ref.name}` : `Add ${ref.name}`}
                         >
                           <AssetImage path={ref.path} alt={ref.name} />
@@ -3805,6 +4142,100 @@ Reply with ONLY a JSON object, no markdown fence:
           </div>
         </div>
       )}
+
+      {/* --- A0. FLOATING OVERLAY: STORYBOARD --- */}
+      {activeOverlay === 'storyboard' && (() => {
+        const totalShots = scenes.reduce((n, s) => n + (s.shots || []).length, 0);
+        const withImage = scenes.reduce((n, s) => n + (s.shots || []).filter(sh => sh.selectedImage).length, 0);
+
+        return (
+          <div className="modal-overlay" onClick={() => setActiveOverlay(null)}>
+            <div className="modal-window gallery-modal-window" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <LayoutGrid size={20} /> Storyboard
+                  <span style={{ fontSize: '0.8rem', fontWeight: 'normal', color: 'var(--text-dim)' }}>
+                    {withImage} / {totalShots} shots have an image
+                  </span>
+                </h2>
+                <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setActiveOverlay(null)}>
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="modal-body">
+                {scenes.map((scene, sceneIndex) => (
+                  <div key={scene.id} style={{ marginBottom: '28px' }}>
+                    <h3 style={{
+                      fontSize: '0.95rem', display: 'flex', alignItems: 'center', gap: '8px',
+                      borderBottom: '1px solid var(--border-light)', paddingBottom: '6px', marginBottom: '12px'
+                    }}>
+                      <Film size={15} />
+                      Scene {sceneIndex + 1}: {scene.name}
+                      <span style={{ fontWeight: 'normal', color: 'var(--text-dim)', fontSize: '0.8rem' }}>
+                        {(scene.shots || []).length} shot{(scene.shots || []).length === 1 ? '' : 's'}
+                      </span>
+                    </h3>
+
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '14px' }}>
+                      {(scene.shots || []).map((shot, shotIndex) => (
+                        <div
+                          key={shot.id}
+                          onClick={() => {
+                            setActiveSceneId(scene.id);
+                            setActiveShotId(shot.id);
+                            setCollapsedShots(prev => ({ ...prev, [shot.id]: false }));
+                            setActiveOverlay(null);
+                          }}
+                          title="Jump to this shot"
+                          style={{
+                            cursor: 'pointer', borderRadius: '6px', overflow: 'hidden',
+                            border: `1px solid ${shot.id === activeShotId ? 'var(--primary)' : 'var(--border-light)'}`,
+                            background: 'rgba(255,255,255,0.02)', display: 'flex', flexDirection: 'column'
+                          }}
+                        >
+                          <div style={{ position: 'relative', aspectRatio: '16 / 9', background: '#000' }}>
+                            {shot.selectedImage ? (
+                              <AssetImage
+                                path={shot.selectedImage}
+                                alt={shot.name}
+                                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                              />
+                            ) : (
+                              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-dim)', fontSize: '0.72rem', textAlign: 'center', padding: '8px' }}>
+                                No image yet
+                              </div>
+                            )}
+                            <span style={{ position: 'absolute', top: '4px', left: '4px', fontSize: '0.62rem', fontWeight: 'bold', background: 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '1px 5px' }}>
+                              {sceneIndex + 1}.{shotIndex + 1}
+                            </span>
+                            {shot.selectedVideo && (
+                              <span title="Has video" style={{ position: 'absolute', top: '4px', right: '4px', background: 'rgba(16,185,129,0.85)', color: '#fff', borderRadius: '3px', padding: '1px 4px', display: 'flex', alignItems: 'center' }}>
+                                <Film size={10} />
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ padding: '7px 8px' }}>
+                            <div style={{ fontSize: '0.76rem', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {shot.name || `Shot ${shotIndex + 1}`}
+                            </div>
+                            <div style={{ fontSize: '0.68rem', color: 'var(--text-dim)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                              {shot.description || shot.setup || ''}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                      {(scene.shots || []).length === 0 && (
+                        <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem' }}>No shots in this scene.</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* --- A1. FLOATING OVERLAY: PROJECTS --- */}
       {activeOverlay === 'projects' && (
@@ -4373,8 +4804,8 @@ Reply with ONLY a JSON object, no markdown fence:
               <div className="form-group">
                 <label className="form-label">Reference Images ({(assetEditor.images || []).length})</label>
                 <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)', display: 'block', marginBottom: '8px' }}>
-                  Click one to make it the primary — that's the image sent with &lt;{assetEditor.tag || 'Tag'}&gt;.
-                  Models taking more than one input receive the rest in order. Double-click to view large.
+                  Click one to make it the primary — that is the single image sent with &lt;{assetEditor.tag || 'Tag'}&gt;.
+                  The rest are kept here as alternates and are never uploaded. Double-click to view large.
                 </span>
                 <input type="file" accept="image/*" multiple ref={assetUploadRef} onChange={handleAssetImageUpload} style={{ display: 'none' }} />
                 <div className="generation-reference-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '8px' }}>
@@ -4505,11 +4936,29 @@ Reply with ONLY a JSON object, no markdown fence:
                       <AlertTriangle size={12} /> {noPrompt} shot{noPrompt === 1 ? '' : 's'} skipped — no prompt or description to work from.
                     </div>
                   )}
-                  {batchDialog.type === 'video' && (
-                    <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
-                      Each video is driven by that shot's selected image when one is set, otherwise text-to-video.
-                    </div>
-                  )}
+                  {(() => {
+                    const attaching = batchDialog.type === 'image' ? attachTagsForImages : attachTagsForVideos;
+                    const withoutStill = batchDialog.type === 'video'
+                      ? candidates.filter(({ shot }) => !shot.selectedImage).length
+                      : 0;
+                    return (
+                      <>
+                        <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                          Reference images: <strong style={{ color: 'var(--text-muted)' }}>
+                            {batchDialog.type === 'video' ? "each shot's own selected image" : 'each shot’s assigned references'}
+                          </strong>
+                          {attaching ? ', plus tagged asset images where slots remain.' : '. Tagged asset images are NOT attached.'}
+                          {' '}Change this in Settings.
+                        </div>
+                        {withoutStill > 0 && (
+                          <div style={{ fontSize: '0.78rem', color: 'var(--accent)', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
+                            <AlertTriangle size={12} style={{ marginTop: '3px', flexShrink: 0 }} />
+                            <span>{withoutStill} shot{withoutStill === 1 ? ' has' : 's have'} no selected image — those run as text-to-video.</span>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               </div>
 
@@ -5229,6 +5678,23 @@ Reply with ONLY a JSON object, no markdown fence:
                       placeholder=", volumetric lighting, ultra detailed, 8k"
                     />
                   </div>
+                </div>
+
+                <div style={{ borderTop: '1px solid var(--border-light)', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <strong style={{ fontSize: '0.85rem' }}>Attach tagged asset images by default</strong>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                    Whether a <code>&lt;Tag&gt;</code>'s reference image is uploaded with the request. Your explicitly
+                    chosen image always takes the first slot — most image-to-video models accept only one input, so
+                    tagged images would otherwise displace the shot frame you meant to animate.
+                  </span>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.85rem' }}>
+                    <input type="checkbox" checked={attachTagsForImages} onChange={(e) => setAttachTagsForImages(e.target.checked)} />
+                    Image generation <span style={{ color: 'var(--text-dim)' }}>(recommended on — this is how characters stay consistent)</span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.85rem' }}>
+                    <input type="checkbox" checked={attachTagsForVideos} onChange={(e) => setAttachTagsForVideos(e.target.checked)} />
+                    Video generation <span style={{ color: 'var(--text-dim)' }}>(recommended off — animate the shot's own image)</span>
+                  </label>
                 </div>
 
                 <div className="control-grid">

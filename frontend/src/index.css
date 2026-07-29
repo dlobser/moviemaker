@@ -133,6 +133,11 @@ body.light-theme .glass-panel:hover {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  /* The toolbar has outgrown a single row. Wrapping keeps every control inside
+     the card instead of spilling past its rounded edge, and stops flex from
+     crushing the title until the wordmark breaks across two lines. */
+  flex-wrap: wrap;
+  gap: 12px 20px;
   padding: 16px 24px;
   background: var(--bg-card);
   border: 1px solid var(--border-light);
@@ -146,6 +151,8 @@ body.light-theme .glass-panel:hover {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex: 0 0 auto;   /* never squeezed by the toolbar */
+  min-width: 0;
 }
 
 .header-logo {
@@ -162,7 +169,9 @@ body.light-theme .glass-panel:hover {
 }
 
 .app-header h1 {
-  font-size: 1.8rem;
+  font-size: clamp(1.15rem, 1.5vw, 1.8rem);
+  line-height: 1.2;
+  white-space: nowrap;
   background: linear-gradient(135deg, var(--text-main) 30%, var(--primary));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -176,8 +185,42 @@ body.light-theme .app-header h1 {
 
 .header-actions {
   display: flex;
-  gap: 12px;
+  gap: 8px;
   align-items: center;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+/* Below full desktop width the toolbar drops onto its own full-width row and
+   the buttons tighten up, so it reads as one clean strip instead of fragmenting
+   into several ragged rows beside the title. */
+@media (max-width: 1600px) {
+  .header-actions {
+    flex-basis: 100%;
+    justify-content: flex-start;
+  }
+  .header-actions .btn {
+    padding: 8px 12px;
+    font-size: 0.85rem;
+    gap: 6px;
+  }
+}
+
+/* Tighter still: the secondary library buttons collapse to their icons. Their
+   title attributes carry the name, and the primary actions stay labelled. */
+@media (max-width: 1150px) {
+  .header-actions .btn {
+    padding: 8px 10px;
+    font-size: 0.8rem;
+  }
+  .header-actions .btn-label-optional {
+    display: none;
+  }
+  .app-header {
+    padding: 14px 16px;
+  }
 }
 
 /* Timeline Single Column View */
@@ -688,6 +731,32 @@ textarea.input-field {
   gap: 16px;
 }
 
+/* Grid and flex items default to min-width:auto, so a <select> with a long
+   option ("Fal.ai - Kling Video - ~$0.35 / 5s (standard)") refuses to shrink
+   below its intrinsic width and overflows its column. Letting these shrink is
+   what stops the right-hand control being clipped. */
+.control-grid > * {
+  min-width: 0;
+}
+.form-group {
+  min-width: 0;
+}
+.select-field,
+.input-field {
+  max-width: 100%;
+  min-width: 0;
+}
+/* Long model names truncate rather than push the control out of the panel. */
+select.select-field {
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 700px) {
+  .control-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* Generic Buttons styles */
 .btn {
   display: inline-flex;
@@ -849,6 +918,17 @@ body.light-theme .media-card:hover {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
+}
+/* The "apply to shot" row: the dropdown absorbs the slack, the button keeps
+   its full label instead of being sliced off at the card edge. */
+.media-info .media-actions select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.media-info .media-actions .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .media-name {

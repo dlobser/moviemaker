@@ -35,5 +35,8 @@ export function AssetImage({ path, alt = '', fallback = null, ...rest }) {
 export function AssetVideo({ path, fallback = null, ...rest }) {
   const url = useAssetUrl(path);
   if (!url) return fallback;
-  return <video src={url} {...rest} />;
+  // crossOrigin keeps the canvas untainted so a frame can be captured off the
+  // playhead. The backend sends permissive CORS headers; blob: URLs in the
+  // static build are same-origin and ignore the attribute.
+  return <video src={url} crossOrigin="anonymous" {...rest} />;
 }

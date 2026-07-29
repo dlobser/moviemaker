@@ -84,7 +84,15 @@ export async function apiFetch(path, options = {}) {
   await detectMode();
 
   if (mode === 'server') {
-    return fetch(`${SERVER_BASE}${path}`, options);
+    try {
+      return await fetch(`${SERVER_BASE}${path}`, options);
+    } catch (error) {
+      return errorResponse(
+        `Cannot connect to MovieMaker backend server (${SERVER_BASE}). ` +
+        `Please ensure the backend server is running ("npm start" or "node server.js").`,
+        503
+      );
+    }
   }
 
   const credentials = loadCredentials();

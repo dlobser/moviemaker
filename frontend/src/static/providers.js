@@ -61,6 +61,21 @@ async function downloadToProject(remoteUrl, prefix, fallbackExt, credentials) {
 
 // --- LLM ------------------------------------------------------------------
 
+/**
+ * Pull the text out of a provider response, failing with something readable.
+ *
+ * Models return an empty candidate more often than you'd think — safety stops,
+ * token limits, recitation blocks — and reaching straight for `.text.trim()`
+ * turned those into "Cannot read properties of undefined".
+ */
+function requireText(value, providerLabel, detail = '') {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  throw new Error(
+    `${providerLabel} returned no text${detail ? ` (${detail})` : ''}. ` +
+    `This usually means the response was blocked or cut short — try rewording the description, or a different model.`
+  );
+}
+
 export async function generateText({ provider, prompt, systemPrompt, model }, credentials) {
   if (provider === 'gemini') {
     const apiKey = credentials.geminiKey;
@@ -77,7 +92,9 @@ export async function generateText({ provider, prompt, systemPrompt, model }, cr
     );
     const data = await res.json();
     if (data.error) throw new Error(data.error.message || 'Gemini API Error');
-    return data.candidates[0].content.parts[0].text.trim();
+    const candidate = data.candidates?.[0];
+    const text = candidate?.content?.parts?.map(part => part.text).filter(Boolean).join('\n');
+    return requireText(text, 'Gemini', candidate?.finishReason || data.promptFeedback?.blockReason);
   }
 
   if (provider === 'chatgpt') {
@@ -97,7 +114,8 @@ export async function generateText({ provider, prompt, systemPrompt, model }, cr
     );
     const data = await res.json();
     if (data.error) throw new Error(data.error.message || 'OpenAI API Error');
-    return data.choices[0].message.content.trim();
+    const choice = data.choices?.[0];
+    return requireText(choice?.message?.content, 'OpenAI', choice?.finish_reason);
   }
 
   if (provider === 'claude') {
@@ -125,7 +143,8 @@ export async function generateText({ provider, prompt, systemPrompt, model }, cr
     );
     const data = await res.json();
     if (data.error) throw new Error(data.error.message || 'Claude API Error');
-    return data.content[0].text.trim();
+    const text = data.content?.filter(block => block.type === 'text').map(block => block.text).join('\n');
+    return requireText(text, 'Claude', data.stop_reason);
   }
 
   throw new Error(`Unsupported LLM provider: ${provider}`);
