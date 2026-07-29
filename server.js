@@ -1297,6 +1297,87 @@ function runFfmpeg(args, label) {
   });
 }
 
+// --- SOURCE MEASUREMENT -----------------------------------------------------
+
+/**
+ * Measure assets for the editor.
+ *
+ * The timeline needs a real duration before it can clamp a trim to the end of
+ * its source, and the project needs frame sizes before it can default its
+ * resolution to whatever most of the footage already is. Generated assets are
+ * written once under timestamped names, so the caller caches these results
+ * forever rather than asking twice.
+ */
+const PROBE_IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif)$/i;
+
+function parseFrameRate(rate) {
+  if (!rate || typeof rate !== 'string') return null;
+  const [numerator, denominator] = rate.split('/').map(Number);
+  if (!numerator || !denominator) return null;
+  const fps = numerator / denominator;
+  return Number.isFinite(fps) && fps > 0 ? fps : null;
+}
+
+function runFfprobe(filePath) {
+  return new Promise((resolve, reject) => {
+    const command = `ffprobe -v error -print_format json -show_format -show_streams "${filePath}"`;
+    exec(command, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(/not recognized|ENOENT/i.test(stderr || error.message)
+          ? 'FFprobe is not installed or not on PATH.'
+          : (stderr || error.message).trim().split('\n').slice(-2).join(' ')));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error('FFprobe returned output that could not be parsed.'));
+      }
+    });
+  });
+}
+
+app.post('/api/probe', async (req, res) => {
+  const paths = Array.isArray(req.body?.paths) ? req.body.paths : [];
+  if (paths.length === 0) return res.json({ results: {} });
+
+  const root = getWorkingRoot();
+  const results = {};
+
+  for (const relative of paths) {
+    if (typeof relative !== 'string' || !relative) continue;
+    const absolute = path.join(root, relative);
+    if (!fs.existsSync(absolute)) {
+      results[relative] = { error: 'File not found.' };
+      continue;
+    }
+
+    try {
+      const probe = await runFfprobe(absolute);
+      const streams = Array.isArray(probe.streams) ? probe.streams : [];
+      const video = streams.find(s => s.codec_type === 'video') || null;
+      const audio = streams.find(s => s.codec_type === 'audio') || null;
+      const isImage = PROBE_IMAGE_EXT.test(relative);
+      // Stills report a nominal duration; the timeline decides how long to hold
+      // them, so reporting null keeps that decision in one place.
+      const duration = isImage ? null : Number(probe.format?.duration) || null;
+
+      results[relative] = {
+        duration,
+        width: video?.width || null,
+        height: video?.height || null,
+        fps: isImage ? null : parseFrameRate(video?.avg_frame_rate || video?.r_frame_rate),
+        hasAudio: Boolean(audio),
+        isImage
+      };
+    } catch (error) {
+      results[relative] = { error: error.message };
+    }
+  }
+
+  res.json({ results });
+});
+
 /**
  * Concatenate a timeline into one file.
  *

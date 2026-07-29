@@ -124,6 +124,13 @@ export async function apiFetch(path, options = {}) {
       return asResponse(await listAssetImages());
     }
 
+    // The hosted build measures sources with a media element instead — see
+    // edit/durations.js. An empty result keeps a stray caller from treating
+    // this as a failure.
+    if (route === '/api/probe') {
+      return asResponse({ results: {} });
+    }
+
     if (route === '/api/upload') {
       const file = options.body?.get?.('file');
       if (!file) return errorResponse('No file provided', 400);

@@ -34,7 +34,8 @@ import {
   Copy,
   Zap,
   StopCircle,
-  LayoutGrid
+  LayoutGrid,
+  Scissors
 } from 'lucide-react';
 import {
   IMAGE_MODELS,
@@ -61,6 +62,8 @@ import {
 } from './promptTags.js';
 import { buildLlmImportPrompt, normalizeImportedShotList } from './shotListImport.js';
 import { apiFetch, resolveAssetUrl, detectMode, isStatic } from './client.js';
+import { createEmptyEdit, migrateEdit } from './edit/model.js';
+import EditView from './edit/EditView.jsx';
 import { AssetImage, AssetVideo, useAssetUrl } from './AssetMedia.jsx';
 import * as projectFs from './static/fileSystem.js';
 
@@ -91,6 +94,7 @@ export default function App() {
   const shots = scenes.flatMap(s => s.shots || []);
 
   const [viewingPromptText, setViewingPromptText] = useState(null);
+  const [frameCaptureChoice, setFrameCaptureChoice] = useState(null); // { imagePath, imageName, shotId }
   const [promptSnippets, setPromptSnippets] = useState([
     { id: 's1', name: 'Establish', text: 'wide establishing shot, scale detail' },
     { id: 's2', name: 'Close Up', text: 'cinematic macro close up shot, shallow depth of field' },
@@ -205,6 +209,15 @@ export default function App() {
 
   // --- CONCATENATED VIDEO PREVIEW ---
   const [concatenatedVideo, setConcatenatedVideo] = useState(null);
+  // The edit document. Owned here so it autosaves and travels with the project
+  // file; every operation on it lives in ./edit/.
+  const [edit, setEdit] = useState(createEmptyEdit);
+  // 'create' | 'edit'. The editor replaces the whole window rather than sharing
+  // it, so nothing about cutting has to fit around the generation UI. ?view=edit
+  // also lets it be opened on its own in a second browser tab.
+  const [view, setView] = useState(() => (
+    new URLSearchParams(window.location.search).get('view') === 'edit' ? 'edit' : 'create'
+  ));
 
   // --- DRAG TO REORDER TIMELINE SHOTS ---
   const [isDraggable, setIsDraggable] = useState(false);
@@ -376,6 +389,8 @@ export default function App() {
     setAttachTagsForVideos(state.attachTagsForVideos === true);
     setImageSystemPrompt(state.imageSystemPrompt || DEFAULT_IMAGE_SYSTEM_PROMPT);
     setVideoSystemPrompt(state.videoSystemPrompt || DEFAULT_VIDEO_SYSTEM_PROMPT);
+    // Projects saved before the editor existed simply have no `edit` key.
+    setEdit(migrateEdit(state.edit));
     setConcatenatedVideo(state.concatenatedVideo || null);
 
     // Find or set activeSceneId
@@ -425,6 +440,7 @@ export default function App() {
       imageSystemPrompt,
       videoSystemPrompt,
       concatenatedVideo: extra.concatenatedVideo !== undefined ? extra.concatenatedVideo : concatenatedVideo,
+      edit: extra.edit !== undefined ? extra.edit : edit,
       activeSceneId: extra.activeSceneId !== undefined ? extra.activeSceneId : activeSceneId,
       activeShotId: extra.activeShotId !== undefined ? extra.activeShotId : activeShotId,
       ...extra
@@ -455,7 +471,7 @@ export default function App() {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, prePrompt, postPrompt, videoPrePrompt, videoPostPrompt, imageSystemPrompt, videoSystemPrompt, concatenatedVideo]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, prePrompt, postPrompt, videoPrePrompt, videoPostPrompt, imageSystemPrompt, videoSystemPrompt, concatenatedVideo, edit]);
 
   // Save Credentials
   const saveConfig = async (newKeys) => {
@@ -2382,10 +2398,10 @@ Reply with ONLY a JSON object, no markdown fence:
         createdAt: new Date().toISOString()
       }, ...prev]);
 
-      // Make it the shot's image so the next video can start from this moment.
+      // Always lands in the gallery; ask what (if anything) to do with a shot
+      // rather than silently overwriting the shot currently being viewed.
       if (shotId) {
-        handleUpdateShotField(shotId, 'selectedImage', data.filePath);
-        showToast(`Captured ${name} — now the shot's image.`, 'success');
+        setFrameCaptureChoice({ imagePath: data.filePath, imageName: name, shotId });
       } else {
         showToast(`Captured ${name} — saved to the image gallery.`, 'success');
       }
@@ -2400,6 +2416,79 @@ Reply with ONLY a JSON object, no markdown fence:
     } finally {
       setLoadingStates(prev => ({ ...prev, capture: false }));
     }
+  };
+
+  /** Whichever shot immediately follows contextShotId, scene boundaries included. */
+  const getNextShot = (contextShotId) => {
+    const idx = shots.findIndex(s => s.id === contextShotId);
+    if (idx === -1 || idx === shots.length - 1) return null;
+    return shots[idx + 1];
+  };
+
+  // Resolve the three "Capture Frame" choices. The captured image is already
+  // in the gallery by this point — these only decide what else happens to it.
+  const handleFrameChoiceNextShot = () => {
+    if (!frameCaptureChoice) return;
+    const { imagePath, imageName, shotId } = frameCaptureChoice;
+    const next = getNextShot(shotId);
+    if (!next) {
+      showToast('There is no next shot to set — it stayed in the image gallery.', 'warning');
+      setFrameCaptureChoice(null);
+      return;
+    }
+    handleUpdateShotField(next.id, 'selectedImage', imagePath);
+    showToast(`${imageName} is now ${next.name || 'the next shot'}'s image.`, 'success');
+    setFrameCaptureChoice(null);
+  };
+
+  const handleFrameChoiceInsertShot = () => {
+    if (!frameCaptureChoice) return;
+    const { imagePath, imageName, shotId } = frameCaptureChoice;
+    const scene = scenes.find(s => (s.shots || []).some(sh => sh.id === shotId));
+    if (!scene) {
+      setFrameCaptureChoice(null);
+      return;
+    }
+    const newId = 'shot_' + Date.now();
+    const insertAt = scene.shots.findIndex(sh => sh.id === shotId) + 1;
+    const newShot = {
+      id: newId,
+      name: `Shot ${scene.shots.length + 1}`,
+      setup: '',
+      description: '',
+      dialogue: '',
+      notes: '',
+      selectedImage: imagePath,
+      selectedVideo: null,
+      referenceImages: [],
+      lipSyncAudio: null,
+      imagePrompts: [],
+      videoPrompts: [],
+      draftImagePrompt: '',
+      draftVideoPrompt: ''
+    };
+
+    const newShots = [...scene.shots];
+    newShots.splice(insertAt, 0, newShot);
+    const updated = scenes.map(s => (s.id === scene.id ? { ...s, shots: newShots } : s));
+
+    const newCollapseState = { ...collapsedShots };
+    shots.forEach(s => { newCollapseState[s.id] = true; });
+    newCollapseState[newId] = false;
+    setCollapsedShots(newCollapseState);
+
+    setScenes(updated);
+    setActiveSceneId(scene.id);
+    setActiveShotId(newId);
+    saveProjectState(updated, { activeShotId: newId });
+    showToast(`Inserted new shot with ${imageName} as its image.`, 'success');
+    setFrameCaptureChoice(null);
+  };
+
+  const handleFrameChoiceLibraryOnly = () => {
+    if (!frameCaptureChoice) return;
+    showToast(`${frameCaptureChoice.imageName} saved to the image gallery.`, 'success');
+    setFrameCaptureChoice(null);
   };
 
   // --- FFMEG COMPILATION ---
@@ -2849,6 +2938,20 @@ Reply with ONLY a JSON object, no markdown fence:
   const showStartupGate = runtimeMode === 'static'
     && (needsFolderPermission || project.needsFolder || !projectFs.isFileSystemAccessSupported());
 
+  // The editor is a separate view, not an overlay: it unmounts the creation UI
+  // entirely so the two never have to share layout or keyboard shortcuts.
+  if (view === 'edit' && !showStartupGate) {
+    return (
+      <EditView
+        scenes={scenes}
+        edit={edit}
+        setEdit={setEdit}
+        videoDuration={videoDuration}
+        onClose={() => setView('create')}
+      />
+    );
+  }
+
   if (showStartupGate) {
     const unsupported = !projectFs.isFileSystemAccessSupported();
     return (
@@ -2971,6 +3074,15 @@ Reply with ONLY a JSON object, no markdown fence:
                 <Film size={16} /> <span className="btn-label-optional">Concatenate Video</span>
               </>
             )}
+          </button>
+
+          {/* Editor. A separate view, so it gets its own window rather than an overlay. */}
+          <button
+            className="btn btn-secondary"
+            onClick={() => setView('edit')}
+            title="Open the timeline editor: trim, reorder, dissolve and mix"
+          >
+            <Scissors size={16} /> <span className="btn-label-optional">Edit</span>
           </button>
 
           {/* Theme toggler */}
@@ -3507,7 +3619,7 @@ Reply with ONLY a JSON object, no markdown fence:
                                   className="btn btn-primary"
                                   style={{ position: 'absolute', bottom: '6px', left: '6px', padding: '4px 8px', fontSize: '0.7rem' }}
                                   disabled={loadingStates.capture}
-                                  title="Save the frame at the playhead as an image, and make it this shot's image"
+                                  title="Save the frame at the playhead as an image — you'll choose what happens with it next"
                                   onClick={(e) => handleCaptureVideoFrame(
                                     e.currentTarget.closest('.preview-slot')?.querySelector('video'),
                                     shot.id,
@@ -3705,7 +3817,7 @@ Reply with ONLY a JSON object, no markdown fence:
                                               className="btn btn-secondary"
                                               style={{ padding: '2px 6px', fontSize: '0.7rem' }}
                                               disabled={loadingStates.capture}
-                                              title="Save the frame at the playhead as an image"
+                                              title="Save the frame at the playhead as an image — you'll choose what happens with it next"
                                               onClick={(e) => handleCaptureVideoFrame(
                                                 e.currentTarget.closest('.iteration-card')?.querySelector('video'),
                                                 shot.id,
@@ -5887,6 +5999,34 @@ Reply with ONLY a JSON object, no markdown fence:
               </button>
               <button className="btn btn-secondary" onClick={() => setViewingPromptText(null)}>
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* --- K. CAPTURE FRAME CHOICE MODAL --- */}
+      {frameCaptureChoice && (
+        <div className="modal-overlay" onClick={handleFrameChoiceLibraryOnly}>
+          <div className="modal-window" style={{ maxWidth: '440px', width: '95%' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Frame Captured</h2>
+              <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={handleFrameChoiceLibraryOnly}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>
+                {frameCaptureChoice.imageName} is saved to the image gallery. What else should it do?
+              </p>
+              <button className="btn btn-primary" style={{ justifyContent: 'flex-start' }} onClick={handleFrameChoiceNextShot}>
+                <ImageIcon size={14} /> Set as next shot's image
+              </button>
+              <button className="btn btn-primary" style={{ justifyContent: 'flex-start' }} onClick={handleFrameChoiceInsertShot}>
+                <Plus size={14} /> Insert new shot with this image
+              </button>
+              <button className="btn btn-secondary" style={{ justifyContent: 'flex-start' }} onClick={handleFrameChoiceLibraryOnly}>
+                Just keep it in the asset library
               </button>
             </div>
           </div>

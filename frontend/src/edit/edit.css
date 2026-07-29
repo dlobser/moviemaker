@@ -1,0 +1,287 @@
+/* The editor view. Scoped under .edit-view so none of it can leak into the
+   creation UI, which keeps its own look entirely. Theme variables come from
+   index.css so light and dark both work without a second palette. */
+
+.edit-view {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-page);
+  color: var(--text-main);
+  font-family: var(--font-body);
+}
+
+/* --- chrome --------------------------------------------------------------- */
+
+.edit-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-light);
+  background: var(--bg-panel);
+  flex: 0 0 auto;
+}
+
+.edit-header h2 {
+  font-family: var(--font-title);
+  font-size: 1rem;
+  margin: 0;
+  letter-spacing: 0.01em;
+}
+
+.edit-header .edit-spacer { flex: 1; }
+
+.edit-chip {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  white-space: nowrap;
+}
+
+.edit-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-light);
+  background: var(--bg-card);
+  color: var(--text-main);
+  font-family: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: var(--transition);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.edit-btn:hover:not(:disabled) {
+  background: var(--bg-card-hover);
+  border-color: var(--border-focus);
+}
+
+.edit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.edit-btn.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.edit-btn.primary:hover:not(:disabled) { background: var(--primary-hover); }
+
+.edit-btn.toggle-on {
+  border-color: var(--primary);
+  color: var(--primary-hover);
+  background: var(--primary-glow);
+}
+
+/* --- monitor -------------------------------------------------------------- */
+
+.edit-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: #05050a;
+}
+
+.edit-canvas {
+  max-width: 100%;
+  max-height: 100%;
+  background: #000;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-card);
+}
+
+.edit-empty {
+  text-align: center;
+  color: var(--text-muted);
+  max-width: 380px;
+  line-height: 1.6;
+  font-size: 0.85rem;
+}
+
+/* --- transport ------------------------------------------------------------ */
+
+.edit-transport {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border-light);
+  background: var(--bg-panel);
+  flex: 0 0 auto;
+}
+
+.edit-clock {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  min-width: 130px;
+}
+
+.edit-clock strong { color: var(--text-main); font-weight: 600; }
+
+/* --- timeline ------------------------------------------------------------- */
+
+.edit-timeline {
+  flex: 0 0 auto;
+  max-height: 42vh;
+  overflow: auto;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border-light);
+  padding-bottom: 12px;
+}
+
+.edit-ruler {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  height: 24px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-light);
+  cursor: pointer;
+}
+
+.edit-ruler-tick {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-left: 1px solid var(--border-light);
+  padding-left: 4px;
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  line-height: 24px;
+  user-select: none;
+  pointer-events: none;
+}
+
+.edit-track {
+  position: relative;
+  margin: 8px 0 0;
+  height: 62px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.edit-track-label {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  display: inline-block;
+  font-size: 0.65rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 2px 8px;
+}
+
+.edit-clip {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border-light);
+  background: linear-gradient(180deg, rgba(139, 92, 246, 0.28), rgba(139, 92, 246, 0.12));
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  box-sizing: border-box;
+}
+
+.edit-clip:hover { border-color: var(--border-focus); }
+
+.edit-clip.selected {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary), var(--shadow-neon);
+}
+
+.edit-clip.is-image {
+  background: linear-gradient(180deg, rgba(6, 182, 212, 0.28), rgba(6, 182, 212, 0.12));
+}
+
+.edit-clip.is-missing {
+  background: repeating-linear-gradient(
+    45deg, rgba(244, 63, 94, 0.22), rgba(244, 63, 94, 0.22) 6px,
+    transparent 6px, transparent 12px
+  );
+}
+
+.edit-clip-name {
+  display: block;
+  padding: 5px 7px 0;
+  font-size: 0.68rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.edit-clip-meta {
+  display: block;
+  padding: 1px 7px;
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.edit-clip-badge {
+  position: absolute;
+  right: 4px;
+  bottom: 3px;
+  font-size: 0.55rem;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: #fff;
+  letter-spacing: 0.03em;
+}
+
+.edit-transition {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(248, 250, 252, 0.32), transparent);
+  border-left: 1px solid rgba(248, 250, 252, 0.35);
+  border-right: 1px solid rgba(248, 250, 252, 0.35);
+}
+
+.edit-transition.dip {
+  background: linear-gradient(90deg, transparent, rgba(0, 0, 0, 0.75), transparent);
+}
+
+.edit-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 3;
+}
+
+.edit-playhead::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -4px;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 7px solid var(--accent);
+}
+
+.edit-scroll {
+  position: relative;
+  padding: 0 0 4px;
+}
