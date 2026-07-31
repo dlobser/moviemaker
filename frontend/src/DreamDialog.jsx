@@ -61,17 +61,31 @@ export default function DreamDialog({
 
   const set = (patch) => onChange({ ...settings, ...patch });
 
-  const allShots = scenes.flatMap(scene => (scene.shots || []).map(shot => ({ shot, scene })));
-  const startShot = allShots.find(entry => entry.shot.id === settings.startShotId)?.shot || null;
+  const allShots = scenes.flatMap(scene => (scene.shots || []).map(shot => shot));
+  const startIndex = allShots.findIndex(shot => shot.id === settings.startShotId);
+  const startShot = startIndex === -1 ? null : allShots[startIndex];
+
+  const chaining = settings.mode === 'chain';
+  // Chaining can only ever reach the end of the timeline.
+  const available = startIndex === -1 ? 0 : allShots.length - startIndex;
+  const requested = Math.max(1, Number(settings.iterations) || 1);
+  const iterations = chaining ? Math.min(requested, Math.max(1, available)) : requested;
+
+  // In chain mode the shots are known up front, which makes a real pre-flight
+  // possible: a shot with nothing written on it stops the run when it is
+  // reached, so say so before anything is spent.
+  const chainShots = chaining && startShot ? allShots.slice(startIndex, startIndex + iterations) : [];
+  const chainWithoutPrompt = chainShots
+    .slice(1)
+    .filter(shot => !String(shot.draftVideoPrompt || shot.description || '').trim());
 
   const videoModelId = settings.videoModel || defaults.videoModel;
   const videoModel = getVideoModel(videoModelId);
-  const iterations = Math.max(1, Number(settings.iterations) || 1);
 
   // What the run will actually pay for: every clip needs a video, and the first
   // one needs a still too unless the starting shot already has one.
   const videosToMake = iterations - (startShot?.selectedVideo ? 1 : 0);
-  const imagesToMake = startShot && !startShot.selectedImage ? 1 : 0;
+  const imagesToMake = startShot && !startShot.selectedImage && !startShot.selectedVideo ? 1 : 0;
   const videoUnitPrice = typeof videoModel?.price === 'number' ? videoModel.price : null;
 
   const cast = describeAssetLibrary(assetLibrary);
@@ -84,6 +98,9 @@ export default function DreamDialog({
       if (!String(seed || '').trim()) {
         return `${startShot.name || 'That shot'} has no image and nothing to generate one from — give it a description first.`;
       }
+    }
+    if (chaining && available < 2) {
+      return 'Chaining needs at least one shot after the starting one.';
     }
     return null;
   })();
@@ -106,11 +123,35 @@ export default function DreamDialog({
         </div>
 
         <div className="modal-body">
+          <div className="form-group">
+            <label className="form-label">Mode</label>
+            <select
+              className="select-field"
+              disabled={running}
+              value={settings.mode || 'invent'}
+              onChange={(e) => onChange({ ...settings, mode: e.target.value })}
+            >
+              <option value="invent">Invent — the LLM writes each new clip</option>
+              <option value="chain">Chain — walk shots I have already written</option>
+            </select>
+          </div>
+
           <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.6, marginTop: 0 }}>
-            One continuous shot, generated a clip at a time. Each clip is animated from the last frame of the
-            one before it, and the LLM looks at that frame before writing what happens next — so where it ends
-            up is a surprise, inside the boundaries you set here. Every clip lands in your shot list as an
-            ordinary shot.
+            {chaining ? (
+              <>
+                One continuous shot out of shots you already wrote. Each shot keeps its own prompt — nothing is
+                rewritten and no new shots are made — but its opening still is replaced by the last frame of the
+                previous clip, so the whole run plays without a cut. The LLM is not called at all, unless the
+                starting shot has no prompt of its own yet.
+              </>
+            ) : (
+              <>
+                One continuous shot, generated a clip at a time. Each clip is animated from the last frame of the
+                one before it, and the LLM looks at that frame before writing what happens next — so where it ends
+                up is a surprise, inside the boundaries you set here. Every clip lands in your shot list as an
+                ordinary shot.
+              </>
+            )}
           </p>
 
           <div className="form-group">
@@ -134,13 +175,17 @@ export default function DreamDialog({
               ))}
             </select>
             <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
-              Whatever this shot already has is reused. Missing image or video gets generated first, then the
-              dream starts from it.
+              {chaining
+                ? 'The chain walks forward from here in timeline order, across scene boundaries.'
+                : 'Whatever this shot already has is reused. A missing image is drawn from its description; a missing prompt is written by reading its image.'}
             </span>
           </div>
 
           <div className="form-group">
-            <label className="form-label">Standing instructions for the LLM</label>
+            <label className="form-label">
+              Standing instructions for the LLM
+              {chaining && <span style={{ color: 'var(--text-dim)', fontWeight: 'normal' }}> — only used if the starting shot has no prompt</span>}
+            </label>
             <textarea
               className="input-field"
               rows={5}
@@ -159,17 +204,22 @@ export default function DreamDialog({
           </div>
 
           <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
-            <div className="form-group" style={{ flex: '0 0 140px' }}>
-              <label className="form-label">Clips</label>
+            <div className="form-group" style={{ flex: '0 0 160px' }}>
+              <label className="form-label">{chaining ? 'Shots to chain' : 'Clips'}</label>
               <input
                 className="input-field"
                 type="number"
                 min={1}
-                max={60}
+                max={chaining ? Math.max(1, available) : 60}
                 disabled={running}
                 value={settings.iterations}
                 onChange={(e) => set({ iterations: Math.max(1, Math.min(60, Number(e.target.value) || 1)) })}
               />
+              {chaining && startShot && (
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                  {available} available from here
+                </span>
+              )}
             </div>
             <div className="form-group" style={{ flex: '1 1 220px' }}>
               <label className="form-label">Video model</label>
@@ -290,8 +340,7 @@ export default function DreamDialog({
           {/* --- what this run will do --- */}
           <div className="glass-panel" style={{ padding: '14px', background: 'rgba(139,92,246,0.06)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
             <div style={{ fontSize: '0.95rem', fontWeight: 'bold' }}>
-              {iterations} clip{iterations === 1 ? '' : 's'}
-              {videoModel?.priceNote && !videoUnitPrice ? '' : ''}
+              {iterations} {chaining ? 'shot' : 'clip'}{iterations === 1 ? '' : 's'}
               {settings.videoDuration || defaults.videoDuration
                 ? ` — about ${iterations * Number(settings.videoDuration || defaults.videoDuration || 5)} seconds of film`
                 : ''}
@@ -301,6 +350,26 @@ export default function DreamDialog({
               {imagesToMake > 0 ? ' and 1 opening image' : ''} will be generated
               {startShot?.selectedVideo ? `, reusing ${startShot.name}'s existing clip` : ''}.
             </div>
+            {chaining && chainShots.length > 0 && (
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)', lineHeight: 1.5 }}>
+                Walking: {chainShots.map(s => s.name).join(' → ')}
+              </div>
+            )}
+            {chaining && (
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                Each chained shot keeps its own prompt but is re-rendered on the incoming frame, with this
+                dialog's model and length rather than its own. Earlier takes stay in the shot's gallery.
+              </div>
+            )}
+            {chaining && chainWithoutPrompt.length > 0 && (
+              <div style={{ fontSize: '0.78rem', color: 'var(--accent)', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
+                <AlertTriangle size={12} style={{ marginTop: '3px', flexShrink: 0 }} />
+                <span>
+                  {chainWithoutPrompt.length} shot{chainWithoutPrompt.length === 1 ? ' has' : 's have'} no prompt
+                  or description — the run stops there. ({chainWithoutPrompt.map(s => s.name).join(', ')})
+                </span>
+              </div>
+            )}
             {videoUnitPrice !== null && (
               <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                 Estimated video cost: <strong>${(videoUnitPrice * Math.max(0, videosToMake)).toFixed(2)}</strong>
@@ -311,11 +380,13 @@ export default function DreamDialog({
                 Pricing: {videoModel.priceNote} — × {Math.max(0, videosToMake)}.
               </div>
             )}
-            <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
-              {cast
-                ? `${assetLibrary.length} defined asset${assetLibrary.length === 1 ? '' : 's'} will be offered to the LLM, tags and all.`
-                : 'No assets defined — the dream will invent its own world.'}
-            </div>
+            {!chaining && (
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                {cast
+                  ? `${assetLibrary.length} defined asset${assetLibrary.length === 1 ? '' : 's'} will be offered to the LLM, tags and all.`
+                  : 'No assets defined — the dream will invent its own world.'}
+              </div>
+            )}
             {startBlocker && (
               <div style={{ fontSize: '0.78rem', color: 'var(--accent)', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
                 <AlertTriangle size={12} style={{ marginTop: '3px', flexShrink: 0 }} />
@@ -370,7 +441,9 @@ export default function DreamDialog({
             </button>
           ) : (
             <button className="btn btn-primary" onClick={onRun} disabled={Boolean(startBlocker)}>
-              <Play size={14} /> Dream {iterations} clip{iterations === 1 ? '' : 's'}
+              <Play size={14} /> {chaining
+                ? `Chain ${iterations} shot${iterations === 1 ? '' : 's'}`
+                : `Dream ${iterations} clip${iterations === 1 ? '' : 's'}`}
             </button>
           )}
         </div>

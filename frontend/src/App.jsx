@@ -1429,8 +1429,14 @@ export default function App() {
     return newId;
   };
 
-  /** Show the LLM the frame we just landed on and get the next clip back. */
-  const askDreamForNextClip = async ({ settings, framePath, clip, total, history }) => {
+  /**
+   * Show the LLM a frame and get a clip back.
+   *
+   * `opening` marks the one call where the frame is the shot's own still rather
+   * than something captured off a previous clip, so the model is not told to
+   * continue from a clip that does not exist.
+   */
+  const askDreamForClip = async ({ settings, framePath, clip, total, history, opening = false }) => {
     const res = await apiFetch('/api/llm/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1445,6 +1451,7 @@ export default function App() {
           clipNumber: clip,
           totalClips: total,
           hasFrame: true,
+          opening,
           historyDepth: settings.historyDepth
         }),
         imagePaths: [framePath]
@@ -1456,13 +1463,35 @@ export default function App() {
     return parseDreamReply(data.text);
   };
 
+  /**
+   * The shots a chain run will walk: the start shot and everything after it, in
+   * timeline order, capped at the requested count.
+   */
+  const dreamChainShots = (startShotId, count) => {
+    const startIndex = shots.findIndex(s => s.id === startShotId);
+    if (startIndex === -1) return [];
+    return shots.slice(startIndex, startIndex + Math.max(1, count));
+  };
+
   const handleRunDream = async () => {
     const settings = dreamSettings;
-    const total = Math.max(1, Math.min(60, Number(settings.iterations) || 1));
+    const chaining = settings.mode === 'chain';
     const startShot = shots.find(s => s.id === settings.startShotId);
 
     if (!startShot) {
       showToast('Pick a shot to start the dream from.', 'warning');
+      return;
+    }
+
+    // Chaining can never run past the last shot — there is nothing to hand the
+    // next frame to, and inventing one is the other mode's job.
+    const chainShots = chaining ? dreamChainShots(startShot.id, Number(settings.iterations) || 1) : [];
+    const total = chaining
+      ? chainShots.length
+      : Math.max(1, Math.min(60, Number(settings.iterations) || 1));
+
+    if (chaining && total === 0) {
+      showToast('There are no shots after that one to chain through.', 'warning');
       return;
     }
 
@@ -1489,9 +1518,7 @@ export default function App() {
       for (let clip = 1; clip <= total; clip++) {
         if (dreamCancelRef.current) break;
 
-        if (clip === 1) {
-          history.push(startShot.description || currentVideoPrompt || '');
-        } else {
+        if (clip > 1) {
           dreamPhase(clip, 'capturing the last frame');
           const framePath = await captureLastFrame(previousVideo);
           setImageGallery(prev => [{
@@ -1503,35 +1530,54 @@ export default function App() {
           }, ...prev]);
 
           if (dreamCancelRef.current) break;
-          dreamPhase(clip, 'asking the LLM what happens next');
-          const next = await askDreamForNextClip({ settings, framePath, clip, total, history });
 
-          shotName = dreamShotName(clip);
-          shotId = appendDreamShot(shotId, {
-            name: shotName,
-            description: next.description,
-            draftVideoPrompt: next.videoPrompt,
-            selectedImage: framePath,
-            videoModel: videoModelId,
-            videoResolution: videoRes,
-            videoDuration: duration
-          });
+          if (chaining) {
+            // Nothing is written here: the shot keeps the prompt it already has
+            // and only its opening still is replaced by the frame we captured.
+            const nextShot = chainShots[clip - 1];
+            shotId = nextShot.id;
+            shotName = nextShot.name || `Shot ${clip}`;
+            currentVideoPrompt = resolveShotPrompt(nextShot, 'video');
+            if (!currentVideoPrompt.trim()) {
+              throw new Error(`${shotName} has no video prompt or description of its own to chain from.`);
+            }
+            handleUpdateShotField(shotId, 'selectedImage', framePath);
+            history.push(nextShot.description || currentVideoPrompt);
+            dreamLog(`${clip}. ${shotName} — continuing from the previous frame`);
+          } else {
+            dreamPhase(clip, 'asking the LLM what happens next');
+            const next = await askDreamForClip({ settings, framePath, clip, total, history });
+
+            shotName = dreamShotName(clip);
+            shotId = appendDreamShot(shotId, {
+              name: shotName,
+              description: next.description,
+              draftVideoPrompt: next.videoPrompt,
+              selectedImage: framePath,
+              videoModel: videoModelId,
+              videoResolution: videoRes,
+              videoDuration: duration
+            });
+            currentVideoPrompt = next.videoPrompt;
+            history.push(next.description || next.videoPrompt);
+            dreamLog(`${clip}. ${next.description || next.videoPrompt.slice(0, 100)}`);
+          }
 
           currentImage = framePath;
           currentVideo = null;
-          currentVideoPrompt = next.videoPrompt;
-          history.push(next.description || next.videoPrompt);
-          dreamLog(`${clip}. ${next.description || next.videoPrompt.slice(0, 100)}`);
         }
 
         if (dreamCancelRef.current) break;
 
-        // An opening shot with neither still nor clip needs a still first —
-        // everything after clip 1 already has one, captured off the last video.
+        // --- opening shot only: fill in whatever it is missing ---------------
+        // Everything after clip 1 arrives with a still already captured off the
+        // previous clip, so none of this can apply to it.
+
+        // No still and no clip: draw one from whatever the shot has written.
         if (!currentImage && !currentVideo) {
           const openingPrompt = resolveShotPrompt(startShot, 'image');
           if (!openingPrompt.trim()) {
-            throw new Error(`${shotName} has no image and no description to generate one from.`);
+            throw new Error(`${shotName} has no image, and no description to generate one from.`);
           }
           dreamPhase(clip, 'generating the opening image');
           const result = await submitGenerationJob({
@@ -1546,7 +1592,32 @@ export default function App() {
           });
           if (!result?.ok) throw new Error(result?.error || 'The opening image failed to generate.');
           currentImage = result.path;
-          dreamLog(`${clip}. opening image ready`);
+          dreamLog('1. opening image ready');
+        }
+
+        // A still but nothing written to animate it with. This is the common
+        // way in — a frame grabbed off another clip, dropped on an empty shot —
+        // so read the image and write the opening clip rather than refusing.
+        if (clip === 1 && !currentVideo && !currentVideoPrompt.trim()) {
+          if (!currentImage) {
+            throw new Error(`${shotName} has nothing to start from — give it an image or a description.`);
+          }
+          dreamPhase(1, 'writing the opening clip from the image');
+          const opening = await askDreamForClip({
+            settings, framePath: currentImage, clip: 1, total, history: [], opening: true
+          });
+          currentVideoPrompt = opening.videoPrompt;
+          // Write them onto the shot so the run leaves a shot you can re-roll
+          // by hand, exactly like every shot the invent mode creates.
+          handleUpdateShotField(shotId, 'draftVideoPrompt', opening.videoPrompt);
+          if (opening.description && !String(startShot.description || '').trim()) {
+            handleUpdateShotField(shotId, 'description', opening.description);
+          }
+          dreamLog(`1. ${opening.description || opening.videoPrompt.slice(0, 100)}`);
+        }
+
+        if (clip === 1) {
+          history.push(startShot.description || currentVideoPrompt || '');
         }
 
         if (!currentVideo) {

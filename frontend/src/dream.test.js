@@ -73,6 +73,25 @@ test('buildDreamUserMessage omits the frame line for the opening clip', () => {
   assert.match(message, /none given/);
 });
 
+test('the opening clip is told the frame is a beginning, not a continuation', () => {
+  // Filling in a start shot that has a still but nothing written: the model is
+  // shown the shot's own image, and must not be told to continue from "clip 0".
+  const message = buildDreamUserMessage({ clipNumber: 1, totalClips: 6, opening: true });
+  assert.match(message, /where the dream begins/);
+  assert.match(message, /nothing has happened yet/);
+  assert.doesNotMatch(message, /final frame of clip 0/);
+});
+
+test('createDreamSettings defaults to inventing rather than chaining', () => {
+  assert.equal(createDreamSettings().mode, 'invent');
+  assert.equal(createDreamSettings({ mode: 'chain' }).mode, 'chain');
+});
+
+test('compactDreamSettings stores a chain run but not the default mode', () => {
+  assert.equal(compactDreamSettings(createDreamSettings()).mode, undefined);
+  assert.equal(compactDreamSettings(createDreamSettings({ mode: 'chain' })).mode, 'chain');
+});
+
 test('parseDreamReply reads the JSON object', () => {
   const reply = parseDreamReply('{"description":"the wall opens","videoPrompt":"slow dolly through a widening crack"}');
   assert.deepEqual(reply, { description: 'the wall opens', videoPrompt: 'slow dolly through a widening crack' });

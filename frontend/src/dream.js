@@ -35,6 +35,11 @@ export const DEFAULT_DREAM_HISTORY_DEPTH = 3;
  */
 export function createDreamSettings(overrides = {}) {
   return {
+    // 'invent' — the LLM writes each new clip and a new shot is created for it.
+    // 'chain'  — walk shots that already exist, feeding each one the previous
+    //            clip's last frame and generating from the prompt it already
+    //            has. No LLM, no new shots, no new prompts.
+    mode: 'invent',
     instructions: '',
     iterations: 5,
     systemPrompt: DEFAULT_DREAM_SYSTEM_PROMPT,
@@ -96,13 +101,22 @@ export function buildDreamUserMessage({
   clipNumber = 1,
   totalClips = 1,
   hasFrame = true,
+  opening = false,
   historyDepth = DEFAULT_DREAM_HISTORY_DEPTH
 } = {}) {
   const sections = [];
 
   sections.push(`This is clip ${clipNumber} of ${totalClips} in one continuous shot.`);
 
-  if (hasFrame) {
+  // The opening clip is the one case where the attached image is not a frame
+  // captured off a previous clip — it is the still the dream starts from, and
+  // there is nothing before it to continue.
+  if (opening) {
+    sections.push(
+      'The attached image is where the dream begins. It is the first frame of the ' +
+      'clip you are writing, and nothing has happened yet — start from it.'
+    );
+  } else if (hasFrame) {
     sections.push(
       `The attached image is the final frame of clip ${clipNumber - 1}. ` +
       'It is literally the first frame of the clip you are writing — continue from it.'
