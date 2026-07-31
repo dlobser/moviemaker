@@ -121,6 +121,32 @@ ${sourceMaterial || '<<< PASTE YOUR SCRIPT, TREATMENT OR SHOT LIST HERE >>>'}
 `;
 }
 
+/**
+ * Pull the JSON document out of text pasted straight from a chat window.
+ *
+ * A file picked off disk is whatever the user saved, but a paste is usually a
+ * model's reply verbatim: wrapped in a ```json fence, or introduced with a
+ * sentence, or followed by an offer to make changes. All of that is trivial to
+ * strip here and irritating to strip by hand, so the paste box accepts it.
+ */
+export function extractJsonDocument(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) throw new Error('Nothing to import yet — paste a shot list first.');
+
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/, '')
+    .trim();
+
+  const start = unfenced.indexOf('{');
+  const end = unfenced.lastIndexOf('}');
+  if (start === -1 || end <= start) {
+    throw new Error('No JSON object found in the pasted text.');
+  }
+
+  return JSON.parse(unfenced.slice(start, end + 1));
+}
+
 let idCounter = 0;
 function makeId(prefix) {
   idCounter += 1;

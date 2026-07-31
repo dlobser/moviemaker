@@ -76,7 +76,18 @@ function requireText(value, providerLabel, detail = '') {
   );
 }
 
-export async function generateText({ provider, prompt, systemPrompt, model }, credentials) {
+/** Split a project asset into the { mimeType, data } pair every vision API wants. */
+async function assetToInlineImage(assetPath) {
+  const dataUrl = await readAssetDataUrl(assetPath);
+  const [meta, data] = dataUrl.split(',');
+  return { mimeType: meta.slice(5).replace(';base64', ''), data };
+}
+
+// `imagePaths` is optional and defaults to none, so every existing text-only
+// caller keeps sending exactly the request it always sent.
+export async function generateText({ provider, prompt, systemPrompt, model, imagePaths = [] }, credentials) {
+  const images = await Promise.all((imagePaths || []).filter(Boolean).map(assetToInlineImage));
+
   if (provider === 'gemini') {
     const apiKey = credentials.geminiKey;
     if (!apiKey) throw new Error('Gemini API key is not configured.');
@@ -86,7 +97,14 @@ export async function generateText({ provider, prompt, systemPrompt, model }, cr
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: `${systemPrompt}\n\nUser text: ${prompt}` }] }] })
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: `${systemPrompt}\n\nUser text: ${prompt}` },
+              ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))
+            ]
+          }]
+        })
       },
       credentials, 'Gemini'
     );
@@ -107,7 +125,19 @@ export async function generateText({ provider, prompt, systemPrompt, model }, cr
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
           model: model || 'gpt-4o-mini',
-          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
+          messages: [
+            { role: 'system', content: systemPrompt },
+            {
+              role: 'user',
+              content: images.length === 0 ? prompt : [
+                { type: 'text', text: prompt },
+                ...images.map(img => ({
+                  type: 'image_url',
+                  image_url: { url: `data:${img.mimeType};base64,${img.data}` }
+                }))
+              ]
+            }
+          ]
         })
       },
       credentials, 'OpenAI'
@@ -136,7 +166,17 @@ export async function generateText({ provider, prompt, systemPrompt, model }, cr
           model: model || 'claude-sonnet-5',
           max_tokens: 1024,
           system: systemPrompt,
-          messages: [{ role: 'user', content: prompt }]
+          messages: [{
+            role: 'user',
+            // Images before text: Anthropic's own guidance for image questions.
+            content: images.length === 0 ? prompt : [
+              ...images.map(img => ({
+                type: 'image',
+                source: { type: 'base64', media_type: img.mimeType, data: img.data }
+              })),
+              { type: 'text', text: prompt }
+            ]
+          }]
         })
       },
       credentials, 'Anthropic'

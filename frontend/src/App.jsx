@@ -31,7 +31,9 @@ import {
   StopCircle,
   LayoutGrid,
   Scissors,
-  RotateCcw
+  RotateCcw,
+  Moon,
+  ClipboardPaste
 } from 'lucide-react';
 import {
   IMAGE_MODELS,
@@ -57,7 +59,7 @@ import {
   findAssetByTag,
   normalizeTag
 } from './promptTags.js';
-import { buildLlmImportPrompt, normalizeImportedShotList } from './shotListImport.js';
+import { buildLlmImportPrompt, extractJsonDocument, normalizeImportedShotList } from './shotListImport.js';
 import { apiFetch, resolveAssetUrl, detectMode, isStatic } from './client.js';
 import { createEmptyEdit, migrateEdit } from './edit/model.js';
 import EditView from './edit/EditView.jsx';
@@ -84,6 +86,16 @@ import {
 } from './references.js';
 import ReferencePanel, { ReferenceStrip } from './ReferencePanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
+import DreamDialog from './DreamDialog.jsx';
+import {
+  DEFAULT_DREAM_SYSTEM_PROMPT,
+  buildDreamUserMessage,
+  compactDreamSettings,
+  createDreamSettings,
+  dreamShotName,
+  parseDreamReply
+} from './dream.js';
+import { captureLastFrame } from './dreamFrame.js';
 import { Menu, MenuItem, MenuLabel, MenuSeparator } from './MenuBar.jsx';
 import './reference.css';
 import './menu.css';
@@ -206,6 +218,12 @@ export default function App() {
   const [batchOnlyMissing, setBatchOnlyMissing] = useState(true);
   const [batchConcurrency, setBatchConcurrency] = useState(3);
 
+  // --- DREAM MODE (self-contained; nothing else reads this) ---
+  const [dreamOpen, setDreamOpen] = useState(false);
+  const [dreamSettings, setDreamSettings] = useState(() => createDreamSettings());
+  const [dreamRun, setDreamRun] = useState(null); // { active, total, clip, completed, phase, log[] }
+  const dreamCancelRef = useRef(false);
+
   // --- PROJECTS (one folder per project) ---
   const [project, setProject] = useState({ path: null, name: 'Loading…', workingFolder: '', isLegacy: true, recent: [] });
   const [newProjectDraft, setNewProjectDraft] = useState(null); // { directory, name }
@@ -216,6 +234,9 @@ export default function App() {
   const [importReport, setImportReport] = useState(null); // { added, warnings[] }
   const [llmPromptSource, setLlmPromptSource] = useState('');
   const shotListInputRef = useRef(null);
+  // Pasting an LLM's reply straight in, as an alternative to saving it to a file
+  // first. Same document, same normaliser — only the way it arrives differs.
+  const [pasteImport, setPasteImport] = useState(null); // null | { text, mode }
 
   // --- UI STATES ---
   const [activeShotId, setActiveShotId] = useState(null);
@@ -435,6 +456,9 @@ export default function App() {
     setBatchConcurrency(state.batchConcurrency || 3);
     setAttachTagsForImages(state.attachTagsForImages !== false);
     setAttachTagsForVideos(state.attachTagsForVideos === true);
+    // Only the fields a dream saved are stored, so unset ones follow the
+    // project's current models rather than a pinned stale one.
+    setDreamSettings(createDreamSettings(state.dreamSettings || {}));
     // Folds the flat pre/post and system-prompt fields older projects saved at
     // the top level into the prompt bag.
     setPromptSettings(migratePromptSettings(state));
@@ -485,6 +509,7 @@ export default function App() {
       batchConcurrency,
       attachTagsForImages,
       attachTagsForVideos,
+      dreamSettings: compactDreamSettings(dreamSettings),
       // Only the slots that differ from their defaults are written, so a future
       // change to a default still reaches projects that never edited it.
       promptSettings: compactPromptSettings(promptSettings),
@@ -542,7 +567,7 @@ export default function App() {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, promptSettings, concatenatedVideo, edit]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, promptSettings, concatenatedVideo, edit, dreamSettings]);
 
   // Save Credentials
   const saveConfig = async (newKeys) => {
@@ -1336,6 +1361,246 @@ export default function App() {
   const handleCancelBatch = () => {
     cancelBatchRef.current = true;
     showToast('Batch will stop after the in-flight generations finish.', 'warning');
+  };
+
+  // --- DREAM MODE -----------------------------------------------------------
+  //
+  // One continuous shot, made a clip at a time: generate, capture the clip's
+  // last frame, show that frame to the LLM, let it decide what happens next,
+  // animate the frame with that answer, repeat.
+  //
+  // Everything it touches is ordinary studio state — it creates ordinary shots
+  // and queues ordinary generation jobs through submitGenerationJob — so the
+  // result behaves like a hand-built sequence everywhere else in the app, and
+  // nothing outside this block and DreamDialog.jsx knows dreams exist.
+
+  const dreamLog = (text, level = 'info') => {
+    setDreamRun(prev => (prev ? { ...prev, log: [...prev.log, { text, level }] } : prev));
+  };
+
+  const dreamPhase = (clip, phase) => {
+    setDreamRun(prev => (prev ? { ...prev, clip, phase } : prev));
+  };
+
+  /**
+   * Open a new shot immediately after `afterShotId`, already holding the frame
+   * the previous clip ended on. Returns its id.
+   */
+  const appendDreamShot = (afterShotId, patch) => {
+    const newId = `shot_dream_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const blank = {
+      id: newId,
+      name: 'Dream',
+      setup: '',
+      description: '',
+      dialogue: '',
+      notes: '',
+      selectedImage: null,
+      selectedVideo: null,
+      referenceImages: [],
+      lipSyncAudio: null,
+      imagePrompts: [],
+      videoPrompts: [],
+      draftImagePrompt: '',
+      draftVideoPrompt: ''
+    };
+
+    setScenes(prev => {
+      let placed = false;
+      const next = prev.map(scene => {
+        const index = (scene.shots || []).findIndex(s => s.id === afterShotId);
+        if (index === -1) return scene;
+        placed = true;
+        const shotList = [...scene.shots];
+        shotList.splice(index + 1, 0, { ...blank, ...patch });
+        return { ...scene, shots: shotList };
+      });
+      if (placed) return next;
+      // The shot we were following got deleted mid-dream — land in the active
+      // scene rather than dropping the clip on the floor.
+      return next.map(scene => (
+        scene.id === activeSceneId ? { ...scene, shots: [...(scene.shots || []), { ...blank, ...patch }] } : scene
+      ));
+    });
+
+    // A dream can add dozens of shots; leaving them all expanded buries the
+    // rest of the timeline.
+    setCollapsedShots(prev => ({ ...prev, [newId]: true }));
+    return newId;
+  };
+
+  /** Show the LLM the frame we just landed on and get the next clip back. */
+  const askDreamForNextClip = async ({ settings, framePath, clip, total, history }) => {
+    const res = await apiFetch('/api/llm/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: activeLlm,
+        model: llmModel,
+        systemPrompt: settings.systemPrompt || DEFAULT_DREAM_SYSTEM_PROMPT,
+        prompt: buildDreamUserMessage({
+          instructions: settings.instructions,
+          assetLibrary,
+          history,
+          clipNumber: clip,
+          totalClips: total,
+          hasFrame: true,
+          historyDepth: settings.historyDepth
+        }),
+        imagePaths: [framePath]
+      })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'The LLM call failed.');
+    return parseDreamReply(data.text);
+  };
+
+  const handleRunDream = async () => {
+    const settings = dreamSettings;
+    const total = Math.max(1, Math.min(60, Number(settings.iterations) || 1));
+    const startShot = shots.find(s => s.id === settings.startShotId);
+
+    if (!startShot) {
+      showToast('Pick a shot to start the dream from.', 'warning');
+      return;
+    }
+
+    const imageModelId = settings.imageModel || imageModel;
+    const imageRes = settings.imageResolution || imageResolution;
+    const videoModelId = settings.videoModel || videoModel;
+    const videoRes = settings.videoResolution || videoResolution;
+    const duration = settings.videoDuration || videoDuration;
+
+    dreamCancelRef.current = false;
+    setDreamRun({ active: true, total, clip: 1, completed: 0, phase: 'starting', log: [], stopped: false, failed: false });
+
+    // What the LLM is told it has already dreamt.
+    const history = [];
+    let shotId = startShot.id;
+    let shotName = startShot.name || 'Shot';
+    let currentImage = startShot.selectedImage;
+    let currentVideo = startShot.selectedVideo;
+    let currentVideoPrompt = resolveShotPrompt(startShot, 'video');
+    let previousVideo = null;
+    let failure = null;
+
+    try {
+      for (let clip = 1; clip <= total; clip++) {
+        if (dreamCancelRef.current) break;
+
+        if (clip === 1) {
+          history.push(startShot.description || currentVideoPrompt || '');
+        } else {
+          dreamPhase(clip, 'capturing the last frame');
+          const framePath = await captureLastFrame(previousVideo);
+          setImageGallery(prev => [{
+            id: `img_dream_${Date.now()}`,
+            path: framePath,
+            prompt: `Dream clip ${clip - 1} — final frame`,
+            name: `Dream frame ${clip - 1}`,
+            createdAt: new Date().toISOString()
+          }, ...prev]);
+
+          if (dreamCancelRef.current) break;
+          dreamPhase(clip, 'asking the LLM what happens next');
+          const next = await askDreamForNextClip({ settings, framePath, clip, total, history });
+
+          shotName = dreamShotName(clip);
+          shotId = appendDreamShot(shotId, {
+            name: shotName,
+            description: next.description,
+            draftVideoPrompt: next.videoPrompt,
+            selectedImage: framePath,
+            videoModel: videoModelId,
+            videoResolution: videoRes,
+            videoDuration: duration
+          });
+
+          currentImage = framePath;
+          currentVideo = null;
+          currentVideoPrompt = next.videoPrompt;
+          history.push(next.description || next.videoPrompt);
+          dreamLog(`${clip}. ${next.description || next.videoPrompt.slice(0, 100)}`);
+        }
+
+        if (dreamCancelRef.current) break;
+
+        // An opening shot with neither still nor clip needs a still first —
+        // everything after clip 1 already has one, captured off the last video.
+        if (!currentImage && !currentVideo) {
+          const openingPrompt = resolveShotPrompt(startShot, 'image');
+          if (!openingPrompt.trim()) {
+            throw new Error(`${shotName} has no image and no description to generate one from.`);
+          }
+          dreamPhase(clip, 'generating the opening image');
+          const result = await submitGenerationJob({
+            type: 'image',
+            shotId,
+            shotName,
+            rawPrompt: openingPrompt,
+            model: imageModelId,
+            resolution: imageRes,
+            primaryImagePaths: shotReferencePaths(startShot),
+            attachTaggedImages: attachTagsForImages
+          });
+          if (!result?.ok) throw new Error(result?.error || 'The opening image failed to generate.');
+          currentImage = result.path;
+          dreamLog(`${clip}. opening image ready`);
+        }
+
+        if (!currentVideo) {
+          if (!String(currentVideoPrompt || '').trim()) {
+            throw new Error(`${shotName} has no video prompt to work from.`);
+          }
+          dreamPhase(clip, 'generating the clip');
+          const result = await submitGenerationJob({
+            type: 'video',
+            shotId,
+            shotName,
+            rawPrompt: currentVideoPrompt,
+            model: videoModelId,
+            resolution: videoRes,
+            duration,
+            primaryImagePaths: currentImage ? [currentImage] : [],
+            attachTaggedImages: attachTagsForVideos
+          });
+          if (!result?.ok) throw new Error(result?.error || 'The clip failed to generate.');
+          currentVideo = result.path;
+        } else {
+          dreamLog(`${clip}. reusing ${shotName}'s existing clip`);
+        }
+
+        previousVideo = currentVideo;
+        setDreamRun(prev => (prev ? { ...prev, completed: clip } : prev));
+      }
+    } catch (error) {
+      console.error('Dream failed:', error);
+      failure = error.message || String(error);
+      dreamLog(`Stopped: ${failure}`, 'error');
+    }
+
+    const stopped = dreamCancelRef.current;
+    setDreamRun(prev => (prev ? { ...prev, active: false, phase: '', stopped, failed: Boolean(failure) } : prev));
+    dreamCancelRef.current = false;
+
+    // No explicit save: this closure captured `scenes` as they were before the
+    // dream added anything, so writing them here would overwrite the run. The
+    // debounced autosave already fired on every clip.
+
+    if (failure) {
+      showToast(`Dream ended early: ${failure}`, 'error');
+    } else if (stopped) {
+      showToast('Dream stopped. Everything generated so far is in your shot list.', 'warning');
+    } else {
+      showToast(`Dream complete — ${total} clip${total === 1 ? '' : 's'}.`, 'success');
+    }
+  };
+
+  const handleStopDream = () => {
+    dreamCancelRef.current = true;
+    dreamLog('Stopping after the clip in flight…', 'info');
+    showToast('Dream will stop once the current clip finishes.', 'warning');
   };
 
   // --- ASSET LIBRARY --------------------------------------------------------
@@ -2155,7 +2420,7 @@ export default function App() {
   // --- SHOT LIST IMPORT / LLM PROMPT ---------------------------------------
 
   const handleCopyLlmPrompt = async () => {
-    const text = buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource });
+    const text = buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource, intro: promptText(promptSettings, 'importIntro') });
     try {
       await navigator.clipboard.writeText(text);
       showToast('LLM prompt copied. Paste it into any chat model with your script.', 'success');
@@ -2188,6 +2453,24 @@ export default function App() {
     reader.readAsText(file);
   };
 
+  /** The same import, from the paste box rather than a file on disk. */
+  const handleImportPastedShotList = () => {
+    if (!pasteImport) return;
+    let parsed;
+    try {
+      parsed = extractJsonDocument(pasteImport.text);
+    } catch (err) {
+      showToast(`JSON parse error: ${err.message}`, 'error');
+      return;
+    }
+    try {
+      applyImportedDocument(parsed, pasteImport.mode);
+      setPasteImport(null);
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
+  };
+
   /**
    * Load an imported document into the studio.
    *
@@ -2199,13 +2482,30 @@ export default function App() {
     const { project, assets, promptSnippets: importedSnippets, scenes: importedScenes, warnings } =
       normalizeImportedShotList(parsed);
 
-    // Project-level settings
-    if (project.prePrompt !== undefined) setPrePrompt(project.prePrompt);
-    if (project.postPrompt !== undefined) setPostPrompt(project.postPrompt);
-    if (project.videoPrePrompt !== undefined) setVideoPrePrompt(project.videoPrePrompt);
-    if (project.videoPostPrompt !== undefined) setVideoPostPrompt(project.videoPostPrompt);
-    if (project.imageSystemPrompt) setImageSystemPrompt(project.imageSystemPrompt);
-    if (project.videoSystemPrompt) setVideoSystemPrompt(project.videoSystemPrompt);
+    // Project-level settings.
+    //
+    // The pre/post and system prompts have no state of their own any more —
+    // they are slots in `promptSettings`. Writing them through the setters they
+    // used to have threw a ReferenceError that the import handlers caught and
+    // reported as a plain "Import failed", so any document carrying a pre-prompt
+    // could not be imported at all.
+    const importedSlots = {};
+    [
+      'prePrompt', 'postPrompt', 'videoPrePrompt', 'videoPostPrompt',
+      'imageSystemPrompt', 'videoSystemPrompt'
+    ].forEach(slot => {
+      if (typeof project[slot] === 'string') importedSlots[slot] = project[slot];
+    });
+    // A full state export carries the whole bag, including the slots that have
+    // no flat mirror (asset templates, the import intro). The flat six win, so a
+    // hand-written shot list still overrides what the bag happens to hold.
+    const importedBag = parsed.promptSettings && typeof parsed.promptSettings === 'object'
+      ? parsed.promptSettings
+      : {};
+    if (Object.keys(importedSlots).length > 0 || Object.keys(importedBag).length > 0) {
+      setPromptSettings(prev => ({ ...prev, ...importedBag, ...importedSlots }));
+    }
+
     if (project.activeLlm) setActiveLlm(project.activeLlm);
     if (project.llmModel) setLlmModel(project.llmModel);
     if (project.imageModel) setImageModel(project.imageModel);
@@ -3447,15 +3747,23 @@ export default function App() {
                 Copy LLM prompt
               </MenuItem>
               <MenuItem
+                icon={ClipboardPaste}
+                onClick={() => setPasteImport({ text: '', mode: 'replace' })}
+                title="Paste an LLM's reply straight in, fence and all"
+              >
+                Paste shot list…
+              </MenuItem>
+              <MenuItem
                 icon={Upload}
                 onClick={() => { shotListInputRef.current.dataset.mode = 'replace'; shotListInputRef.current.click(); }}
+                hint="file"
               >
                 Import shot list…
               </MenuItem>
               <MenuItem
                 icon={Plus}
                 onClick={() => { shotListInputRef.current.dataset.mode = 'append'; shotListInputRef.current.click(); }}
-                hint="append"
+                hint="file, append"
               >
                 Import and add after…
               </MenuItem>
@@ -3520,6 +3828,16 @@ export default function App() {
                 onClick={() => setAssetBatchDialog({ onlyMissing: true, useLlm: true, rewriteExisting: false })}
               >
                 Batch asset references…
+              </MenuItem>
+
+              <MenuSeparator />
+              <MenuItem
+                icon={Moon}
+                onClick={() => setDreamOpen(true)}
+                badge={dreamRun?.active && <span className="menu-badge">{dreamRun.completed}/{dreamRun.total}</span>}
+                title="One continuous shot: each clip animates the last frame of the one before it"
+              >
+                Dream…
               </MenuItem>
 
               <MenuSeparator />
@@ -5812,6 +6130,122 @@ export default function App() {
         );
       })()}
 
+      {/* --- A4b. DREAM --- */}
+      {dreamOpen && (
+        <DreamDialog
+          settings={dreamSettings}
+          onChange={setDreamSettings}
+          scenes={scenes}
+          assetLibrary={assetLibrary}
+          defaults={{ imageModel, imageResolution, videoModel, videoResolution, videoDuration }}
+          run={dreamRun}
+          onRun={handleRunDream}
+          onStop={handleStopDream}
+          onClose={() => setDreamOpen(false)}
+        />
+      )}
+
+      {/* --- A4c. PASTE SHOT LIST --- */}
+      {pasteImport && (() => {
+        // Validate as you paste rather than on submit: the whole point of the
+        // box is that you can see the document was understood before it
+        // replaces the project.
+        let preview = null;
+        let problem = null;
+        if (pasteImport.text.trim()) {
+          try {
+            const normalized = normalizeImportedShotList(extractJsonDocument(pasteImport.text));
+            preview = {
+              scenes: normalized.scenes.length,
+              shots: normalized.scenes.reduce((sum, s) => sum + s.shots.length, 0),
+              assets: normalized.assets.length,
+              snippets: normalized.promptSnippets.length,
+              warnings: normalized.warnings
+            };
+          } catch (err) {
+            problem = err.message;
+          }
+        }
+
+        return (
+          <div className="modal-overlay" onClick={() => setPasteImport(null)}>
+            <div className="modal-window" style={{ maxWidth: '720px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <ClipboardPaste size={20} /> Paste Shot List
+                </h2>
+                <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setPasteImport(null)}>
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="modal-body">
+                <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.6 }}>
+                  Paste the JSON an LLM gave you. A <code>```json</code> fence or a sentence either side of it is
+                  fine — the document is found and read out of whatever you paste.
+                </p>
+
+                <div className="form-group">
+                  <textarea
+                    autoFocus
+                    className="input-field"
+                    style={{ fontFamily: 'monospace', fontSize: '0.72rem', minHeight: '280px', width: '100%' }}
+                    placeholder={'{\n  "schemaVersion": 1,\n  "project": { … },\n  "assets": [ … ],\n  "scenes": [ … ]\n}'}
+                    value={pasteImport.text}
+                    onChange={(e) => setPasteImport({ ...pasteImport, text: e.target.value })}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">On import</label>
+                  <select
+                    className="select-field"
+                    value={pasteImport.mode}
+                    onChange={(e) => setPasteImport({ ...pasteImport, mode: e.target.value })}
+                  >
+                    <option value="replace">Replace every scene in the project</option>
+                    <option value="append">Add after the existing scenes</option>
+                  </select>
+                </div>
+
+                {problem && (
+                  <div className="glass-panel" style={{ padding: '12px', background: 'rgba(244,63,94,0.07)', display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
+                    <AlertTriangle size={14} style={{ marginTop: '2px', flexShrink: 0, color: 'var(--accent)' }} />
+                    <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{problem}</span>
+                  </div>
+                )}
+
+                {preview && (
+                  <div className="glass-panel" style={{ padding: '14px', background: 'rgba(139,92,246,0.06)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <div style={{ fontSize: '0.9rem', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <Check size={14} color="var(--success)" />
+                      {preview.scenes} scene{preview.scenes === 1 ? '' : 's'}, {preview.shots} shot{preview.shots === 1 ? '' : 's'},
+                      {' '}{preview.assets} asset{preview.assets === 1 ? '' : 's'}
+                      {preview.snippets > 0 ? `, ${preview.snippets} snippet${preview.snippets === 1 ? '' : 's'}` : ''}
+                    </div>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                      {pasteImport.mode === 'replace'
+                        ? `Replaces the ${scenes.length} scene${scenes.length === 1 ? '' : 's'} currently in this project.`
+                        : `Added after the ${scenes.length} scene${scenes.length === 1 ? '' : 's'} already here.`}
+                    </div>
+                    {preview.warnings.map((warning, i) => (
+                      <div key={i} style={{ fontSize: '0.78rem', color: 'var(--accent)' }}>• {warning}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="modal-footer">
+                <button className="btn btn-secondary" onClick={() => setPasteImport(null)}>Cancel</button>
+                <button className="btn btn-primary" onClick={handleImportPastedShotList} disabled={!preview}>
+                  <ClipboardPaste size={14} /> Import
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* --- A5. IMPORT REPORT --- */}
       {importReport && (
         <div className="modal-overlay" onClick={() => setImportReport(null)}>
@@ -6245,8 +6679,10 @@ export default function App() {
                 <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '12px', lineHeight: 1.6 }}>
                   Paste your script or treatment below, hit <strong>Copy LLM Prompt</strong>, and give the result to
                   any chat model. It returns a JSON document covering scenes, shots, prompts, assets, global
-                  pre/post prompts, system prompts and model choices — import it with <strong>Import Shot List</strong>.
-                  The prompt is generated from this project's live model catalog and existing asset tags.
+                  pre/post prompts, system prompts and model choices — bring it back with <strong>Paste Shot
+                  List</strong> (straight from the chat window, fence and all) or save it and use <strong>Import
+                  from File</strong>. The prompt is generated from this project's live model catalog and existing
+                  asset tags.
                 </p>
 
                 <div className="form-group" style={{ marginBottom: '12px' }}>
@@ -6264,7 +6700,7 @@ export default function App() {
                   readOnly
                   className="input-field"
                   style={{ fontFamily: 'monospace', fontSize: '0.72rem', minHeight: '220px', width: '100%', background: 'rgba(0,0,0,0.3)', color: '#a8ffb2' }}
-                  value={buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource })}
+                  value={buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource, intro: promptText(promptSettings, 'importIntro') })}
                 />
 
                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '10px' }}>
@@ -6273,9 +6709,15 @@ export default function App() {
                   </button>
                   <button
                     className="btn btn-secondary"
+                    onClick={() => { setActiveOverlay(null); setPasteImport({ text: '', mode: 'replace' }); }}
+                  >
+                    <ClipboardPaste size={14} /> Paste Shot List
+                  </button>
+                  <button
+                    className="btn btn-secondary"
                     onClick={() => { shotListInputRef.current.dataset.mode = 'replace'; shotListInputRef.current.click(); }}
                   >
-                    <Upload size={14} /> Import Shot List
+                    <Upload size={14} /> Import from File
                   </button>
                 </div>
               </div>

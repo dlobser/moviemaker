@@ -521,13 +521,24 @@ function requireText(value, providerLabel, detail) {
   );
 }
 
+// Split a project asset into the { mimeType, data } pair every vision API wants,
+// differing only in what they call the two fields.
+function assetToInlineImage(assetPath) {
+  const dataUrl = assetToDataUrl(assetPath);
+  const [meta, data] = dataUrl.split(',');
+  return { mimeType: meta.slice(5).replace(';base64', ''), data };
+}
+
 // --- LLM PROXY ENDPOINTS ---
+// `imagePaths` is optional and defaults to none, so every existing text-only
+// caller keeps sending exactly the request it always sent.
 app.post('/api/llm/generate', async (req, res) => {
-  const { provider, prompt, systemPrompt, model } = req.body;
+  const { provider, prompt, systemPrompt, model, imagePaths = [] } = req.body;
   const config = readJsonFile(CONFIG_FILE);
 
   try {
     let responseText = '';
+    const images = (imagePaths || []).filter(Boolean).map(assetToInlineImage);
 
     if (provider === 'gemini') {
       const apiKey = config.geminiKey;
@@ -539,7 +550,12 @@ app.post('/api/llm/generate', async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: `${systemPrompt}\n\nUser text: ${prompt}` }] }]
+          contents: [{
+            parts: [
+              { text: `${systemPrompt}\n\nUser text: ${prompt}` },
+              ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))
+            ]
+          }]
         })
       });
 
@@ -566,7 +582,16 @@ app.post('/api/llm/generate', async (req, res) => {
           model: targetModel,
           messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: prompt }
+            {
+              role: 'user',
+              content: images.length === 0 ? prompt : [
+                { type: 'text', text: prompt },
+                ...images.map(img => ({
+                  type: 'image_url',
+                  image_url: { url: `data:${img.mimeType};base64,${img.data}` }
+                }))
+              ]
+            }
           ]
         })
       });
@@ -594,7 +619,17 @@ app.post('/api/llm/generate', async (req, res) => {
           model: targetModel,
           max_tokens: 1024,
           system: systemPrompt,
-          messages: [{ role: 'user', content: prompt }]
+          messages: [{
+            role: 'user',
+            // Images before text: Anthropic's own guidance for image questions.
+            content: images.length === 0 ? prompt : [
+              ...images.map(img => ({
+                type: 'image',
+                source: { type: 'base64', media_type: img.mimeType, data: img.data }
+              })),
+              { type: 'text', text: prompt }
+            ]
+          }]
         })
       });
 
