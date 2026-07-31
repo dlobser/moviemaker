@@ -24,11 +24,13 @@ import {
   REFERENCE_ROLES,
   SORT_MODES,
   allReferenceTags,
+  assignmentStateFor,
   filterReferences,
   groupReferences,
   kindColor,
   kindLabel,
   sortReferences,
+  targetKey,
   usageOf
 } from './references.js';
 
@@ -49,7 +51,7 @@ export default function ReferencePanel({
   activeSceneId,
   activeShotId,
   onClose,
-  onAssign,
+  onApplyAssignments,
   onUnassign,
   onUpdateReferences,
   onDeleteReferences,
@@ -394,12 +396,15 @@ export default function ReferencePanel({
       {assignTarget && (
         <AssignDialog
           scenes={scenes}
+          assetLibrary={assetLibrary}
+          assignments={assignments}
+          selectedIds={selection.selectedIds}
           activeSceneId={activeSceneId}
           activeShotId={activeShotId}
           count={selection.count}
           onCancel={() => setAssignTarget(null)}
-          onConfirm={(targets, options) => {
-            onAssign(selection.selectedIds, targets, options);
+          onConfirm={(toAssign, toUnassign, options) => {
+            onApplyAssignments(selection.selectedIds, toAssign, toUnassign, options);
             setAssignTarget(null);
           }}
         />
@@ -412,12 +417,14 @@ export default function ReferencePanel({
 function ReferenceCard({ reference, selected, usage, scenes, assetLibrary, onClick, onToggle, onInspect, onPreview, isInspected }) {
   const asset = assetLibrary.find(a => a.id === reference.assetId);
   const scopeBits = [];
-  if (usage.project) scopeBits.push('All');
+  if (usage.project) scopeBits.push('All shots');
   usage.sceneIds.forEach(id => {
     const scene = scenes.find(s => s.id === id);
     if (scene) scopeBits.push(scene.name);
   });
   if (usage.shotIds.length > 0) scopeBits.push(`${usage.shotIds.length} shot${usage.shotIds.length === 1 ? '' : 's'}`);
+  if (usage.allAssets) scopeBits.push('all assets');
+  else if (usage.assetIds.length > 0) scopeBits.push(`${usage.assetIds.length} asset${usage.assetIds.length === 1 ? '' : 's'}`);
 
   return (
     <div
@@ -541,6 +548,17 @@ function ReferenceInspector({ reference, assetLibrary, scenes, assignments, onCh
             </button>
           ) : null;
         })}
+        {usage.allAssets && (
+          <button onClick={() => onUnassignFrom({ scope: 'asset', targetId: null })}>Every asset <X size={10} /></button>
+        )}
+        {usage.assetIds.map(id => {
+          const asset = assetLibrary.find(a => a.id === id);
+          return asset ? (
+            <button key={id} onClick={() => onUnassignFrom({ scope: 'asset', targetId: id })}>
+              &lt;{asset.tag}&gt; <X size={10} />
+            </button>
+          ) : null;
+        })}
       </div>
     </div>
   );
@@ -550,104 +568,175 @@ function ReferenceInspector({ reference, assetLibrary, scenes, assignments, onCh
  * The checkbox tree that makes bulk assignment one interaction: pick any mix of
  * project, scenes and shots, then commit once.
  */
-function AssignDialog({ scenes, activeSceneId, activeShotId, count, onCancel, onConfirm }) {
-  const [project, setProject] = useState(false);
-  const [sceneIds, setSceneIds] = useState([]);
-  const [shotIds, setShotIds] = useState([]);
+function AssignDialog({
+  scenes, assetLibrary = [], assignments, selectedIds,
+  activeSceneId, activeShotId, count, onCancel, onConfirm
+}) {
+  // Open showing what is already true. A write-only form looked identical
+  // whether a reference was attached everywhere or nowhere, which made it
+  // impossible to see an assignment, let alone take one back.
+  const initial = useMemo(() => assignmentStateFor(assignments, selectedIds), [assignments, selectedIds]);
+  const [state, setState] = useState(initial);
   const [role, setRole] = useState('style');
   const [mode, setMode] = useState('add');
+  const [live, setLive] = useState(true);
   const [expanded, setExpanded] = useState(() => (activeSceneId ? { [activeSceneId]: true } : {}));
+  const [assetsOpen, setAssetsOpen] = useState(false);
 
-  const toggle = (list, setList, id) => setList(
-    list.includes(id) ? list.filter(v => v !== id) : [...list, id]
-  );
-
-  const targets = [
-    ...(project ? [{ scope: 'project' }] : []),
-    ...sceneIds.map(id => ({ scope: 'scene', targetId: id })),
-    ...shotIds.map(id => ({ scope: 'shot', targetId: id }))
+  const every = [
+    { scope: 'project', targetId: null },
+    ...scenes.map(scene => ({ scope: 'scene', targetId: scene.id })),
+    ...scenes.flatMap(scene => (scene.shots || []).map(shot => ({ scope: 'shot', targetId: shot.id }))),
+    { scope: 'asset', targetId: null },
+    ...assetLibrary.map(asset => ({ scope: 'asset', targetId: asset.id }))
   ];
+
+  const stateOf = (scope, targetId) => state[targetKey(scope, targetId)] || 'none';
+
+  // Partly-attached cycles to fully attached first, then to detached — the same
+  // order a file browser's tri-state checkbox uses.
+  const cycle = (scope, targetId) => setState(prev => {
+    const key = targetKey(scope, targetId);
+    return { ...prev, [key]: (prev[key] || 'none') === 'all' ? 'none' : 'all' };
+  });
+
+  const toAssign = [];
+  const toUnassign = [];
+  every.forEach(({ scope, targetId }) => {
+    const key = targetKey(scope, targetId);
+    const now = state[key] || 'none';
+    if (now === (initial[key] || 'none')) return;    // untouched
+    if (now === 'all') toAssign.push({ scope, targetId });
+    else if (now === 'none') toUnassign.push({ scope, targetId });
+  });
+
+  const changes = toAssign.length + toUnassign.length;
 
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal-window assign-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h2>Assign {count} reference{count === 1 ? '' : 's'}</h2>
+          <h2>Where {count} reference{count === 1 ? '' : 's'} appl{count === 1 ? 'ies' : 'y'}</h2>
           <button className="btn btn-secondary icon-btn" onClick={onCancel}><X size={15} /></button>
         </div>
 
         <div className="modal-body">
+          <p className="assign-intro">
+            Ticked means attached. Untick to detach. A half-filled box means only some of your
+            selection is attached there — click once to attach them all, again to detach them all.
+          </p>
+
           <div className="assign-quick">
             {activeSceneId && (
-              <button className="btn btn-secondary" onClick={() => toggle(sceneIds, setSceneIds, activeSceneId)}>
+              <button className="btn btn-secondary" onClick={() => cycle('scene', activeSceneId)}>
                 Current scene
               </button>
             )}
             {activeShotId && (
-              <button className="btn btn-secondary" onClick={() => toggle(shotIds, setShotIds, activeShotId)}>
+              <button className="btn btn-secondary" onClick={() => cycle('shot', activeShotId)}>
                 Current shot
               </button>
             )}
             <button
               className="btn btn-secondary"
+              disabled={!activeSceneId}
               onClick={() => {
                 const scene = scenes.find(s => s.id === activeSceneId);
-                const ids = (scene?.shots || []).map(s => s.id);
-                setShotIds(prev => [...new Set([...prev, ...ids])]);
+                setState(prev => {
+                  const next = { ...prev };
+                  (scene?.shots || []).forEach(shot => { next[targetKey('shot', shot.id)] = 'all'; });
+                  return next;
+                });
               }}
-              disabled={!activeSceneId}
             >
               Every shot in this scene
             </button>
           </div>
 
           <div className="assign-tree">
-            <label className="assign-row root">
-              <input type="checkbox" checked={project} onChange={() => setProject(v => !v)} />
-              <strong>Whole project</strong>
-              <em>applies to every shot, now and later</em>
-            </label>
+            <TriRow
+              root
+              state={stateOf('project', null)}
+              onToggle={() => cycle('project', null)}
+              label={<strong>Whole project</strong>}
+              hint="every shot, now and later"
+            />
 
             {scenes.map(scene => {
               const shots = scene.shots || [];
-              const picked = shots.filter(shot => shotIds.includes(shot.id)).length;
+              const attached = shots.filter(shot => stateOf('shot', shot.id) === 'all').length;
               const open = expanded[scene.id];
 
               return (
                 <div key={scene.id} className="assign-scene">
-                  <div className="assign-row">
-                    <input
-                      type="checkbox"
-                      checked={sceneIds.includes(scene.id)}
-                      ref={el => { if (el) el.indeterminate = !sceneIds.includes(scene.id) && picked > 0; }}
-                      onChange={() => toggle(sceneIds, setSceneIds, scene.id)}
-                    />
-                    <button
-                      className="assign-disclosure"
-                      onClick={() => setExpanded(prev => ({ ...prev, [scene.id]: !prev[scene.id] }))}
-                    >
-                      {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                    </button>
-                    <span>{scene.name}</span>
-                    <em>{picked > 0 ? `${picked}/${shots.length} shots` : `${shots.length} shots`}</em>
-                  </div>
+                  <TriRow
+                    state={stateOf('scene', scene.id)}
+                    onToggle={() => cycle('scene', scene.id)}
+                    disclosure={open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    onDisclosure={() => setExpanded(prev => ({ ...prev, [scene.id]: !prev[scene.id] }))}
+                    label={<span>{scene.name}</span>}
+                    hint={attached > 0 ? `${attached}/${shots.length} shots` : `${shots.length} shots`}
+                  />
 
                   {open && shots.map(shot => (
-                    <label key={shot.id} className="assign-row shot">
-                      <input
-                        type="checkbox"
-                        checked={shotIds.includes(shot.id)}
-                        onChange={() => toggle(shotIds, setShotIds, shot.id)}
-                      />
-                      <span>{shot.name}</span>
-                    </label>
+                    <TriRow
+                      key={shot.id}
+                      indent
+                      state={stateOf('shot', shot.id)}
+                      onToggle={() => cycle('shot', shot.id)}
+                      label={<span>{shot.name}</span>}
+                    />
                   ))}
                 </div>
               );
             })}
+
+            {/* Assets are a separate kind of target from the timeline: these
+                references ride along when the asset's own artwork is generated,
+                which is how one style board keeps every character sheet
+                consistent. */}
+            {assetLibrary.length > 0 && (() => {
+              const everyAssets = stateOf('asset', null) === 'all';
+              const attached = assetLibrary.filter(a => stateOf('asset', a.id) === 'all').length;
+
+              return (
+                <div className="assign-scene">
+                  <TriRow
+                    state={stateOf('asset', null)}
+                    onToggle={() => cycle('asset', null)}
+                    disclosure={assetsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    onDisclosure={() => setAssetsOpen(v => !v)}
+                    label={<strong>Every asset</strong>}
+                    hint={everyAssets ? 'on — incl. ones you add later' : (attached > 0 ? `${attached}/${assetLibrary.length} picked` : 'incl. ones you add later')}
+                  />
+
+                  {assetsOpen && assetLibrary.map(asset => (
+                    <TriRow
+                      key={asset.id}
+                      indent
+                      state={everyAssets ? 'all' : stateOf('asset', asset.id)}
+                      // Covered by the blanket row, so ticking one individually
+                      // would be a no-op that looks like it did something.
+                      disabled={everyAssets}
+                      onToggle={() => cycle('asset', asset.id)}
+                      label={<span>&lt;{asset.tag}&gt;{asset.name && asset.name !== asset.tag ? ` — ${asset.name}` : ''}</span>}
+                      hint={everyAssets ? 'via Every asset' : undefined}
+                    />
+                  ))}
+                </div>
+              );
+            })()}
           </div>
 
           <div className="assign-options">
+            <label className="settings-check">
+              <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} />
+              <span>
+                Send these with generations straight away
+                <em>Leave off to attach them but hold them back — you can switch them on later from any shot or asset.</em>
+              </span>
+            </label>
+
             <label className="mini-field">
               <span>Role</span>
               <select className="select-field" value={role} onChange={(e) => setRole(e.target.value)}>
@@ -655,23 +744,29 @@ function AssignDialog({ scenes, activeSceneId, activeShotId, count, onCancel, on
               </select>
             </label>
             <label className="mini-field">
-              <span>Existing references on those targets</span>
+              <span>Other references already on a target</span>
               <select className="select-field" value={mode} onChange={(e) => setMode(e.target.value)}>
-                <option value="add">Keep them — add to the list</option>
-                <option value="replace">Replace them</option>
+                <option value="add">Keep them</option>
+                <option value="replace">Replace them with this selection</option>
               </select>
             </label>
           </div>
         </div>
 
         <div className="modal-footer">
+          <span className="assign-summary">
+            {changes === 0 ? 'No changes' : [
+              toAssign.length ? `attach to ${toAssign.length}` : '',
+              toUnassign.length ? `detach from ${toUnassign.length}` : ''
+            ].filter(Boolean).join(', ')}
+          </span>
           <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
           <button
             className="btn btn-primary"
-            disabled={targets.length === 0}
-            onClick={() => onConfirm(targets, { role, mode })}
+            disabled={changes === 0}
+            onClick={() => onConfirm(toAssign, toUnassign, { role, mode, enabled: live })}
           >
-            <Check size={14} /> Assign to {targets.length} target{targets.length === 1 ? '' : 's'}
+            <Check size={14} /> Apply
           </button>
         </div>
       </div>
@@ -687,6 +782,37 @@ function AssignDialog({ scenes, activeSceneId, activeShotId, count, onCancel, on
  * so it is obvious that unticking one here is a decision about this shot rather
  * than about the scene it came from.
  */
+/**
+ * One row of the assign tree. `state` is 'all' | 'some' | 'none' — 'some' shows
+ * as a half-filled box, which is the only honest rendering when a multi-select
+ * is attached to a target unevenly.
+ */
+function TriRow({ state, onToggle, label, hint, disclosure, onDisclosure, indent, root, disabled }) {
+  return (
+    <div className={`assign-row ${indent ? 'shot' : ''} ${root ? 'root' : ''} ${disabled ? 'disabled' : ''}`}>
+      <input
+        type="checkbox"
+        checked={state === 'all'}
+        disabled={disabled}
+        ref={el => { if (el) el.indeterminate = state === 'some'; }}
+        onChange={onToggle}
+      />
+      {disclosure && (
+        <button className="assign-disclosure" onClick={onDisclosure}>{disclosure}</button>
+      )}
+      <label onClick={disabled ? undefined : onToggle}>{label}</label>
+      {hint && <em>{hint}</em>}
+    </div>
+  );
+}
+
+/** Where an inherited entry came from, in the space of a corner badge. */
+function inheritedLabel(entry) {
+  if (entry.scope === 'project') return 'all';
+  if (entry.scope === 'asset') return 'assets';   // the every-asset assignment
+  return 'scene';
+}
+
 export function ReferenceStrip({ entries, onToggleEntry, onOpenPanel, capacity, label = 'References', compact = false }) {
   if (entries.length === 0) {
     return (
@@ -697,14 +823,21 @@ export function ReferenceStrip({ entries, onToggleEntry, onOpenPanel, capacity, 
   }
 
   const sending = entries.filter(entry => entry.enabled);
-  const overCapacity = capacity > 0 && sending.length > capacity;
+  // `capacity === null` means the caller has no model in hand (the scene strip)
+  // and is not making a claim either way. Zero is a real answer, and it means
+  // nothing at all is uploaded — saying "N sending" there would be a lie.
+  const knownCapacity = capacity !== null && capacity !== undefined;
+  const takesNone = knownCapacity && capacity === 0;
+  const overCapacity = knownCapacity && capacity > 0 && sending.length > capacity;
 
   return (
-    <div className={`reference-strip ${compact ? 'compact' : ''}`}>
+    <div className={`reference-strip ${compact ? 'compact' : ''} ${takesNone ? 'inert' : ''}`}>
       <div className="reference-strip-head">
         <span>{label}</span>
-        <em className={overCapacity ? 'over' : ''}>
-          {sending.length} sending{capacity > 0 ? ` · model takes ${capacity}` : ''}
+        <em className={overCapacity || takesNone ? 'over' : ''}>
+          {takesNone
+            ? `${sending.length} on, none sent — this model reads no reference images`
+            : `${sending.length} sending${capacity > 0 ? ` · model takes ${capacity}` : ''}`}
         </em>
         <button onClick={onOpenPanel} title="Open the reference board"><Plus size={11} /></button>
       </div>
@@ -719,7 +852,7 @@ export function ReferenceStrip({ entries, onToggleEntry, onOpenPanel, capacity, 
           >
             <AssetImage path={entry.ref.path} alt={entry.ref.name} />
             <span className="reference-strip-tick">{entry.enabled ? <Check size={9} /> : <X size={9} />}</span>
-            {entry.inherited && <span className="reference-strip-scope">{entry.scope === 'project' ? 'all' : 'scene'}</span>}
+            {entry.inherited && <span className="reference-strip-scope">{inheritedLabel(entry)}</span>}
           </button>
         ))}
       </div>

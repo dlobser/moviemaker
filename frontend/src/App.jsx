@@ -73,7 +73,9 @@ import {
 import {
   REFERENCE_SCHEMA_VERSION,
   assignReferences,
+  enabledAssetReferencePaths,
   enabledReferencePaths,
+  resolveAssetReferences,
   migrateReferenceState,
   normalizeReference,
   pruneAssignments,
@@ -419,7 +421,8 @@ export default function App() {
     setReferenceImages(migratedRefs.references);
     setRefAssignments(pruneAssignments(migratedRefs.assignments, {
       references: migratedRefs.references,
-      scenes: loadedScenes
+      scenes: loadedScenes,
+      assetLibrary: state.assetLibrary || []
     }));
     setAssetLibrary(state.assetLibrary || []);
     setPromptSnippets(state.promptSnippets || promptSnippets);
@@ -1342,10 +1345,10 @@ export default function App() {
 
   const openAssetEditor = (asset = null) => {
     setAssetEditor(asset
-      ? { ...asset, images: [...(asset.images || [])], inputImages: assetInputImages(asset) }
+      ? { ...asset, images: [...(asset.images || [])], inputImages: assetInputImages(asset), refExclusions: [...(asset.refExclusions || [])] }
       : {
         tag: '', type: 'character', name: '', description: '',
-        images: [], primaryImage: null, inputImages: [],
+        images: [], primaryImage: null, inputImages: [], refExclusions: [],
         imagePrompt: '', imageModel: null, imageResolution: null,
         applyGlobalPrompts: false
       });
@@ -1367,9 +1370,10 @@ export default function App() {
         return { ...prev, inputImages: selected.filter(p => p !== imagePath) };
       }
       const capacity = assetRefCapacity(prev);
+      // A model with no image inputs must not block the choice — the panel says
+      // the ticks are kept for when you switch models, so it has to keep them.
       if (capacity <= 0) {
-        showToast('This model does not accept reference images.', 'warning');
-        return { ...prev, inputImages: selected };
+        return { ...prev, inputImages: [...selected, imagePath] };
       }
       if (selected.length >= capacity) {
         showToast(`This model accepts up to ${capacity} reference image${capacity === 1 ? '' : 's'}. Deselect one first.`, 'warning');
@@ -1397,6 +1401,12 @@ export default function App() {
     const pool = draft.images || [];
     const picked = assetInputImages(draft).filter(p => pool.includes(p));
 
+    // The asset's own ticked images come first, then anything the board aims at
+    // this asset (or at every asset). Order matters because the model's input
+    // capacity trims the tail: a shared style board must never displace the
+    // character's own previous artwork, which is the thing being kept consistent.
+    const boardPaths = assetReferencePaths(draft).filter(p => !picked.includes(p));
+
     // Three-way, because reference art and film frames want opposite treatment.
     // 'asset' is the default: the dedicated asset pre/post, which is usually
     // neutral. 'image' borrows the film's own grade language, which is only
@@ -1414,7 +1424,7 @@ export default function App() {
       prePrompt: wraps[0],
       postPrompt: wraps[1],
       assetLibrary: others,
-      primaryImagePaths: picked,
+      primaryImagePaths: [...picked, ...boardPaths],
       attachTaggedImages: true,
       type: 'image',
       modelId
@@ -1719,7 +1729,10 @@ export default function App() {
       imagePrompt: assetEditor.imagePrompt || '',
       imageModel: assetEditor.imageModel || null,
       imageResolution: assetEditor.imageResolution || null,
-      promptWrap: assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset')
+      promptWrap: assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset'),
+      // Board references this asset opts out of, despite them being aimed at
+      // every asset.
+      refExclusions: assetEditor.refExclusions || []
     };
 
     setAssetLibrary(prev => (
@@ -2950,11 +2963,26 @@ export default function App() {
 
   // --- REFERENCE BOARD ------------------------------------------------------
 
-  /** Attach many references to many targets in one go. */
-  const handleAssignReferences = (refIds, targets, options) => {
-    setRefAssignments(prev => assignReferences(prev, refIds, targets, options));
-    const targetLabel = targets.length === 1 ? 'target' : `${targets.length} targets`;
-    showToast(`${refIds.length} reference${refIds.length === 1 ? '' : 's'} assigned to ${targetLabel}.`, 'success');
+  /**
+   * Apply the assign dialog's result: attach where a target was ticked, detach
+   * where one was unticked. Both halves in one state update so a single edit
+   * cannot half-apply.
+   */
+  const handleApplyAssignments = (refIds, toAssign, toUnassign, options) => {
+    setRefAssignments(prev => {
+      let next = prev;
+      if (toUnassign.length > 0) next = unassignReferences(next, refIds, toUnassign);
+      if (toAssign.length > 0) next = assignReferences(next, refIds, toAssign, options);
+      return next;
+    });
+
+    const parts = [];
+    if (toAssign.length) parts.push(`attached to ${toAssign.length}`);
+    if (toUnassign.length) parts.push(`detached from ${toUnassign.length}`);
+    showToast(
+      `${refIds.length} reference${refIds.length === 1 ? '' : 's'} ${parts.join(' and ')}${options?.enabled === false ? ' — held back until you switch them on' : ''}.`,
+      'success'
+    );
   };
 
   /** Detach from specific targets, or from everywhere when targets is null. */
@@ -3058,6 +3086,35 @@ export default function App() {
     references: referenceImages,
     assignments: refAssignments
   });
+
+  /** The board references in play when this asset's own artwork is generated. */
+  const assetReferenceEntries = (asset) => resolveAssetReferences({
+    asset,
+    references: referenceImages,
+    assignments: refAssignments
+  });
+
+  const assetReferencePaths = (asset) => enabledAssetReferencePaths({
+    asset,
+    references: referenceImages,
+    assignments: refAssignments
+  });
+
+  /** Same per-target send control as a shot, for an asset. */
+  const toggleAssetReferenceEntry = (asset, entry) => {
+    if (entry.inherited) {
+      // Assigned to every asset — opting out is this asset's own decision, so
+      // it is recorded on the asset rather than by detaching it for all of them.
+      const current = asset.refExclusions || [];
+      const next = current.includes(entry.ref.id)
+        ? current.filter(id => id !== entry.ref.id)
+        : [...current, entry.ref.id];
+      setAssetEditor(prev => (prev ? { ...prev, refExclusions: next } : prev));
+      setAssetLibrary(prev => prev.map(a => (a.id === asset.id ? { ...a, refExclusions: next } : a)));
+      return;
+    }
+    setRefAssignments(prev => setEdgeEnabled(prev, entry.edge.id, !entry.enabled));
+  };
 
   const handleRenameAsset = (galleryType, id, newName) => {
     if (!newName.trim()) return;
@@ -3667,7 +3724,9 @@ export default function App() {
                   entries={resolveSceneReferences({ scene: activeScene, references: referenceImages, assignments: refAssignments })}
                   onToggleEntry={toggleSceneReferenceEntry}
                   onOpenPanel={() => setReferencePanelOpen(true)}
-                  capacity={0}
+                  // A scene generates nothing itself, so there is no model and
+                  // no capacity claim to make here.
+                  capacity={null}
                 />
               </div>
             )}
@@ -5229,6 +5288,9 @@ export default function App() {
                 const preview = buildAssetPrompt(assetEditor);
                 const capacity = refImageCapacity('image', modelId);
                 const picked = assetInputImages(assetEditor).filter(p => (assetEditor.images || []).includes(p));
+                // Board references aimed at this asset land after the picks
+                // above, so both counts have to be visible to explain the trim.
+                const boardCount = assetReferencePaths(assetEditor).filter(p => !picked.includes(p)).length;
                 const busy = loadingStates[`asset_gen_${assetEditor.id}`];
 
                 return (
@@ -5317,39 +5379,69 @@ export default function App() {
                       </select>
                     </div>
 
-                    {/* What the model is being shown. Picked below in Reference Images. */}
+                    {/* What the model is being shown. Picked below in Reference
+                        Images, and topped up by whatever the board aims at this
+                        asset. The bulk-select helpers stay available whatever
+                        the model does, so a model change never removes controls. */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
                       {capacity === 0 ? (
-                        <span><strong>{getImageModel(modelId)?.label || modelId}</strong> takes no reference images — prompt only.</span>
+                        <span><strong>{getImageModel(modelId)?.label || modelId}</strong> takes no reference images — prompt only. Your picks below are kept.</span>
                       ) : (
                         <>
                           <span>
-                            Sending <strong>{picked.length}</strong> of up to <strong>{capacity}</strong> reference image{capacity === 1 ? '' : 's'} — tick them in <em>Reference Images</em> below.
+                            Sending <strong>{picked.length}</strong> picked here
+                            {boardCount > 0 ? <> + <strong>{boardCount}</strong> from the board</> : null}
+                            {' '}of up to <strong>{capacity}</strong> reference image{capacity === 1 ? '' : 's'}.
                           </span>
-                          {picked.length > capacity && (
+                          {picked.length + boardCount > capacity && (
                             <span style={{ color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                               <AlertTriangle size={12} /> This model reads only the first {capacity}; untick the rest.
                             </span>
                           )}
-                          <button
-                            className="btn btn-secondary"
-                            style={{ fontSize: '0.72rem', padding: '3px 8px' }}
-                            disabled={!assetEditor.primaryImage}
-                            onClick={() => setAssetEditor({ ...assetEditor, inputImages: assetEditor.primaryImage ? [assetEditor.primaryImage] : [] })}
-                          >
-                            Just the primary
-                          </button>
-                          <button
-                            className="btn btn-secondary"
-                            style={{ fontSize: '0.72rem', padding: '3px 8px' }}
-                            disabled={picked.length === 0}
-                            onClick={() => setAssetEditor({ ...assetEditor, inputImages: [] })}
-                          >
-                            Clear
-                          </button>
                         </>
                       )}
+                      <button
+                        className="btn btn-secondary"
+                        style={{ fontSize: '0.72rem', padding: '3px 8px' }}
+                        disabled={!assetEditor.primaryImage}
+                        onClick={() => setAssetEditor({ ...assetEditor, inputImages: assetEditor.primaryImage ? [assetEditor.primaryImage] : [] })}
+                      >
+                        Just the primary
+                      </button>
+                      <button
+                        className="btn btn-secondary"
+                        style={{ fontSize: '0.72rem', padding: '3px 8px' }}
+                        disabled={(assetEditor.images || []).length === 0}
+                        onClick={() => setAssetEditor({
+                          ...assetEditor,
+                          inputImages: capacity > 0
+                            ? (assetEditor.images || []).slice(0, capacity)
+                            : [...(assetEditor.images || [])]
+                        })}
+                      >
+                        Select all
+                      </button>
+                      <button
+                        className="btn btn-secondary"
+                        style={{ fontSize: '0.72rem', padding: '3px 8px' }}
+                        disabled={picked.length === 0}
+                        onClick={() => setAssetEditor({ ...assetEditor, inputImages: [] })}
+                      >
+                        Clear
+                      </button>
                     </div>
+
+                    {/* Board references aimed at this asset, or at every asset.
+                        Same ticks as a shot: assigned by default, held back per
+                        asset without detaching it for the others. */}
+                    <ReferenceStrip
+                      compact
+                      label="Board references"
+                      entries={assetReferenceEntries(assetEditor)}
+                      capacity={capacity}
+                      onToggleEntry={(entry) => toggleAssetReferenceEntry(assetEditor, entry)}
+                      onOpenPanel={() => { setAssetEditor(null); setReferencePanelOpen(true); }}
+                    />
 
                     <div>
                       <label className="form-label" style={{ fontSize: '0.75rem' }}>
@@ -5389,17 +5481,33 @@ export default function App() {
                   <div className="form-group">
                     <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                       Reference Images ({pool.length})
-                      {capacity > 0 && (
-                        <span style={{ fontWeight: 'normal', fontSize: '0.75rem', color: picked.length >= capacity ? 'var(--accent)' : 'var(--text-dim)' }}>
-                          {picked.length}/{capacity} ticked to send with the next generation
-                        </span>
-                      )}
+                      <span style={{ fontWeight: 'normal', fontSize: '0.75rem', color: capacity > 0 && picked.length >= capacity ? 'var(--accent)' : 'var(--text-dim)' }}>
+                        {capacity > 0
+                          ? `${picked.length}/${capacity} ticked to send with the next generation`
+                          : `${picked.length} ticked — kept for when you pick a model that reads them`}
+                      </span>
                     </label>
                     <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)', display: 'block', marginBottom: '8px' }}>
                       Click one to make it the primary — that is the single image sent with &lt;{assetEditor.tag || 'Tag'}&gt; in other prompts.
                       Tick the checkboxes to send several of them <em>into</em> this asset's own generation, up to what the model takes.
                       Double-click to view large.
                     </span>
+
+                    {/* The ticks used to disappear entirely on a model with no
+                        image inputs, which reads as the control having been
+                        taken away rather than as a fact about the model. Say
+                        which model, and keep the choices editable so switching
+                        model does not mean re-picking everything. */}
+                    {capacity === 0 && pool.length > 0 && (
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '6px', marginBottom: '8px', padding: '7px 9px', borderRadius: '6px', background: 'rgba(244,63,94,0.08)', border: '1px solid rgba(244,63,94,0.25)', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                        <AlertTriangle size={13} style={{ color: 'var(--accent)', flexShrink: 0, marginTop: '1px' }} />
+                        <span>
+                          <strong>{getImageModel(assetEditorModel(assetEditor))?.label || assetEditorModel(assetEditor)}</strong> reads no
+                          reference images, so nothing below is uploaded no matter what is ticked. Your ticks are still
+                          saved — switch the <em>Model</em> above to one that accepts inputs and they take effect.
+                        </span>
+                      </div>
+                    )}
                     <input type="file" accept="image/*" multiple ref={assetUploadRef} onChange={handleAssetImageUpload} style={{ display: 'none' }} />
                     <div className="generation-reference-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '8px' }}>
                       {pool.map(imagePath => {
@@ -5416,20 +5524,23 @@ export default function App() {
                           >
                             <AssetImage path={imagePath} alt="asset reference" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                             {isPrimary && <Check size={14} style={{ position: 'absolute', top: '4px', left: '4px', background: 'var(--success)', color: '#fff', borderRadius: '50%', padding: '2px' }} />}
-                            {capacity > 0 && (
-                              <label
-                                onClick={(e) => e.stopPropagation()}
-                                title={isSending ? 'Sent as a reference with the next generation' : 'Send this image with the next generation'}
-                                style={{ position: 'absolute', top: '4px', right: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center', width: '20px', height: '20px', borderRadius: '4px', background: 'rgba(0,0,0,0.55)', cursor: 'pointer' }}
-                              >
-                                <input
-                                  type="checkbox"
-                                  checked={isSending}
-                                  onChange={() => toggleAssetInputImage(imagePath)}
-                                  style={{ cursor: 'pointer', margin: 0 }}
-                                />
-                              </label>
-                            )}
+                            {/* Always rendered. A control that vanishes when the
+                                model changes is indistinguishable from one that
+                                was removed. */}
+                            <label
+                              onClick={(e) => e.stopPropagation()}
+                              title={capacity === 0
+                                ? 'Saved, but this model reads no reference images'
+                                : (isSending ? 'Sent as a reference with the next generation' : 'Send this image with the next generation')}
+                              style={{ position: 'absolute', top: '4px', right: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center', width: '20px', height: '20px', borderRadius: '4px', background: 'rgba(0,0,0,0.55)', cursor: 'pointer', opacity: capacity === 0 ? 0.55 : 1 }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isSending}
+                                onChange={() => toggleAssetInputImage(imagePath)}
+                                style={{ cursor: 'pointer', margin: 0 }}
+                              />
+                            </label>
                             <button
                               className="btn btn-danger"
                               style={{ position: 'absolute', bottom: '4px', right: '4px', padding: '3px' }}
@@ -5564,16 +5675,34 @@ export default function App() {
                     // saving the asset links them instead of leaving two
                     // unrelated records pointing at one file.
                     const sourceIds = referenceImages.filter(r => chosen.includes(r.path)).map(r => r.id);
-                    setAssetEditor(prev => (prev
-                      ? {
+                    let ticked = 0;
+                    setAssetEditor(prev => {
+                      if (!prev) return prev;
+                      const capacityHere = assetRefCapacity(prev);
+                      // Pulling an image in is a statement of intent, so it
+                      // arrives switched on rather than sitting inert until you
+                      // notice a second checkbox. Only up to what the model
+                      // reads, so nothing silently overflows.
+                      const already = assetInputImages(prev);
+                      const room = Math.max(0, capacityHere - already.length);
+                      const newlySent = chosen.filter(p => !already.includes(p)).slice(0, room);
+                      ticked = newlySent.length;
+
+                      return {
                         ...prev,
                         images: [...(prev.images || []), ...chosen.filter(p => !(prev.images || []).includes(p))],
                         primaryImage: prev.primaryImage || chosen[0],
+                        inputImages: [...already, ...newlySent],
                         linkedReferenceIds: [...new Set([...(prev.linkedReferenceIds || []), ...sourceIds])]
-                      }
-                      : prev));
+                      };
+                    });
                     setRefBoardPicker(null);
-                    showToast(`${chosen.length} reference${chosen.length === 1 ? '' : 's'} added — tick the ones to send.`, 'success');
+                    showToast(
+                      ticked === chosen.length
+                        ? `${chosen.length} reference${chosen.length === 1 ? '' : 's'} added and set to send.`
+                        : `${chosen.length} added, ${ticked} set to send — the model takes no more.`,
+                      'success'
+                    );
                   }}
                 >
                   <Plus size={14} /> Add {chosen.length || ''} to asset
@@ -5950,7 +6079,7 @@ export default function App() {
           activeShotId={activeShotId}
           busy={loadingStates.ref_upload || loadingStates.project_images}
           onClose={() => setReferencePanelOpen(false)}
-          onAssign={handleAssignReferences}
+          onApplyAssignments={handleApplyAssignments}
           onUnassign={handleUnassignReferences}
           onUpdateReferences={handleUpdateReferences}
           onDeleteReferences={handleDeleteReferences}
