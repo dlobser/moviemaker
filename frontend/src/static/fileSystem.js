@@ -193,6 +193,85 @@ export async function writeProjectState(state) {
   await getAssetsDir(true); // make sure media has somewhere to land
 }
 
+// --- checkpoints ---
+//
+// Named snapshots of the whole studio state, one file each in `checkpoints/`,
+// mirroring what the server build writes so a project folder means the same
+// thing whichever build wrote it. Media is shared, not copied: generated assets
+// are written once under timestamped names and never change.
+
+async function getCheckpointsDir(create = true) {
+  return requireProject().getDirectoryHandle('checkpoints', { create });
+}
+
+function summariseState(state) {
+  const scenes = Array.isArray(state?.scenes) ? state.scenes : [];
+  const shots = scenes.reduce((total, scene) => total + (scene.shots || []).length, 0);
+  return {
+    scenes: scenes.length,
+    shots,
+    shotsWithVideo: scenes.reduce((total, scene) => (
+      total + (scene.shots || []).filter(shot => shot.selectedVideo).length
+    ), 0),
+    editClips: Array.isArray(state?.edit?.video) ? state.edit.video.length : 0
+  };
+}
+
+export async function listCheckpoints() {
+  let dir;
+  try {
+    dir = await getCheckpointsDir(false);
+  } catch (error) {
+    if (error.name === 'NotFoundError') return [];
+    throw error;
+  }
+
+  const records = [];
+  for await (const [name, handle] of dir.entries()) {
+    if (!name.endsWith('.json') || handle.kind !== 'file') continue;
+    try {
+      const parsed = JSON.parse(await (await handle.getFile()).text());
+      if (!parsed?.id) continue;
+      const { state: _omit, ...meta } = parsed;
+      records.push(meta);
+    } catch { /* a corrupt file should not hide the rest */ }
+  }
+  return records.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+export async function writeCheckpoint({ name, note, state }) {
+  const dir = await getCheckpointsDir(true);
+  const createdAt = new Date().toISOString();
+  const id = `cp_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const record = {
+    id,
+    name: String(name || '').trim() || `Checkpoint ${createdAt.slice(0, 16).replace('T', ' ')}`,
+    note: String(note || '').trim(),
+    createdAt,
+    summary: summariseState(state),
+    state
+  };
+
+  const handle = await dir.getFileHandle(`${id}.json`, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(JSON.stringify(record, null, 2));
+  await writable.close();
+
+  const { state: _omit, ...meta } = record;
+  return meta;
+}
+
+export async function readCheckpoint(id) {
+  const dir = await getCheckpointsDir(false);
+  const handle = await dir.getFileHandle(`${id}.json`);
+  return JSON.parse(await (await handle.getFile()).text());
+}
+
+export async function deleteCheckpoint(id) {
+  const dir = await getCheckpointsDir(false);
+  await dir.removeEntry(`${id}.json`);
+}
+
 // --- assets ---
 
 const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];

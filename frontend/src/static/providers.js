@@ -321,8 +321,11 @@ export async function generateImage({ provider, prompt, resolution, inputImagePa
 
     if (inputImagePaths.length > 0) {
       const dataUrls = await Promise.all(inputImagePaths.map(readAssetDataUrl));
+      // Three aliases because Higgsfield's models disagree on the field name;
+      // `image_references` is the one the multi-reference models read.
       input.image_url = dataUrls[0];
       input.reference_images = dataUrls;
+      input.image_references = dataUrls;
     }
     const result = await callHiggsfieldModel(modelId, input, credentials);
     const url = result.images?.[0]?.url || result.image?.url;

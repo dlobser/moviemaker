@@ -98,8 +98,28 @@ export function createAudioClip(source, overrides = {}) {
     // When set, this clip rides along with a video clip instead of sitting at
     // an absolute time. Unlinking clears it and freezes `start` where it was.
     link: null,
+    // Set when this clip was pulled off a video clip, so it can be put back.
+    detachedFrom: null,
     ...overrides
   };
+}
+
+/**
+ * Lip-sync audio belongs to its shot, so it is placed automatically and linked
+ * to that shot's picture — slipping the clip slips the sync with it.
+ */
+export function deriveAudioClipsForShots(scenes, videoClips) {
+  const clips = [];
+  for (const clip of videoClips || []) {
+    if (clip.source?.kind !== 'shot') continue;
+    const shot = findShot(scenes, clip.source.shotId);
+    if (!shot?.lipSyncAudio) continue;
+    clips.push(createAudioClip(
+      { kind: 'shot', shotId: shot.id, stream: 'audio' },
+      { link: { clipId: clip.id, offset: 0 } }
+    ));
+  }
+  return clips;
 }
 
 // --- reading a clip's source back out of the shot list ----------------------
@@ -355,6 +375,7 @@ function normalizeAudioClip(raw) {
     fadeOut: Math.max(0, finiteOr(raw?.fadeOut, 0)),
     link: raw?.link && raw.link.clipId
       ? { clipId: raw.link.clipId, offset: finiteOr(raw.link.offset, 0) }
-      : null
+      : null,
+    detachedFrom: raw?.detachedFrom || null
   };
 }

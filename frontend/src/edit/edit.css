@@ -83,14 +83,103 @@
 
 /* --- monitor -------------------------------------------------------------- */
 
-.edit-stage {
+.edit-body {
   flex: 1 1 auto;
   min-height: 0;
+  display: flex;
+}
+
+.edit-stage {
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 16px;
   background: #05050a;
+}
+
+/* --- inspector ------------------------------------------------------------ */
+
+.edit-inspector {
+  flex: 0 0 264px;
+  overflow-y: auto;
+  padding: 14px;
+  border-left: 1px solid var(--border-light);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.edit-inspector h3 {
+  font-family: var(--font-title);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.edit-inspector-path {
+  margin: 0;
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.edit-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  margin: 0;
+  font-size: 0.7rem;
+}
+
+.edit-facts dt { color: var(--text-dim); }
+
+.edit-facts dd {
+  margin: 0;
+  color: var(--text-main);
+  font-variant-numeric: tabular-nums;
+}
+
+.edit-warning {
+  margin: 0;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  background: rgba(244, 63, 94, 0.12);
+  border: 1px solid rgba(244, 63, 94, 0.35);
+  font-size: 0.66rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.edit-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
+.edit-field select,
+.edit-field input[type='range'] {
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.78rem;
+}
+
+.edit-field select {
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-light);
+  background: var(--bg-input);
+  color: var(--text-main);
+}
+
+.edit-inspector-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
 }
 
 .edit-canvas {
@@ -172,16 +261,144 @@
   background: rgba(255, 255, 255, 0.02);
 }
 
-.edit-track-label {
+.edit-track-head {
   position: sticky;
   left: 0;
-  z-index: 1;
-  display: inline-block;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  max-width: 100%;
+  padding: 4px 8px 1px;
+}
+
+.edit-track-head.is-dimmed { opacity: 0.45; }
+
+.edit-track-label {
   font-size: 0.65rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-dim);
-  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.edit-mini {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid var(--border-light);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.edit-mini:hover { border-color: var(--border-focus); color: var(--text-main); }
+
+.edit-mini.on {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.edit-fader { width: 84px; }
+
+.edit-track-db {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 30px;
+}
+
+.edit-track.is-audio { height: 44px; }
+
+.edit-clip.is-audio {
+  background: linear-gradient(180deg, rgba(16, 185, 129, 0.3), rgba(16, 185, 129, 0.12));
+}
+
+.edit-clip-badge.muted {
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid var(--border-light);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.edit-subhead {
+  margin: 6px 0 0;
+  font-family: var(--font-title);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border-light);
+  padding-top: 8px;
+}
+
+/* --- shot list changes ---------------------------------------------------- */
+
+.edit-changes { position: relative; flex: 0 0 auto; }
+
+.edit-changes-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 10;
+  width: 268px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-light);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-card);
+}
+
+.edit-changes-menu .edit-btn { justify-content: flex-start; white-space: normal; text-align: left; }
+
+/* --- render progress ------------------------------------------------------ */
+
+.edit-render-progress {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 148px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--primary);
+  background: var(--bg-card);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+.edit-render-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--primary-glow);
+  transition: width 0.3s linear;
+}
+
+.edit-render-label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.edit-note {
+  margin: 0;
+  font-size: 0.66rem;
+  line-height: 1.45;
+  color: var(--text-muted);
 }
 
 .edit-clip {
@@ -192,10 +409,48 @@
   border: 1px solid var(--border-light);
   background: linear-gradient(180deg, rgba(139, 92, 246, 0.28), rgba(139, 92, 246, 0.12));
   overflow: hidden;
-  cursor: pointer;
+  cursor: grab;
   transition: border-color 0.15s, box-shadow 0.15s;
   box-sizing: border-box;
+  user-select: none;
+  touch-action: none;
 }
+
+.edit-clip.is-dragging {
+  cursor: grabbing;
+  z-index: 2;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55);
+  transition: none;
+}
+
+/* Trim handles. Invisible until the clip is hovered so the strip stays calm. */
+.edit-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  z-index: 2;
+  cursor: ew-resize;
+  background: transparent;
+  transition: background 0.12s;
+}
+
+.edit-handle.left { left: 0; }
+.edit-handle.right { right: 0; }
+
+.edit-clip:hover .edit-handle,
+.edit-clip.selected .edit-handle {
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.5), rgba(248, 250, 252, 0.22));
+}
+
+.edit-handle:hover { background: var(--primary-hover) !important; }
+
+/* While a drag is live the pointer owns the whole strip; nothing else should
+   light up under it or steal the cursor. */
+.edit-timeline.is-dragging .edit-clip:not(.is-dragging) { transition: none; }
+.edit-timeline.is-dragging { cursor: grabbing; }
+.edit-timeline.mode-trim-in,
+.edit-timeline.mode-trim-out { cursor: ew-resize; }
 
 .edit-clip:hover { border-color: var(--border-focus); }
 

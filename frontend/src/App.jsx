@@ -35,7 +35,8 @@ import {
   Zap,
   StopCircle,
   LayoutGrid,
-  Scissors
+  Scissors,
+  RotateCcw
 } from 'lucide-react';
 import {
   IMAGE_MODELS,
@@ -54,6 +55,7 @@ import {
 } from './catalog.js';
 import {
   ASSET_TYPES,
+  assetInputImages,
   composeGenerationPrompt,
   defaultAssetPrompt,
   extractTags,
@@ -120,8 +122,9 @@ export default function App() {
 
   // --- ASSET LIBRARY (characters / environments / props, referenced as <Tag>) ---
   const [assetLibrary, setAssetLibrary] = useState([]);
-  const [assetEditor, setAssetEditor] = useState(null); // null | { id?, tag, type, name, description, images[], primaryImage }
+  const [assetEditor, setAssetEditor] = useState(null); // null | { id?, tag, type, name, description, images[], primaryImage, inputImages[] }
   const [assetBatchDialog, setAssetBatchDialog] = useState(null); // { onlyMissing, useLlm, rewriteExisting }
+  const [refBoardPicker, setRefBoardPicker] = useState(null); // null | { selected: string[] } — pulling from the master board into an asset
   const assetUploadRef = useRef(null);
 
   // --- SETTINGS ---
@@ -209,6 +212,8 @@ export default function App() {
 
   // --- CONCATENATED VIDEO PREVIEW ---
   const [concatenatedVideo, setConcatenatedVideo] = useState(null);
+  const [checkpoints, setCheckpoints] = useState([]);
+  const [checkpointName, setCheckpointName] = useState('');
   // The edit document. Owned here so it autosaves and travels with the project
   // file; every operation on it lives in ./edit/.
   const [edit, setEdit] = useState(createEmptyEdit);
@@ -465,6 +470,13 @@ export default function App() {
   // Autosave is debounced: typing in a shot textarea used to fire one POST per
   // keystroke (and a second from the effect below), which made the timeline
   // stutter on long projects.
+  // Refresh the checkpoint list whenever the Projects panel is opened, so it
+  // reflects anything written by another window or by hand on disk.
+  useEffect(() => {
+    if (activeOverlay === 'projects') loadCheckpoints();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeOverlay]);
+
   const saveStateRef = useRef();
   saveStateRef.current = () => { saveProjectState(); };
   useEffect(() => {
@@ -1250,13 +1262,41 @@ export default function App() {
 
   const openAssetEditor = (asset = null) => {
     setAssetEditor(asset
-      ? { ...asset, images: [...(asset.images || [])] }
+      ? { ...asset, images: [...(asset.images || [])], inputImages: assetInputImages(asset) }
       : {
         tag: '', type: 'character', name: '', description: '',
-        images: [], primaryImage: null,
+        images: [], primaryImage: null, inputImages: [],
         imagePrompt: '', imageModel: null, imageResolution: null,
-        applyGlobalPrompts: false, useExistingAsReference: false
+        applyGlobalPrompts: false
       });
+  };
+
+  /** The model the asset editor will generate with, and how many refs it takes. */
+  const assetEditorModel = (draft) => (draft?.imageModel || imageModel);
+  const assetRefCapacity = (draft) => refImageCapacity('image', assetEditorModel(draft));
+
+  /**
+   * Toggle one of an asset's reference images in or out of the set sent with
+   * the next generation, refusing to overfill the model.
+   */
+  const toggleAssetInputImage = (imagePath) => {
+    setAssetEditor(prev => {
+      if (!prev) return prev;
+      const selected = assetInputImages(prev);
+      if (selected.includes(imagePath)) {
+        return { ...prev, inputImages: selected.filter(p => p !== imagePath) };
+      }
+      const capacity = assetRefCapacity(prev);
+      if (capacity <= 0) {
+        showToast('This model does not accept reference images.', 'warning');
+        return { ...prev, inputImages: selected };
+      }
+      if (selected.length >= capacity) {
+        showToast(`This model accepts up to ${capacity} reference image${capacity === 1 ? '' : 's'}. Deselect one first.`, 'warning');
+        return { ...prev, inputImages: selected };
+      }
+      return { ...prev, inputImages: [...selected, imagePath] };
+    });
   };
 
   /** The asset editor's prompt, falling back to one derived from the description. */
@@ -1270,13 +1310,16 @@ export default function App() {
   const buildAssetPrompt = (draft) => {
     const others = assetLibrary.filter(a => a.id !== draft.id);
     const modelId = draft.imageModel || imageModel;
-    const useRef = draft.useExistingAsReference && draft.primaryImage;
+    // Only images still in the asset's pool can be sent — one deleted from the
+    // grid must not keep riding along invisibly in the saved selection.
+    const pool = draft.images || [];
+    const picked = assetInputImages(draft).filter(p => pool.includes(p));
     return composeGenerationPrompt({
       prompt: effectiveAssetPrompt(draft),
       prePrompt: draft.applyGlobalPrompts ? prePrompt : '',
       postPrompt: draft.applyGlobalPrompts ? postPrompt : '',
       assetLibrary: others,
-      primaryImagePaths: useRef ? [draft.primaryImage] : [],
+      primaryImagePaths: picked,
       attachTaggedImages: true,
       type: 'image',
       modelId
@@ -1570,19 +1613,20 @@ Reply with ONLY a JSON object, no markdown fence:
       return null;
     }
 
+    const images = assetEditor.images || [];
     const record = {
       id: assetEditor.id || `asset_${Date.now()}`,
       tag,
       type: assetEditor.type || 'character',
       name: (assetEditor.name || '').trim() || tag,
       description: (assetEditor.description || '').trim(),
-      images: assetEditor.images || [],
-      primaryImage: assetEditor.primaryImage || (assetEditor.images || [])[0] || null,
+      images,
+      primaryImage: assetEditor.primaryImage || images[0] || null,
+      inputImages: assetInputImages(assetEditor).filter(p => images.includes(p)),
       imagePrompt: assetEditor.imagePrompt || '',
       imageModel: assetEditor.imageModel || null,
       imageResolution: assetEditor.imageResolution || null,
-      applyGlobalPrompts: Boolean(assetEditor.applyGlobalPrompts),
-      useExistingAsReference: Boolean(assetEditor.useExistingAsReference)
+      applyGlobalPrompts: Boolean(assetEditor.applyGlobalPrompts)
     };
 
     setAssetLibrary(prev => (
@@ -1950,7 +1994,8 @@ Reply with ONLY a JSON object, no markdown fence:
                 ...asset,
                 id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
                 images,
-                primaryImage: mapping.get(asset.primaryImage) || images[0] || null
+                primaryImage: mapping.get(asset.primaryImage) || images[0] || null,
+                inputImages: assetInputImages(asset).map(p => mapping.get(p)).filter(Boolean)
               };
             });
           return [...prev, ...additions];
@@ -2074,6 +2119,8 @@ Reply with ONLY a JSON object, no markdown fence:
       setVideoGallery(parsed.videoGallery || []);
       setReferenceImages(parsed.referenceImages || []);
       setConcatenatedVideo(parsed.concatenatedVideo || null);
+      // A shot list on its own carries no edit; a full state export does.
+      if (parsed.edit) setEdit(migrateEdit(parsed.edit));
     }
 
     // Assets merge by tag: an imported asset never clobbers reference images
@@ -2091,7 +2138,8 @@ Reply with ONLY a JSON object, no markdown fence:
               name: incoming.name || existing.name,
               description: incoming.description || existing.description,
               images: existing.images?.length ? existing.images : incoming.images,
-              primaryImage: existing.primaryImage || incoming.primaryImage
+              primaryImage: existing.primaryImage || incoming.primaryImage,
+              inputImages: assetInputImages(existing).length ? assetInputImages(existing) : assetInputImages(incoming)
             };
           } else {
             merged.push(incoming);
@@ -2158,11 +2206,11 @@ Reply with ONLY a JSON object, no markdown fence:
         description: '',
         images: [],
         primaryImage: null,
+        inputImages: [],
         imagePrompt: '',
         imageModel: null,
         imageResolution: null,
-        applyGlobalPrompts: false,
-        useExistingAsReference: false
+        applyGlobalPrompts: false
       }));
     if (additions.length === 0) return;
     setAssetLibrary(prev => [...prev, ...additions]);
@@ -2778,9 +2826,11 @@ Reply with ONLY a JSON object, no markdown fence:
       };
       setReferenceImages(prev => [newRef, ...prev]);
       
-      // If we are in the generation modal, also auto-select it as one of the active inputs
+      // If we are in the generation modal, also auto-select it as one of the
+      // active inputs — trimmed to what this model will actually read.
       if (generationModal?.type === 'image' || generationModal?.type === 'video') {
-        setGenModalInputImages(prev => [...prev, image.path].slice(0, 3));
+        const capacity = refImageCapacity(generationModal.type, genModalModel);
+        setGenModalInputImages(prev => [...prev, image.path].slice(0, capacity));
       }
       
       // If there is an active shot, also associate it with the active shot!
@@ -2879,16 +2929,90 @@ Reply with ONLY a JSON object, no markdown fence:
     }
   };
 
+  // --- CHECKPOINTS ---
+  // Named snapshots of everything — shot list, settings, galleries, the edit —
+  // kept beside the project. Cheap enough to take freely because they share the
+  // project's media rather than copying it.
+
+  const loadCheckpoints = async () => {
+    try {
+      const res = await apiFetch('/api/checkpoints');
+      const data = await res.json();
+      if (res.ok) setCheckpoints(data.checkpoints || []);
+    } catch (err) {
+      console.error('Could not list checkpoints:', err);
+    }
+  };
+
+  const saveCheckpoint = async (name, { quiet = false } = {}) => {
+    const res = await apiFetch('/api/checkpoints', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, state: buildStatePayload() })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not save the checkpoint.');
+    if (!quiet) showToast(`Checkpoint "${data.checkpoint.name}" saved.`, 'success');
+    return data.checkpoint;
+  };
+
+  const handleSaveCheckpoint = async () => {
+    setLoadingStates(prev => ({ ...prev, checkpoint: true }));
+    try {
+      await saveCheckpoint(checkpointName);
+      setCheckpointName('');
+      await loadCheckpoints();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, checkpoint: false }));
+    }
+  };
+
+  /**
+   * Load a checkpoint back over the current state.
+   *
+   * The current state is snapshotted first, so this can never lose work and
+   * does not need a scary confirmation — if it was the wrong checkpoint, the
+   * one above it in the list is where you just were.
+   */
+  const handleRestoreCheckpoint = async (checkpoint) => {
+    setLoadingStates(prev => ({ ...prev, checkpoint: true }));
+    try {
+      await saveCheckpoint(`Before restoring "${checkpoint.name}"`, { quiet: true });
+
+      const res = await apiFetch(`/api/checkpoints/${checkpoint.id}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not read the checkpoint.');
+
+      applyLoadedState(data.checkpoint.state || {});
+      await saveProjectState(data.checkpoint.state?.scenes || []);
+      await loadCheckpoints();
+      setActiveOverlay(null);
+      showToast(`Restored "${checkpoint.name}". Your previous state was saved as a checkpoint first.`, 'success');
+    } catch (err) {
+      showToast(`Restore failed: ${err.message}`, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, checkpoint: false }));
+    }
+  };
+
+  const handleDeleteCheckpoint = async (checkpoint) => {
+    try {
+      const res = await apiFetch(`/api/checkpoints/${checkpoint.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error((await res.json()).error || 'Delete failed');
+      setCheckpoints(prev => prev.filter(entry => entry.id !== checkpoint.id));
+    } catch (err) {
+      showToast(`Could not delete: ${err.message}`, 'error');
+    }
+  };
+
   // --- STATE IMPORT/EXPORT ---
   const handleExportState = () => {
-    const payload = {
-      scenes, shots, imageGallery, videoGallery, referenceImages, assetLibrary, promptSnippets,
-      activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution,
-      activeVideoGenerator, videoResolution, videoModel, videoDuration,
-      prePrompt, postPrompt, videoPrePrompt, videoPostPrompt,
-      imageSystemPrompt, videoSystemPrompt,
-      activeSceneId, activeShotId, concatenatedVideo
-    };
+    // Built by the same function autosave and Save As use. It used to list the
+    // fields by hand, which meant anything added later — the edit, the tag
+    // flags — quietly failed to export.
+    const payload = buildStatePayload();
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -2947,6 +3071,7 @@ Reply with ONLY a JSON object, no markdown fence:
         edit={edit}
         setEdit={setEdit}
         videoDuration={videoDuration}
+        onToast={showToast}
         onClose={() => setView('create')}
       />
     );
@@ -4419,6 +4544,84 @@ Reply with ONLY a JSON object, no markdown fence:
                 </button>
               </div>
 
+              {/* Checkpoints — versions of this project, without a new project */}
+              <div className="glass-panel" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <div>
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Checkpoints</span>
+                  <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                    A named snapshot of the shot list, every setting, the galleries and the edit.
+                    Media is shared rather than copied, so these are cheap — take one before any
+                    big change. Restoring saves where you are first, so nothing is ever lost.
+                  </p>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    type="text"
+                    className="form-input"
+                    style={{ flex: 1 }}
+                    placeholder="Name this checkpoint (optional)"
+                    value={checkpointName}
+                    onChange={(e) => setCheckpointName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleSaveCheckpoint(); }}
+                    disabled={project.needsFolder}
+                  />
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleSaveCheckpoint}
+                    disabled={loadingStates.checkpoint || project.needsFolder}
+                    title={project.needsFolder ? 'Choose a project folder first' : 'Snapshot everything as it is right now'}
+                  >
+                    {loadingStates.checkpoint ? <RefreshCw className="spinner" size={14} /> : <Save size={14} />} Save checkpoint
+                  </button>
+                </div>
+
+                {checkpoints.length === 0 ? (
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                    No checkpoints yet.
+                  </span>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '260px', overflowY: 'auto' }}>
+                    {checkpoints.map(entry => (
+                      <div
+                        key={entry.id}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: '10px', padding: '8px 10px',
+                          borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-light)',
+                          background: 'var(--bg-card)'
+                        }}
+                      >
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: '0.82rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {entry.name}
+                          </div>
+                          <div style={{ fontSize: '0.68rem', color: 'var(--text-dim)' }}>
+                            {new Date(entry.createdAt).toLocaleString()}
+                            {entry.summary && ` · ${entry.summary.shots} shots, ${entry.summary.shotsWithVideo} with video${entry.summary.editClips ? `, ${entry.summary.editClips} clips cut` : ''}`}
+                          </div>
+                        </div>
+                        <button
+                          className="btn btn-secondary"
+                          style={{ fontSize: '0.72rem', padding: '4px 10px' }}
+                          disabled={loadingStates.checkpoint}
+                          onClick={() => handleRestoreCheckpoint(entry)}
+                        >
+                          <RotateCcw size={12} /> Restore
+                        </button>
+                        <button
+                          className="btn btn-secondary"
+                          style={{ fontSize: '0.72rem', padding: '4px 8px' }}
+                          title="Delete this checkpoint"
+                          onClick={() => handleDeleteCheckpoint(entry)}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
               {/* New project inline form (server build only — the hosted build
                   uses the browser's own folder picker) */}
               {newProjectDraft && !isStatic() && (
@@ -4791,7 +4994,8 @@ Reply with ONLY a JSON object, no markdown fence:
               {(() => {
                 const modelId = assetEditor.imageModel || imageModel;
                 const preview = buildAssetPrompt(assetEditor);
-                const canUseRef = refImageCapacity('image', modelId) > 0 && Boolean(assetEditor.primaryImage);
+                const capacity = refImageCapacity('image', modelId);
+                const picked = assetInputImages(assetEditor).filter(p => (assetEditor.images || []).includes(p));
                 const busy = loadingStates[`asset_gen_${assetEditor.id}`];
 
                 return (
@@ -4872,15 +5076,39 @@ Reply with ONLY a JSON object, no markdown fence:
                         />
                         Apply global pre/post prompt
                       </label>
-                      {canUseRef && (
-                        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                          <input
-                            type="checkbox"
-                            checked={Boolean(assetEditor.useExistingAsReference)}
-                            onChange={(e) => setAssetEditor({ ...assetEditor, useExistingAsReference: e.target.checked })}
-                          />
-                          Use current image as reference (keep likeness)
-                        </label>
+                    </div>
+
+                    {/* What the model is being shown. Picked below in Reference Images. */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                      {capacity === 0 ? (
+                        <span><strong>{getImageModel(modelId)?.label || modelId}</strong> takes no reference images — prompt only.</span>
+                      ) : (
+                        <>
+                          <span>
+                            Sending <strong>{picked.length}</strong> of up to <strong>{capacity}</strong> reference image{capacity === 1 ? '' : 's'} — tick them in <em>Reference Images</em> below.
+                          </span>
+                          {picked.length > capacity && (
+                            <span style={{ color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                              <AlertTriangle size={12} /> This model reads only the first {capacity}; untick the rest.
+                            </span>
+                          )}
+                          <button
+                            className="btn btn-secondary"
+                            style={{ fontSize: '0.72rem', padding: '3px 8px' }}
+                            disabled={!assetEditor.primaryImage}
+                            onClick={() => setAssetEditor({ ...assetEditor, inputImages: assetEditor.primaryImage ? [assetEditor.primaryImage] : [] })}
+                          >
+                            Just the primary
+                          </button>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ fontSize: '0.72rem', padding: '3px 8px' }}
+                            disabled={picked.length === 0}
+                            onClick={() => setAssetEditor({ ...assetEditor, inputImages: [] })}
+                          >
+                            Clear
+                          </button>
+                        </>
                       )}
                     </div>
 
@@ -4913,64 +5141,104 @@ Reply with ONLY a JSON object, no markdown fence:
                 );
               })()}
 
-              <div className="form-group">
-                <label className="form-label">Reference Images ({(assetEditor.images || []).length})</label>
-                <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)', display: 'block', marginBottom: '8px' }}>
-                  Click one to make it the primary — that is the single image sent with &lt;{assetEditor.tag || 'Tag'}&gt;.
-                  The rest are kept here as alternates and are never uploaded. Double-click to view large.
-                </span>
-                <input type="file" accept="image/*" multiple ref={assetUploadRef} onChange={handleAssetImageUpload} style={{ display: 'none' }} />
-                <div className="generation-reference-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '8px' }}>
-                  {(assetEditor.images || []).map(imagePath => {
-                    const isPrimary = assetEditor.primaryImage === imagePath;
-                    return (
-                      <div
-                        key={imagePath}
-                        className={`generation-reference-card ${isPrimary ? 'selected' : ''}`}
-                        style={{ position: 'relative', height: '110px', borderRadius: '6px', overflow: 'hidden', border: '1px solid var(--border-light)', cursor: 'pointer' }}
-                        onClick={() => setAssetEditor({ ...assetEditor, primaryImage: imagePath })}
-                        onDoubleClick={() => handleImageDoubleClick(imagePath, assetEditor.tag || 'asset')}
-                        title={isPrimary ? 'Primary reference' : 'Click to make primary, double-click to enlarge'}
+              {(() => {
+                const pool = assetEditor.images || [];
+                const capacity = assetRefCapacity(assetEditor);
+                const picked = assetInputImages(assetEditor).filter(p => pool.includes(p));
+
+                return (
+                  <div className="form-group">
+                    <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                      Reference Images ({pool.length})
+                      {capacity > 0 && (
+                        <span style={{ fontWeight: 'normal', fontSize: '0.75rem', color: picked.length >= capacity ? 'var(--accent)' : 'var(--text-dim)' }}>
+                          {picked.length}/{capacity} ticked to send with the next generation
+                        </span>
+                      )}
+                    </label>
+                    <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)', display: 'block', marginBottom: '8px' }}>
+                      Click one to make it the primary — that is the single image sent with &lt;{assetEditor.tag || 'Tag'}&gt; in other prompts.
+                      Tick the checkboxes to send several of them <em>into</em> this asset's own generation, up to what the model takes.
+                      Double-click to view large.
+                    </span>
+                    <input type="file" accept="image/*" multiple ref={assetUploadRef} onChange={handleAssetImageUpload} style={{ display: 'none' }} />
+                    <div className="generation-reference-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '8px' }}>
+                      {pool.map(imagePath => {
+                        const isPrimary = assetEditor.primaryImage === imagePath;
+                        const isSending = picked.includes(imagePath);
+                        return (
+                          <div
+                            key={imagePath}
+                            className={`generation-reference-card ${isPrimary ? 'selected' : ''}`}
+                            style={{ position: 'relative', height: '110px', borderRadius: '6px', overflow: 'hidden', border: isSending ? '2px solid var(--primary)' : '1px solid var(--border-light)', cursor: 'pointer' }}
+                            onClick={() => setAssetEditor({ ...assetEditor, primaryImage: imagePath })}
+                            onDoubleClick={() => handleImageDoubleClick(imagePath, assetEditor.tag || 'asset')}
+                            title={isPrimary ? 'Primary reference' : 'Click to make primary, double-click to enlarge'}
+                          >
+                            <AssetImage path={imagePath} alt="asset reference" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                            {isPrimary && <Check size={14} style={{ position: 'absolute', top: '4px', left: '4px', background: 'var(--success)', color: '#fff', borderRadius: '50%', padding: '2px' }} />}
+                            {capacity > 0 && (
+                              <label
+                                onClick={(e) => e.stopPropagation()}
+                                title={isSending ? 'Sent as a reference with the next generation' : 'Send this image with the next generation'}
+                                style={{ position: 'absolute', top: '4px', right: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center', width: '20px', height: '20px', borderRadius: '4px', background: 'rgba(0,0,0,0.55)', cursor: 'pointer' }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isSending}
+                                  onChange={() => toggleAssetInputImage(imagePath)}
+                                  style={{ cursor: 'pointer', margin: 0 }}
+                                />
+                              </label>
+                            )}
+                            <button
+                              className="btn btn-danger"
+                              style={{ position: 'absolute', bottom: '4px', right: '4px', padding: '3px' }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const remaining = pool.filter(p => p !== imagePath);
+                                setAssetEditor({
+                                  ...assetEditor,
+                                  images: remaining,
+                                  primaryImage: isPrimary ? (remaining[0] || null) : assetEditor.primaryImage,
+                                  inputImages: picked.filter(p => p !== imagePath)
+                                });
+                              }}
+                            >
+                              <X size={10} />
+                            </button>
+                          </div>
+                        );
+                      })}
+                      <button
+                        type="button"
+                        onClick={() => assetUploadRef.current?.click()}
+                        disabled={loadingStates.asset_upload}
+                        style={{ border: '2px dashed var(--border-light)', background: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '4px', color: 'var(--text-muted)', height: '110px', borderRadius: '6px' }}
                       >
-                        <AssetImage path={imagePath} alt="asset reference" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                        {isPrimary && <Check size={14} style={{ position: 'absolute', top: '4px', left: '4px', background: 'var(--success)', color: '#fff', borderRadius: '50%', padding: '2px' }} />}
-                        <button
-                          className="btn btn-danger"
-                          style={{ position: 'absolute', bottom: '4px', right: '4px', padding: '3px' }}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const remaining = assetEditor.images.filter(p => p !== imagePath);
-                            setAssetEditor({
-                              ...assetEditor,
-                              images: remaining,
-                              primaryImage: isPrimary ? (remaining[0] || null) : assetEditor.primaryImage
-                            });
-                          }}
-                        >
-                          <X size={10} />
-                        </button>
-                      </div>
-                    );
-                  })}
-                  <button
-                    type="button"
-                    onClick={() => assetUploadRef.current?.click()}
-                    disabled={loadingStates.asset_upload}
-                    style={{ border: '2px dashed var(--border-light)', background: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '4px', color: 'var(--text-muted)', height: '110px', borderRadius: '6px' }}
-                  >
-                    {loadingStates.asset_upload ? <RefreshCw className="spinner" size={16} /> : <Upload size={16} />}
-                    <span style={{ fontSize: '0.68rem' }}>Upload</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => openProjectImageSelector('asset')}
-                    style={{ border: '2px dashed var(--border-light)', background: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '4px', color: 'var(--text-muted)', height: '110px', borderRadius: '6px' }}
-                  >
-                    <FolderOpen size={16} />
-                    <span style={{ fontSize: '0.68rem' }}>From Project</span>
-                  </button>
-                </div>
-              </div>
+                        {loadingStates.asset_upload ? <RefreshCw className="spinner" size={16} /> : <Upload size={16} />}
+                        <span style={{ fontSize: '0.68rem' }}>Upload</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRefBoardPicker({ selected: [] })}
+                        style={{ border: '2px dashed var(--border-light)', background: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '4px', color: 'var(--text-muted)', height: '110px', borderRadius: '6px' }}
+                      >
+                        <ImageIcon size={16} />
+                        <span style={{ fontSize: '0.68rem', textAlign: 'center' }}>From Reference Board</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openProjectImageSelector('asset')}
+                        style={{ border: '2px dashed var(--border-light)', background: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '4px', color: 'var(--text-muted)', height: '110px', borderRadius: '6px' }}
+                      >
+                        <FolderOpen size={16} />
+                        <span style={{ fontSize: '0.68rem' }}>From Project</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
 
             <div className="modal-footer">
@@ -4980,6 +5248,93 @@ Reply with ONLY a JSON object, no markdown fence:
           </div>
         </div>
       )}
+
+      {/* --- A3b. PULL REFERENCES OFF THE MASTER BOARD INTO AN ASSET --- */}
+      {refBoardPicker && assetEditor && (() => {
+        const pool = assetEditor.images || [];
+        const chosen = refBoardPicker.selected;
+        const toggle = (path) => setRefBoardPicker(prev => ({
+          ...prev,
+          selected: prev.selected.includes(path)
+            ? prev.selected.filter(p => p !== path)
+            : [...prev.selected, path]
+        }));
+
+        return (
+          <div className="modal-overlay" onClick={() => setRefBoardPicker(null)}>
+            <div className="modal-window" style={{ maxWidth: '760px', width: '92%', maxHeight: '85vh', display: 'flex', flexDirection: 'column' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <ImageIcon size={20} /> Reference Board → &lt;{assetEditor.tag || 'Asset'}&gt;
+                </h2>
+                <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setRefBoardPicker(null)}>
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="modal-body" style={{ flex: 1, overflowY: 'auto' }}>
+                <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                  Pick as many as you like — they join this asset's reference images. You then tick which of them
+                  actually ride along with a generation, since the model caps how many it will read.
+                </div>
+
+                {referenceImages.length === 0 ? (
+                  <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--text-muted)' }}>
+                    The master reference board is empty. Add images to it from the Reference Imagery panel first.
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))', gap: '10px' }}>
+                    {referenceImages.map(ref => {
+                      const already = pool.includes(ref.path);
+                      const selected = chosen.includes(ref.path);
+                      return (
+                        <button
+                          key={ref.id}
+                          type="button"
+                          disabled={already}
+                          onClick={() => toggle(ref.path)}
+                          title={already ? 'Already one of this asset\'s reference images' : ref.name}
+                          style={{
+                            position: 'relative', padding: 0, borderRadius: '6px', overflow: 'hidden',
+                            border: selected ? '2px solid var(--primary)' : '1px solid var(--border-color)',
+                            background: 'rgba(255,255,255,0.02)', cursor: already ? 'default' : 'pointer',
+                            opacity: already ? 0.45 : 1, display: 'flex', flexDirection: 'column'
+                          }}
+                        >
+                          <div style={{ height: '95px', width: '100%', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <AssetImage path={ref.path} alt={ref.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                          </div>
+                          {selected && <Check size={16} style={{ position: 'absolute', top: '4px', right: '4px', background: 'var(--success)', color: '#fff', borderRadius: '50%', padding: '2px' }} />}
+                          <span style={{ fontSize: '0.68rem', padding: '5px 4px', color: 'var(--text-muted)', textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', width: '100%' }}>
+                            {already ? `${ref.name} — added` : ref.name}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="modal-footer">
+                <button className="btn btn-secondary" onClick={() => setRefBoardPicker(null)}>Cancel</button>
+                <button
+                  className="btn btn-primary"
+                  disabled={chosen.length === 0}
+                  onClick={() => {
+                    setAssetEditor(prev => (prev
+                      ? { ...prev, images: [...(prev.images || []), ...chosen.filter(p => !(prev.images || []).includes(p))], primaryImage: prev.primaryImage || chosen[0] }
+                      : prev));
+                    setRefBoardPicker(null);
+                    showToast(`${chosen.length} reference${chosen.length === 1 ? '' : 's'} added — tick the ones to send.`, 'success');
+                  }}
+                >
+                  <Plus size={14} /> Add {chosen.length || ''} to asset
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* --- A4. BATCH GENERATION DIALOG --- */}
       {batchDialog && (() => {

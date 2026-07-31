@@ -8,6 +8,12 @@
 //             varies by duration. Never invent a number here; say what it is.
 // refImages - how many input/reference images the model accepts (0 = none).
 //             Drives which <Tag> assets get uploaded with the request.
+//             These are the *host's* documented ceilings, not the underlying
+//             model's marketing number — the same model allows a different
+//             count depending on who is serving it (Gemini 2.5 Flash Image is
+//             3 direct from Google but 8 through Higgsfield). Sources are noted
+//             per line; re-check before raising one, an over-count is a request
+//             the provider rejects after you have already paid for the tokens.
 
 export const IMAGE_MODELS = [
   // --- Fal.ai ---
@@ -19,6 +25,7 @@ export const IMAGE_MODELS = [
   { id: 'fal-ai/stable-diffusion-v35-medium', label: 'SD 3.5 Medium', provider: 'fal-ai', price: 0.015, refImages: 0 },
 
   // --- Google (direct) ---
+  // ai.google.dev caps gemini-2.5-flash-image at 3 images per prompt.
   { id: 'google-gemini-image', label: 'Gemini 2.5 Flash Image (Nano Banana)', provider: 'google', priceNote: 'per Google AI Studio rates', refImages: 3 },
 
   // --- OpenAI (direct) ---
@@ -35,12 +42,16 @@ export const IMAGE_MODELS = [
   { id: 'higgsfield-ai/soul/image-to-image', label: 'Higgsfield Soul Image-to-Image', provider: 'higgsfield', priceNote: '~$0.09 / run (credits)', refImages: 1 },
   { id: 'higgsfield-ai/soul-id', label: 'Higgsfield Soul ID (character consistency)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 4 },
   { id: 'reve/text-to-image', label: 'Reve Text-to-Image', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
-  { id: 'google/nano-banana-pro', label: 'Nano Banana Pro (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 3 },
-  { id: 'google/nano-banana', label: 'Nano Banana (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 3 },
-  { id: 'openai/gpt-image-1.5', label: 'GPT Image 1.5 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 3 },
-  { id: 'bytedance/seedream/v4', label: 'Seedream 4 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'black-forest-labs/flux.2', label: 'FLUX.2 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'kling/o1/image', label: 'Kling O1 Image (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
+  // Counts below follow higgsfield-ai/cli MODELS.md ("At most N image_references
+  // are allowed"): nano_banana_2 14, nano_banana 8, openai 16, seedream_v4_5 14,
+  // kling_omni_image 10. FLUX.2 has no Higgsfield-published number, so it takes
+  // Black Forest Labs' own API ceiling of 8.
+  { id: 'google/nano-banana-pro', label: 'Nano Banana Pro (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 14 },
+  { id: 'google/nano-banana', label: 'Nano Banana (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 8 },
+  { id: 'openai/gpt-image-1.5', label: 'GPT Image 1.5 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 16 },
+  { id: 'bytedance/seedream/v4', label: 'Seedream 4 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 10 },
+  { id: 'black-forest-labs/flux.2', label: 'FLUX.2 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 8 },
+  { id: 'kling/o1/image', label: 'Kling O1 Image (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 10 },
   { id: 'alibaba/z-image', label: 'Z-Image (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 }
 ];
 

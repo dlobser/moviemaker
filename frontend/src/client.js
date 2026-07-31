@@ -13,7 +13,8 @@ import { loadCredentials, saveCredentials } from './static/keyStore.js';
 import {
   readProjectState, writeProjectState, listAssetImages,
   importFile, getAssetObjectUrl, getActiveName, getActiveHandle,
-  isFileSystemAccessSupported
+  isFileSystemAccessSupported,
+  listCheckpoints, writeCheckpoint, readCheckpoint, deleteCheckpoint
 } from './static/fileSystem.js';
 import { generateText, listModels, generateImage, generateVideo, runLipSync } from './static/providers.js';
 
@@ -119,6 +120,23 @@ export async function apiFetch(path, options = {}) {
       return asResponse(state || DEFAULT_STATE);
     }
 
+    // --- checkpoints ---
+    if (route === '/api/checkpoints') {
+      if (!getActiveHandle()) return asResponse({ checkpoints: [] });
+      if (options.method === 'POST') {
+        return asResponse({ checkpoint: await writeCheckpoint(body) });
+      }
+      return asResponse({ checkpoints: await listCheckpoints() });
+    }
+    if (route.startsWith('/api/checkpoints/')) {
+      const id = route.slice('/api/checkpoints/'.length);
+      if (options.method === 'DELETE') {
+        await deleteCheckpoint(id);
+        return asResponse({ ok: true });
+      }
+      return asResponse({ checkpoint: await readCheckpoint(id) });
+    }
+
     // --- assets ---
     if (route === '/api/project-images') {
       return asResponse(await listAssetImages());
@@ -161,6 +179,13 @@ export async function apiFetch(path, options = {}) {
       return errorResponse(
         'Video stitching needs FFmpeg, which is not available in the hosted build. ' +
         'Download the shot videos from your project folder and join them in an editor, or run the local server build.',
+        501
+      );
+    }
+    if (route === '/api/render' || route.startsWith('/api/render/')) {
+      return errorResponse(
+        'Rendering needs FFmpeg, which is not available in the hosted build. ' +
+        'Run the local server build to export your edit.',
         501
       );
     }

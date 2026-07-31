@@ -4,7 +4,8 @@ const multer = require('multer');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
+const { buildRenderGraph } = require('./renderGraph.js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -116,6 +117,57 @@ function getAssetsDir() {
     fs.mkdirSync(dir, { recursive: true });
   }
   return dir;
+}
+
+// --- CHECKPOINTS ------------------------------------------------------------
+// A checkpoint is a named snapshot of the whole studio state — shot list,
+// settings, galleries and the edit — kept beside the project so you can branch
+// an idea without branching the project.
+//
+// They live as one file each in `checkpoints/` rather than inside the project
+// file: the state is tens of kilobytes, and burying a dozen copies of it in the
+// document autosave rewrites every few seconds would be miserable.
+//
+// Media is deliberately not copied. Generated assets are written once under
+// timestamped names and never change, so every checkpoint can share them. The
+// cost is that deleting an asset also breaks the checkpoints referencing it.
+
+function getCheckpointsDir(create = true) {
+  const dir = path.join(getWorkingRoot(), 'checkpoints');
+  if (create && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Enough to describe a checkpoint in a list without reading all of it. */
+function summariseState(state) {
+  const scenes = Array.isArray(state?.scenes) ? state.scenes : [];
+  const shots = scenes.reduce((total, scene) => total + (scene.shots || []).length, 0);
+  const withVideo = scenes.reduce((total, scene) => (
+    total + (scene.shots || []).filter(shot => shot.selectedVideo).length
+  ), 0);
+  return {
+    scenes: scenes.length,
+    shots,
+    shotsWithVideo: withVideo,
+    editClips: Array.isArray(state?.edit?.video) ? state.edit.video.length : 0
+  };
+}
+
+function readCheckpointFile(file) {
+  const raw = readJsonFile(file, null);
+  if (!raw || !raw.id) return null;
+  return raw;
+}
+
+function listCheckpoints() {
+  const dir = getCheckpointsDir(false);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter(name => name.endsWith('.json'))
+    .map(name => readCheckpointFile(path.join(dir, name)))
+    .filter(Boolean)
+    .map(({ state, ...meta }) => meta)
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
 // Helper to get dynamic project state file path
@@ -832,11 +884,16 @@ app.post('/api/image/generate', async (req, res) => {
 
       if (inputImagePaths && inputImagePaths.length > 0) {
         const dataUrls = inputImagePaths.map(assetToDataUrl);
-        // Higgsfield accepts a single `image_url` on edit endpoints and a list
-        // of `reference_images` on identity-preserving ones. Send both shapes so
-        // whichever the chosen model reads is populated.
+        // Higgsfield accepts a single `image_url` on edit endpoints, a list of
+        // `reference_images` on identity-preserving ones, and `image_references`
+        // on the multi-reference models (nano banana, seedream, kling omni —
+        // see higgsfield-ai/cli MODELS.md). Send all three shapes so whichever
+        // the chosen model reads is populated; only `image_url` can carry one
+        // image, so a multi-image request that lands on it silently drops the
+        // rest, which is the failure this alias exists to avoid.
         input.image_url = dataUrls[0];
         input.reference_images = dataUrls;
+        input.image_references = dataUrls;
       }
 
       const result = await callHiggsfieldModel(modelId, input, config);
@@ -1297,6 +1354,63 @@ function runFfmpeg(args, label) {
   });
 }
 
+// --- CHECKPOINT ENDPOINTS ---------------------------------------------------
+
+app.get('/api/checkpoints', (req, res) => {
+  try {
+    res.json({ checkpoints: listCheckpoints() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/checkpoints', (req, res) => {
+  const { name, note, state } = req.body || {};
+  if (!state || typeof state !== 'object') {
+    return res.status(400).json({ error: 'No state to save.' });
+  }
+
+  try {
+    const createdAt = new Date().toISOString();
+    const id = `cp_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const record = {
+      id,
+      name: String(name || '').trim() || `Checkpoint ${createdAt.slice(0, 16).replace('T', ' ')}`,
+      note: String(note || '').trim(),
+      createdAt,
+      summary: summariseState(state),
+      state
+    };
+
+    const file = path.join(getCheckpointsDir(), `${id}.json`);
+    if (!writeJsonFile(file, record)) throw new Error('Could not write the checkpoint file.');
+
+    const { state: _omit, ...meta } = record;
+    res.json({ checkpoint: meta });
+  } catch (error) {
+    console.error('Checkpoint save failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/checkpoints/:id', (req, res) => {
+  const file = path.join(getCheckpointsDir(false), `${path.basename(req.params.id)}.json`);
+  const record = fs.existsSync(file) ? readCheckpointFile(file) : null;
+  if (!record) return res.status(404).json({ error: 'No such checkpoint.' });
+  res.json({ checkpoint: record });
+});
+
+app.delete('/api/checkpoints/:id', (req, res) => {
+  const file = path.join(getCheckpointsDir(false), `${path.basename(req.params.id)}.json`);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'No such checkpoint.' });
+  try {
+    fs.rmSync(file);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- SOURCE MEASUREMENT -----------------------------------------------------
 
 /**
@@ -1478,6 +1592,164 @@ app.post('/api/concatenate', async (req, res) => {
   }
 });
 
+// --- TIMELINE RENDER --------------------------------------------------------
+
+/**
+ * Render an edit.
+ *
+ * Unlike /api/concatenate this takes the editor's resolved timeline — trims,
+ * transitions, levels and all — and encodes it in a single pass rather than
+ * normalising every shot to its own file first.
+ *
+ * It answers immediately with a job id and works in the background: a couple of
+ * minutes of footage takes long enough that holding the request open would just
+ * be a timeout waiting to happen, and ffmpeg's own progress output gives the
+ * editor something real to show meanwhile.
+ */
+const renderJobs = new Map();
+const RENDER_JOB_TTL_MS = 60 * 60 * 1000;
+
+function pruneRenderJobs() {
+  const now = Date.now();
+  for (const [id, job] of renderJobs) {
+    if (job.state !== 'running' && now - job.finishedAt > RENDER_JOB_TTL_MS) {
+      renderJobs.delete(id);
+    }
+  }
+}
+
+function planDuration(plan) {
+  const ends = [
+    ...(plan.video || []).map(clip => Number(clip.end) || 0),
+    ...(plan.audio || []).map(clip => (Number(clip.start) || 0) + (Number(clip.length) || 0))
+  ];
+  return ends.length ? Math.max(...ends) : 0;
+}
+
+app.post('/api/render', (req, res) => {
+  pruneRenderJobs();
+
+  const plan = req.body || {};
+  if (!Array.isArray(plan.video) || plan.video.length === 0) {
+    return res.status(400).json({ error: 'Nothing on the timeline to render.' });
+  }
+
+  const root = getWorkingRoot();
+  const missing = [];
+  const resolvePath = (relative) => {
+    const absolute = path.join(root, relative);
+    if (!fs.existsSync(absolute)) missing.push(relative);
+    return absolute;
+  };
+
+  const outputFilename = `edit_${Date.now()}.mp4`;
+  const outputFilePath = path.join(getAssetsDir(), outputFilename);
+
+  let graph;
+  try {
+    graph = buildRenderGraph(plan, {
+      resolvePath,
+      outputPath: outputFilePath,
+      encoder: plan.encoder === 'h264_nvenc' ? 'h264_nvenc' : 'libx264'
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  if (missing.length > 0) {
+    return res.status(400).json({
+      error: `Missing media: ${[...new Set(missing)].slice(0, 5).join(', ')}`
+    });
+  }
+
+  // The graph goes in a file: a long edit produces one far past the 8191
+  // character limit Windows puts on a command line.
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mm_render_'));
+  const scriptPath = path.join(workDir, 'graph.txt');
+  fs.writeFileSync(scriptPath, graph.filterScript, 'utf8');
+
+  const args = ['-y', '-hide_banner', '-nostats', '-progress', 'pipe:1',
+    ...graph.args.map(arg => (arg === '__FILTER_SCRIPT__' ? scriptPath : arg))];
+
+  const jobId = `r_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  const job = {
+    id: jobId,
+    state: 'running',
+    progress: 0,
+    duration: planDuration(plan),
+    filePath: null,
+    error: null,
+    startedAt: Date.now(),
+    finishedAt: null
+  };
+  renderJobs.set(jobId, job);
+
+  let stderrTail = '';
+  let child;
+  try {
+    // No shell: the argument array sidesteps quoting entirely, which matters
+    // for paths with spaces and for the filter graph.
+    child = spawn('ffmpeg', args, { windowsHide: true });
+  } catch (error) {
+    job.state = 'error';
+    job.error = 'FFmpeg could not be started. Is it installed and on PATH?';
+    job.finishedAt = Date.now();
+    return res.status(500).json({ error: job.error });
+  }
+
+  child.stdout.on('data', (chunk) => {
+    // -progress emits key=value lines; out_time_us is the one worth reading.
+    for (const line of String(chunk).split('\n')) {
+      const match = /^out_time_us=(\d+)/.exec(line.trim());
+      if (match && job.duration > 0) {
+        job.progress = Math.min(1, (Number(match[1]) / 1e6) / job.duration);
+      }
+    }
+  });
+
+  child.stderr.on('data', (chunk) => {
+    stderrTail = (stderrTail + chunk).slice(-4000);
+  });
+
+  child.on('error', (error) => {
+    job.state = 'error';
+    job.error = /ENOENT/i.test(error.message)
+      ? 'FFmpeg is not installed or not on PATH.'
+      : error.message;
+    job.finishedAt = Date.now();
+  });
+
+  child.on('close', (code) => {
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    if (job.state === 'error') return;
+
+    if (code === 0) {
+      job.state = 'done';
+      job.progress = 1;
+      job.filePath = `assets/${outputFilename}`;
+    } else {
+      job.state = 'error';
+      job.error = stderrTail.trim().split('\n').slice(-4).join(' ') || `FFmpeg exited with code ${code}.`;
+      console.error('Render failed:', stderrTail.slice(-1500));
+    }
+    job.finishedAt = Date.now();
+  });
+
+  res.json({ jobId, duration: job.duration, inputs: graph.inputCount });
+});
+
+app.get('/api/render/:jobId', (req, res) => {
+  const job = renderJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'No such render job.' });
+  res.json({
+    state: job.state,
+    progress: job.progress,
+    duration: job.duration,
+    filePath: job.filePath,
+    error: job.error
+  });
+});
+
 // --- NATIVE WINDOWS FILE / FOLDER PICKER ---
 // Runs a WinForms dialog through PowerShell. Needs -STA (the dialogs require a
 // single-threaded apartment) and a TopMost owner form, otherwise the dialog can
@@ -1511,11 +1783,33 @@ if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $d
   const body = scripts[mode];
   if (!body) return res.status(400).json({ error: `Unknown browse mode: ${mode}` });
 
+  // The dialog is modal to $owner, so $owner has to be a *shown* top-most
+  // window. A Form that is only constructed is never activated and never gets
+  // a taskbar button, and neither does a dialog owned by it — so the picker
+  // opens behind the browser, invisible, and just sits there until the timeout.
+  // It is parked 1x1 at the middle of the work area: effectively invisible, but
+  // real, and centred so owner-centred dialogs land on screen rather than off it.
   const script = `
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -Namespace MM -Name Fg -MemberDefinition '
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'
+
+$area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $owner = New-Object System.Windows.Forms.Form
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Location = New-Object System.Drawing.Point(
+  [int]($area.Left + $area.Width / 2), [int]($area.Top + $area.Height / 2))
+$owner.ShowInTaskbar = $false
 $owner.TopMost = $true
+$owner.Show()
+$owner.Activate()
+[void][MM.Fg]::SetForegroundWindow($owner.Handle)
+[System.Windows.Forms.Application]::DoEvents()
 ${body}
+$owner.Close()
 $owner.Dispose()
 `;
 
@@ -1526,9 +1820,13 @@ $owner.Dispose()
     return res.status(500).json({ error: `Could not stage picker script: ${error.message}` });
   }
 
-  exec(
-    `powershell -NoProfile -ExecutionPolicy Bypass -STA -File "${scriptPath}"`,
-    { timeout: 5 * 60 * 1000 },
+  // execFile, not exec: exec goes through cmd.exe, so the timeout kills the
+  // shell and leaves the PowerShell holding the dialog running forever. One
+  // stranded invisible dialog per click adds up fast.
+  execFile(
+    'powershell',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', scriptPath],
+    { timeout: 5 * 60 * 1000, windowsHide: true },
     (error, stdout, stderr) => {
       try { fs.unlinkSync(scriptPath); } catch { /* best effort */ }
 

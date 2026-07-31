@@ -13,7 +13,9 @@
 // ends in `normalize`, which either reflows the sequence so it has no holes
 // (smart) or sorts it by start time and reads the overlaps back (free).
 
-import { resolveClipSource, findShot, FALLBACK_CLIP_SECONDS } from './model.js';
+import {
+  resolveClipSource, findShot, createAudioTrack, createAudioClip, FALLBACK_CLIP_SECONDS
+} from './model.js';
 
 /** No clip may be trimmed shorter than this. Roughly one frame at 24fps. */
 export const MIN_CLIP_SECONDS = 0.05;
@@ -54,6 +56,21 @@ export function sourceDuration(clip, ctx) {
 /** The furthest `out` a clip may be trimmed to. */
 export function maxOut(clip, ctx) {
   return sourceDuration(clip, ctx);
+}
+
+/**
+ * Whether the source has a soundtrack at all.
+ *
+ * Generated clips very often have no audio stream, and offering level and fade
+ * controls for silence is just misleading. Unknown counts as yes: the hosted
+ * build cannot inspect streams, and wrongly silencing real audio is the worse
+ * mistake of the two.
+ */
+export function sourceHasAudio(clip, ctx) {
+  const resolved = resolveClipSource(clip, ctx.scenes);
+  if (resolved.kind === 'image' || !resolved.path) return false;
+  const probe = ctx.durations[resolved.path];
+  return probe?.hasAudio !== false;
 }
 
 /**
@@ -219,9 +236,14 @@ export function setClipTrim(edit, clipId, edge, value, ctx) {
 
   let nextIn = Number(clip.in) || 0;
   let nextOut = currentOut;
+  let nextStart = clip.start;
 
   if (edge === 'in') {
     nextIn = clamp(value, 0, currentOut - MIN_CLIP_SECONDS);
+    // Free mode has no reflow to close the hole a shortened head would leave,
+    // so the clip's start follows the trim and the picture stays put. In smart
+    // mode the start is derived anyway and the ripple does the same job.
+    if (!edit.smart) nextStart = Math.max(0, clip.start + (nextIn - (Number(clip.in) || 0)));
   } else {
     const ceiling = Number.isFinite(limit) ? limit : Infinity;
     nextOut = clamp(value, nextIn + MIN_CLIP_SECONDS, ceiling);
@@ -231,6 +253,7 @@ export function setClipTrim(edit, clipId, edge, value, ctx) {
     ...clip,
     in: nextIn,
     out: nextOut,
+    start: nextStart,
     manual: true,
     boundTo: resolved.path || clip.boundTo
   };
@@ -359,6 +382,198 @@ export function setSmart(edit, smart, ctx) {
   return normalize({ ...edit, smart: Boolean(smart), video: ordered }, ctx);
 }
 
+// --- audio tracks -----------------------------------------------------------
+
+export function addAudioTrack(edit, name) {
+  const audio = [...(edit.audio || [])];
+  audio.push(createAudioTrack(name || `Audio ${audio.length + 1}`));
+  return { ...edit, audio };
+}
+
+export function removeAudioTrack(edit, trackId) {
+  return { ...edit, audio: (edit.audio || []).filter(track => track.id !== trackId) };
+}
+
+/** Patch a track's mixer settings: gain, muted, solo, name. */
+export function setTrackField(edit, trackId, patch) {
+  return {
+    ...edit,
+    audio: (edit.audio || []).map(track => (
+      track.id === trackId ? { ...track, ...patch } : track
+    ))
+  };
+}
+
+export function addAudioClip(edit, trackId, clip) {
+  const audio = (edit.audio || []).map(track => (
+    track.id === trackId ? { ...track, clips: [...(track.clips || []), clip] } : track
+  ));
+  return { ...edit, audio };
+}
+
+export function removeAudioClip(edit, clipId) {
+  return {
+    ...edit,
+    audio: (edit.audio || []).map(track => ({
+      ...track,
+      clips: (track.clips || []).filter(clip => clip.id !== clipId)
+    }))
+  };
+}
+
+export function findAudioClip(edit, clipId) {
+  for (const track of edit.audio || []) {
+    const clip = (track.clips || []).find(candidate => candidate.id === clipId);
+    if (clip) return { track, clip };
+  }
+  return null;
+}
+
+/** Patch one audio clip's own settings: gain, fades, trim. */
+export function setAudioClipField(edit, clipId, patch) {
+  return {
+    ...edit,
+    audio: (edit.audio || []).map(track => ({
+      ...track,
+      clips: (track.clips || []).map(clip => (
+        clip.id === clipId ? { ...clip, ...patch } : clip
+      ))
+    }))
+  };
+}
+
+/**
+ * Trim an audio clip, clamped to the material the source actually has.
+ *
+ * Unlike picture there is no ripple: audio sits at an absolute time (or hangs
+ * off a video clip), so trimming the head moves the clip to keep the sound
+ * where it was rather than shuffling anything else along.
+ */
+export function setAudioClipTrim(edit, clipId, edge, value, ctx) {
+  const found = findAudioClip(edit, clipId);
+  if (!found) return edit;
+
+  const { clip } = found;
+  const limit = sourceDuration(clip, ctx);
+  const currentIn = Number(clip.in) || 0;
+  const currentOut = effectiveOut(clip, ctx);
+
+  if (edge === 'in') {
+    const nextIn = clamp(value, 0, currentOut - MIN_CLIP_SECONDS);
+    const shift = nextIn - currentIn;
+    const patch = { in: nextIn, out: currentOut };
+    if (clip.link) patch.link = { ...clip.link, offset: (clip.link.offset || 0) + shift };
+    else patch.start = Math.max(0, clip.start + shift);
+    return setAudioClipField(edit, clipId, patch);
+  }
+
+  const ceiling = Number.isFinite(limit) ? limit : Infinity;
+  return setAudioClipField(edit, clipId, {
+    out: clamp(value, currentIn + MIN_CLIP_SECONDS, ceiling)
+  });
+}
+
+/**
+ * Move an audio clip.
+ *
+ * A linked clip keeps its link and slips its offset instead of breaking away —
+ * that is how you nudge a lip-sync a few frames without losing the fact that it
+ * belongs to that shot. A free clip just takes the new absolute time.
+ */
+export function moveAudioClip(edit, clipId, start) {
+  const found = findAudioClip(edit, clipId);
+  if (!found) return edit;
+
+  if (found.clip.link) {
+    const anchor = edit.video.find(clip => clip.id === found.clip.link.clipId);
+    if (anchor) {
+      const offset = start - anchor.start;
+      return setAudioClipField(edit, clipId, { link: { ...found.clip.link, offset } });
+    }
+  }
+  return setAudioClipField(edit, clipId, { start: Math.max(0, start), link: null });
+}
+
+/** Pin an audio clip to a video clip so the two travel together from now on. */
+export function linkAudioClip(edit, clipId, videoClipId, ctx) {
+  const found = findAudioClip(edit, clipId);
+  const anchor = buildTimeline(edit, ctx).video.find(entry => entry.clip.id === videoClipId);
+  if (!found || !anchor) return edit;
+  const currentStart = found.clip.link ? anchor.start + found.clip.link.offset : found.clip.start;
+  return setAudioClipField(edit, clipId, {
+    link: { clipId: videoClipId, offset: currentStart - anchor.start }
+  });
+}
+
+/** Cut an audio clip loose, freezing it wherever it currently sits. */
+export function unlinkAudioClip(edit, clipId, ctx) {
+  const timeline = buildTimeline(edit, ctx);
+  for (const track of timeline.audio) {
+    const entry = track.clips.find(candidate => candidate.clip.id === clipId);
+    if (entry) return setAudioClipField(edit, clipId, { link: null, start: entry.start });
+  }
+  return edit;
+}
+
+/**
+ * Lift a video clip's own soundtrack onto an audio track.
+ *
+ * Until this happens the audio is part of the picture clip and moves with it,
+ * which is what you want almost always. Detaching leaves the sound where it is
+ * so the picture can be cut against it.
+ */
+export function detachClipAudio(edit, videoClipId, ctx) {
+  const index = edit.video.findIndex(clip => clip.id === videoClipId);
+  if (index < 0) return edit;
+
+  const clip = edit.video[index];
+  if (clip.audio?.detached) return edit;
+
+  const entry = buildTimeline(edit, ctx).video[index];
+  // A still has no soundtrack to lift, and neither does a silent take — which
+  // most generated clips are.
+  if (entry.resolved.kind !== 'video' || !sourceHasAudio(clip, ctx)) return edit;
+
+  let next = edit;
+  let track = (edit.audio || [])[0];
+  if (!track) {
+    next = addAudioTrack(next, 'Audio 1');
+    track = next.audio[0];
+  }
+
+  const detached = createAudioClip(
+    { ...clip.source, stream: 'audio' },
+    {
+      start: entry.start,
+      in: entry.in,
+      out: entry.out,
+      gain: clip.audio?.gain ?? 1,
+      fadeIn: clip.audio?.fadeIn ?? 0,
+      fadeOut: clip.audio?.fadeOut ?? 0,
+      detachedFrom: videoClipId
+    }
+  );
+
+  const video = [...next.video];
+  video[index] = { ...clip, audio: { ...clip.audio, detached: true } };
+  return normalize(addAudioClip({ ...next, video }, track.id, detached), ctx);
+}
+
+/** Put a detached soundtrack back into its picture clip. */
+export function reattachClipAudio(edit, videoClipId, ctx) {
+  const index = edit.video.findIndex(clip => clip.id === videoClipId);
+  if (index < 0) return edit;
+
+  const audio = (edit.audio || []).map(track => ({
+    ...track,
+    clips: (track.clips || []).filter(clip => clip.detachedFrom !== videoClipId)
+  }));
+
+  const video = [...edit.video];
+  video[index] = { ...video[index], audio: { ...video[index].audio, detached: false } };
+  return normalize({ ...edit, video, audio }, ctx);
+}
+
 // --- the resolved timeline --------------------------------------------------
 
 /**
@@ -378,6 +593,7 @@ export function buildTimeline(edit, ctx) {
       length,
       in: Number(clip.in) || 0,
       out: effectiveOut(clip, ctx),
+      hasAudio: sourceHasAudio(clip, ctx),
       transition: clip.transition || null,
       // Flagged when a trim was measured against a take that is no longer the
       // select, so the UI can badge it instead of silently mangling the edit.
@@ -402,6 +618,7 @@ export function buildTimeline(edit, ctx) {
         length,
         in: Number(clip.in) || 0,
         out: effectiveOut(clip, ctx),
+        hasAudio: sourceHasAudio(clip, ctx),
         gain: Number(clip.gain) || 0,
         fadeIn: Number(clip.fadeIn) || 0,
         fadeOut: Number(clip.fadeOut) || 0
@@ -414,13 +631,24 @@ export function buildTimeline(edit, ctx) {
     ...audio.flatMap(entry => entry.clips.map(clip => clip.end))
   ];
 
+  // Solo is global: the moment any track is soloed, every track without it goes
+  // quiet, which is the only reading of solo that is useful while mixing.
+  const anySolo = audio.some(entry => entry.track.solo);
+
   return {
     settings: edit.settings,
     smart: edit.smart,
     video,
     audio,
+    anySolo,
     duration: ends.length ? Math.max(...ends) : 0
   };
+}
+
+/** Whether a track should be heard, taking mute and the solo state together. */
+export function trackAudible(track, anySolo) {
+  if (anySolo) return Boolean(track.solo);
+  return !track.muted;
 }
 
 /** The clip under the playhead, plus the one dissolving in over it. */

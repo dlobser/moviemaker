@@ -17,6 +17,7 @@
 // consume, so what you watch and what you export come from one description.
 
 import { clipsAtTime } from './timing.js';
+import { AudioScheduler } from './AudioScheduler.js';
 
 /** Past this much drift, seek. Below it, nudge the rate instead. */
 const HARD_CORRECT = 0.25;
@@ -49,6 +50,15 @@ export class PreviewEngine {
     this.host.style.cssText =
       'position:fixed;left:-10000px;top:0;width:640px;height:360px;opacity:0;pointer-events:none;';
     document.body.appendChild(this.host);
+
+    // Audio tracks cannot use media elements: several overlap, they need exact
+    // start times, and element clocks drift. They get decoded buffers scheduled
+    // against the same clock instead.
+    this.scheduler = new AudioScheduler({
+      audioContext: this.audio,
+      destination: this.master,
+      resolveUrl: this.resolveUrl
+    });
 
     this.slots = [this.createSlot(), this.createSlot()];
     this.images = new Map();   // asset path -> HTMLImageElement
@@ -94,6 +104,11 @@ export class PreviewEngine {
       }
     }
     this.resizeCanvas();
+    this.scheduler.setTimeline(timeline);
+    // Edits pause playback first, so this is the rare case of the document
+    // changing mid-play; rebuilding the schedule is cheaper than reasoning
+    // about which scheduled sources are still correct.
+    if (this.playing) this.scheduler.start(this.now());
     if (!this.playing) this.drawAt(this.playhead);
   }
 
@@ -170,6 +185,7 @@ export class PreviewEngine {
     this.playing = true;
     this.clockOrigin = this.audio.currentTime;
     this.clockOffset = this.playhead;
+    this.scheduler.start(this.playhead);
     this.onStateChange({ playing: true });
   }
 
@@ -177,6 +193,7 @@ export class PreviewEngine {
     if (!this.playing) return;
     this.playhead = this.now();
     this.playing = false;
+    this.scheduler.stop();
     for (const slot of this.slots) slot.element.pause();
     this.onStateChange({ playing: false });
   }
@@ -191,9 +208,13 @@ export class PreviewEngine {
     if (this.playing) {
       this.clockOrigin = this.audio.currentTime;
       this.clockOffset = this.playhead;
+      // Scheduled buffers are pinned to absolute times, so a seek has to throw
+      // them away and lay the whole schedule down again from the new position.
+      this.scheduler.start(this.playhead);
       // Force every slot to re-align on the next frame.
       for (const slot of this.slots) slot.ready = false;
     } else {
+      this.scheduler.stop();
       for (const slot of this.slots) slot.element.pause();
       this.drawAt(this.playhead);
     }
@@ -343,12 +364,25 @@ export class PreviewEngine {
     paint.fillRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
+  /**
+   * Level the picture clips' own soundtracks.
+   *
+   * A clip whose audio has been detached is silent here — the copy on the audio
+   * track is the one you hear. Soloing any audio track also drops picture
+   * audio, since a solo you can still hear other things over is not a solo.
+   */
   mixAudio(current, currentGain, incoming, incomingGain) {
     const when = this.audio.currentTime;
+    const soloed = Boolean(this.timeline?.anySolo);
+
     for (const slot of this.slots) {
       let gain = 0;
-      if (current && slot.clipId === current.clip.id) gain = currentGain * (current.clip.audio?.gain ?? 1);
-      else if (incoming && slot.clipId === incoming.clip.id) gain = incomingGain * (incoming.clip.audio?.gain ?? 1);
+      if (current && slot.clipId === current.clip.id) {
+        gain = current.clip.audio?.detached ? 0 : currentGain * (current.clip.audio?.gain ?? 1);
+      } else if (incoming && slot.clipId === incoming.clip.id) {
+        gain = incoming.clip.audio?.detached ? 0 : incomingGain * (incoming.clip.audio?.gain ?? 1);
+      }
+      if (soloed) gain = 0;
       slot.gain.gain.setTargetAtTime(this.playing ? gain : 0, when, 0.02);
     }
   }
@@ -383,6 +417,7 @@ export class PreviewEngine {
 
   destroy() {
     this.destroyed = true;
+    this.scheduler.destroy();
     if (this.frame) cancelAnimationFrame(this.frame);
     for (const slot of this.slots) {
       slot.element.pause();

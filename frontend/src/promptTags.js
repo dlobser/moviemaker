@@ -88,6 +88,21 @@ export function assetPrimaryImage(asset) {
   return asset.primaryImage || (asset.images || [])[0] || null;
 }
 
+/**
+ * The reference images sent *into* a generation of this asset's own artwork.
+ *
+ * These are picked by hand from the asset's reference pool — several at once on
+ * models that take several. Assets saved before the multi-select existed carry
+ * the old single `useExistingAsReference` flag instead, and are read as "send
+ * the primary" so an old project generates what it always generated.
+ */
+export function assetInputImages(asset) {
+  if (!asset) return [];
+  if (Array.isArray(asset.inputImages)) return asset.inputImages.filter(Boolean);
+  const primary = assetPrimaryImage(asset);
+  return asset.useExistingAsReference && primary ? [primary] : [];
+}
+
 /** The text an asset contributes when its tag is substituted into a prompt. */
 export function assetPromptText(asset) {
   if (!asset) return '';

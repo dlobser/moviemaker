@@ -9,7 +9,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  createAudioClip,
+  createAudioTrack,
   createEmptyEdit,
+  deriveAudioClipsForShots,
   deriveVideoClips,
   pickDefaultSettings,
   resolveClipSource
@@ -28,6 +31,15 @@ import {
   moveClipToIndex,
   removeVideoClip,
   splitClipAtTime,
+  addAudioClip,
+  findAudioClip,
+  moveAudioClip,
+  setAudioClipTrim,
+  unlinkAudioClip,
+  detachClipAudio,
+  reattachClipAudio,
+  trackAudible,
+  sourceHasAudio,
   MIN_CLIP_SECONDS
 } from './timing.js';
 
@@ -49,7 +61,9 @@ const durations = {
   'assets/a.mp4': { duration: 5, width: 1920, height: 1080, fps: 24, hasAudio: true },
   'assets/b.mp4': { duration: 4, width: 1280, height: 720, fps: 24, hasAudio: true },
   'assets/d.mp4': { duration: 6, width: 1280, height: 720, fps: 24, hasAudio: true },
-  'assets/c.png': { isImage: true, width: 1920, height: 1080, duration: null, hasAudio: false }
+  'assets/c.png': { isImage: true, width: 1920, height: 1080, duration: null, hasAudio: false },
+  'assets/music.mp3': { duration: 30, width: null, height: null, fps: null, hasAudio: true, isImage: false },
+  'assets/vo.mp3': { duration: 4, width: null, height: null, fps: null, hasAudio: true, isImage: false }
 };
 
 const ctx = makeContext(scenes, durations);
@@ -269,11 +283,174 @@ test('pulling clips back apart clears the dissolve again', () => {
   assert.equal(separated.video[1].transition, null);
 });
 
+test('trimming the head in free mode moves the clip so the picture stays put', () => {
+  const free = setSmart(freshEdit(), false, ctx);
+  const after = setClipTrim(free, free.video[1].id, 'in', 1, ctx);
+
+  // B ran 5–9 holding source 0–4. Dropping a second off its head leaves it
+  // holding 1–4, and it starts a second later so that frame lands where it did.
+  assert.equal(round(after.video[1].start), 6);
+  assert.deepEqual(lengths(after), [5, 3, 3]);
+  // The clip before it has not moved, and a gap is allowed here.
+  assert.equal(round(after.video[0].start), 0);
+});
+
+test('trimming the head in smart mode ripples instead of moving the clip', () => {
+  const base = freshEdit();
+  const after = setClipTrim(base, base.video[1].id, 'in', 1, ctx);
+  assert.deepEqual(starts(after), [0, 5, 8]);
+  assert.deepEqual(lengths(after), [5, 3, 3]);
+});
+
 test('turning smart mode back on closes every gap at once', () => {
   const free = setSmart(freshEdit(), false, ctx);
   const scattered = moveClipToTime(free, free.video[2].id, 40, ctx);
   const tidy = setSmart(scattered, true, ctx);
   assert.deepEqual(starts(tidy), [0, 5, 9]);
+});
+
+// --- audio ------------------------------------------------------------------
+
+const musicSource = { kind: 'asset', path: 'assets/music.mp3', name: 'Music' };
+
+function withMusic(edit, overrides) {
+  const track = createAudioTrack('Music');
+  const clip = createAudioClip(musicSource, overrides);
+  return { edit: addAudioClip({ ...edit, audio: [track] }, track.id, clip), clip };
+}
+
+test('audio linked to a picture clip moves when that clip moves', () => {
+  const base = freshEdit();
+  const { edit, clip } = withMusic(base, { link: { clipId: base.video[1].id, offset: 0 } });
+
+  assert.equal(round(buildTimeline(edit, ctx).audio[0].clips[0].start), 5);
+
+  // Shortening the clip before it pulls the picture back — and the sound with it.
+  const trimmed = setClipTrim(edit, base.video[0].id, 'out', 3, ctx);
+  assert.equal(round(buildTimeline(trimmed, ctx).audio[0].clips[0].start), 3);
+  assert.equal(buildTimeline(trimmed, ctx).audio[0].clips[0].clip.id, clip.id);
+});
+
+test('unlinking freezes the sound where it currently sits', () => {
+  const base = freshEdit();
+  const { edit, clip } = withMusic(base, { link: { clipId: base.video[1].id, offset: 0 } });
+
+  const freed = unlinkAudioClip(edit, clip.id, ctx);
+  assert.equal(findAudioClip(freed, clip.id).clip.link, null);
+  assert.equal(round(findAudioClip(freed, clip.id).clip.start), 5);
+
+  // Now the picture can move without dragging the sound along.
+  const trimmed = setClipTrim(freed, base.video[0].id, 'out', 3, ctx);
+  assert.equal(round(buildTimeline(trimmed, ctx).audio[0].clips[0].start), 5);
+});
+
+test('dragging a linked clip slips the sync rather than breaking the link', () => {
+  const base = freshEdit();
+  const { edit, clip } = withMusic(base, { link: { clipId: base.video[1].id, offset: 0 } });
+
+  const slipped = moveAudioClip(edit, clip.id, 5.5);
+  const after = findAudioClip(slipped, clip.id).clip;
+  assert.equal(after.link.clipId, base.video[1].id);
+  assert.equal(round(after.link.offset), 0.5);
+  assert.equal(round(buildTimeline(slipped, ctx).audio[0].clips[0].start), 5.5);
+});
+
+test('detaching a clip’s sound puts it on a track and silences the picture', () => {
+  const base = freshEdit();
+  const after = detachClipAudio(base, base.video[0].id, ctx);
+
+  assert.equal(after.video[0].audio.detached, true);
+  assert.equal(after.audio.length, 1);
+  assert.equal(after.audio[0].clips.length, 1);
+
+  const detached = after.audio[0].clips[0];
+  assert.equal(detached.detachedFrom, base.video[0].id);
+  // Detached means detached: it stays put when the picture is recut.
+  assert.equal(detached.link, null);
+  assert.equal(round(detached.start), 0);
+});
+
+test('a still has no soundtrack to detach', () => {
+  const base = freshEdit();
+  assert.equal(detachClipAudio(base, base.video[2].id, ctx), base);
+});
+
+test('a silent take has nothing to detach either', () => {
+  // Generated clips very often carry no audio stream at all.
+  const silent = makeContext(scenes, {
+    ...durations,
+    'assets/a.mp4': { ...durations['assets/a.mp4'], hasAudio: false }
+  });
+  const base = normalize({ ...createEmptyEdit(), video: deriveVideoClips(scenes) }, silent);
+
+  assert.equal(sourceHasAudio(base.video[0], silent), false);
+  assert.equal(sourceHasAudio(base.video[1], silent), true);
+  assert.equal(detachClipAudio(base, base.video[0].id, silent), base);
+  assert.equal(buildTimeline(base, silent).video[0].hasAudio, false);
+});
+
+test('an unmeasured source is assumed to have audio rather than silenced', () => {
+  // The hosted build cannot inspect streams; wrongly muting is the worse error.
+  const blind = makeContext(scenes, {});
+  assert.equal(sourceHasAudio(freshEdit().video[0], blind), true);
+});
+
+test('relinking puts a detached soundtrack back into its clip', () => {
+  const base = freshEdit();
+  const detached = detachClipAudio(base, base.video[0].id, ctx);
+  const restored = reattachClipAudio(detached, base.video[0].id, ctx);
+
+  assert.equal(restored.video[0].audio.detached, false);
+  assert.equal(restored.audio[0].clips.length, 0);
+});
+
+test('removing a picture clip takes its linked sound with it', () => {
+  const base = freshEdit();
+  const { edit, clip } = withMusic(base, { link: { clipId: base.video[1].id, offset: 0 } });
+  const after = removeVideoClip(edit, base.video[1].id, ctx);
+  assert.equal(findAudioClip(after, clip.id), null);
+});
+
+test('audio trim clamps to the source and keeps the sound in place', () => {
+  const base = freshEdit();
+  const { edit, clip } = withMusic(base, { start: 10 });
+
+  const trimmed = setAudioClipTrim(edit, clip.id, 'in', 4, ctx);
+  const after = findAudioClip(trimmed, clip.id).clip;
+  assert.equal(round(after.in), 4);
+  // Start moved by the same amount, so the music itself did not shift.
+  assert.equal(round(after.start), 14);
+
+  const stretched = setAudioClipTrim(trimmed, clip.id, 'out', 999, ctx);
+  assert.equal(round(findAudioClip(stretched, clip.id).clip.out), 30);
+});
+
+test('solo silences every track without it; mute only silences its own', () => {
+  const loud = createAudioTrack('Music');
+  const quiet = createAudioTrack('Room', { muted: true });
+
+  assert.equal(trackAudible(loud, false), true);
+  assert.equal(trackAudible(quiet, false), false);
+
+  const soloed = { ...quiet, solo: true, muted: false };
+  assert.equal(trackAudible(loud, true), false);
+  assert.equal(trackAudible(soloed, true), true);
+});
+
+test('lip-sync audio is placed automatically and linked to its shot', () => {
+  const talking = [{
+    id: 'sc',
+    shots: [
+      { id: 'sh1', name: 'A', selectedVideo: 'assets/a.mp4', lipSyncAudio: 'assets/vo.mp3' },
+      { id: 'sh2', name: 'B', selectedVideo: 'assets/b.mp4' }
+    ]
+  }];
+  const clips = deriveVideoClips(talking);
+  const audio = deriveAudioClipsForShots(talking, clips);
+
+  assert.equal(audio.length, 1);
+  assert.equal(audio[0].link.clipId, clips[0].id);
+  assert.equal(resolveClipSource(audio[0], talking).path, 'assets/vo.mp3');
 });
 
 // --- project settings -------------------------------------------------------

@@ -202,6 +202,9 @@ export function normalizeImportedShotList(raw) {
     seenTags.add(key);
 
     const images = Array.isArray(entry.images) ? entry.images.filter(p => typeof p === 'string') : [];
+    const inputImages = Array.isArray(entry.inputImages)
+      ? entry.inputImages.filter(p => typeof p === 'string' && images.includes(p))
+      : [];
     assets.push({
       id: makeId('asset'),
       tag,
@@ -209,7 +212,8 @@ export function normalizeImportedShotList(raw) {
       name: asString(entry.name, tag),
       description: asString(entry.description),
       images,
-      primaryImage: asString(entry.primaryImage) || images[0] || null
+      primaryImage: asString(entry.primaryImage) || images[0] || null,
+      inputImages
     });
   });
 
