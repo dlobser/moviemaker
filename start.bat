@@ -28,6 +28,35 @@ if errorlevel 1 (
   exit /b 1
 )
 
+REM Vite 8 / rolldown need node ^20.19.0 or >=22.12.0. On anything older npm
+REM silently skips rolldown's native binding (it is an optional dependency with
+REM an engines field), the install "succeeds", and then `vite` dies on startup
+REM complaining about a missing native binding. Catch it here instead.
+set "NODE_MAJOR="
+set "NODE_MINOR="
+for /f "tokens=1,2 delims=v." %%a in ('node -v') do (
+  set "NODE_MAJOR=%%a"
+  set "NODE_MINOR=%%b"
+)
+set "NODE_OK="
+if defined NODE_MAJOR (
+  if %NODE_MAJOR% GEQ 23 set "NODE_OK=1"
+  if %NODE_MAJOR% EQU 22 if %NODE_MINOR% GEQ 12 set "NODE_OK=1"
+  if %NODE_MAJOR% EQU 20 if %NODE_MINOR% GEQ 19 set "NODE_OK=1"
+) else (
+  REM Could not read the version. Let it through rather than block on a guess.
+  set "NODE_OK=1"
+)
+if not defined NODE_OK (
+  for /f %%v in ('node -v') do echo   [X] Node.js %%v is too old to build the frontend.
+  echo       Vite needs 20.19+ or 22.12+. Install a current LTS from
+  echo       https://nodejs.org, then delete frontend\node_modules and run
+  echo       this again so the missing native binding gets installed.
+  echo.
+  pause
+  exit /b 1
+)
+
 where ffmpeg >nul 2>nul
 if errorlevel 1 (
   echo   [!] FFmpeg is not on your PATH.
@@ -44,8 +73,15 @@ if not exist "node_modules\" (
   if errorlevel 1 goto :installfailed
 )
 
+REM The binding check is not redundant with the node_modules check: an install
+REM done on too-old a Node leaves node_modules in place but without rolldown's
+REM native binding, so "already installed" would otherwise stick forever.
 if not exist "frontend\node_modules\" (
   echo   Installing frontend dependencies, this only happens once...
+  call npm --prefix frontend install
+  if errorlevel 1 goto :installfailed
+) else if not exist "frontend\node_modules\@rolldown\binding-win32-*" (
+  echo   Frontend dependencies are incomplete, reinstalling...
   call npm --prefix frontend install
   if errorlevel 1 goto :installfailed
 )
