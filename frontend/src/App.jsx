@@ -73,9 +73,7 @@ import {
 import {
   REFERENCE_SCHEMA_VERSION,
   assignReferences,
-  enabledAssetReferencePaths,
   enabledReferencePaths,
-  resolveAssetReferences,
   migrateReferenceState,
   normalizeReference,
   pruneAssignments,
@@ -421,8 +419,7 @@ export default function App() {
     setReferenceImages(migratedRefs.references);
     setRefAssignments(pruneAssignments(migratedRefs.assignments, {
       references: migratedRefs.references,
-      scenes: loadedScenes,
-      assetLibrary: state.assetLibrary || []
+      scenes: loadedScenes
     }));
     setAssetLibrary(state.assetLibrary || []);
     setPromptSnippets(state.promptSnippets || promptSnippets);
@@ -1345,10 +1342,10 @@ export default function App() {
 
   const openAssetEditor = (asset = null) => {
     setAssetEditor(asset
-      ? { ...asset, images: [...(asset.images || [])], inputImages: assetInputImages(asset), refExclusions: [...(asset.refExclusions || [])] }
+      ? { ...asset, images: [...(asset.images || [])], inputImages: assetInputImages(asset) }
       : {
         tag: '', type: 'character', name: '', description: '',
-        images: [], primaryImage: null, inputImages: [], refExclusions: [],
+        images: [], primaryImage: null, inputImages: [],
         imagePrompt: '', imageModel: null, imageResolution: null,
         applyGlobalPrompts: false
       });
@@ -1401,12 +1398,6 @@ export default function App() {
     const pool = draft.images || [];
     const picked = assetInputImages(draft).filter(p => pool.includes(p));
 
-    // The asset's own ticked images come first, then anything the board aims at
-    // this asset (or at every asset). Order matters because the model's input
-    // capacity trims the tail: a shared style board must never displace the
-    // character's own previous artwork, which is the thing being kept consistent.
-    const boardPaths = assetReferencePaths(draft).filter(p => !picked.includes(p));
-
     // Three-way, because reference art and film frames want opposite treatment.
     // 'asset' is the default: the dedicated asset pre/post, which is usually
     // neutral. 'image' borrows the film's own grade language, which is only
@@ -1424,7 +1415,7 @@ export default function App() {
       prePrompt: wraps[0],
       postPrompt: wraps[1],
       assetLibrary: others,
-      primaryImagePaths: [...picked, ...boardPaths],
+      primaryImagePaths: picked,
       attachTaggedImages: true,
       type: 'image',
       modelId
@@ -1729,10 +1720,7 @@ export default function App() {
       imagePrompt: assetEditor.imagePrompt || '',
       imageModel: assetEditor.imageModel || null,
       imageResolution: assetEditor.imageResolution || null,
-      promptWrap: assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset'),
-      // Board references this asset opts out of, despite them being aimed at
-      // every asset.
-      refExclusions: assetEditor.refExclusions || []
+      promptWrap: assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset')
     };
 
     setAssetLibrary(prev => (
@@ -3087,33 +3075,41 @@ export default function App() {
     assignments: refAssignments
   });
 
-  /** The board references in play when this asset's own artwork is generated. */
-  const assetReferenceEntries = (asset) => resolveAssetReferences({
-    asset,
-    references: referenceImages,
-    assignments: refAssignments
-  });
+  /**
+   * Copy board references into assets' own image pools, ticked to send.
+   *
+   * A push, not a link. Once the paths are in the asset's `images` it owns
+   * them — the existing per-image checkbox unticks one, the ✕ deletes it — with
+   * no trip back to the board. Re-running it on images an asset already has
+   * simply re-ticks them, which makes it double as "switch these back on".
+   */
+  const handleAddReferencesToAssets = (refIds, assetIds) => {
+    const paths = referenceImages.filter(r => refIds.includes(r.id)).map(r => r.path).filter(Boolean);
+    if (paths.length === 0) return;
 
-  const assetReferencePaths = (asset) => enabledAssetReferencePaths({
-    asset,
-    references: referenceImages,
-    assignments: refAssignments
-  });
+    const targets = new Set(assetIds);
+    const applyTo = (asset) => {
+      const images = [...new Set([...(asset.images || []), ...paths])];
+      return {
+        ...asset,
+        images,
+        primaryImage: asset.primaryImage || images[0] || null,
+        // Ticked on arrival. Capacity is not clamped here: the asset editor
+        // already flags an over-full selection and shows where the model's cut
+        // falls, and silently dropping some of what you just added would be
+        // less obvious than showing it and saying so.
+        inputImages: [...new Set([...assetInputImages(asset), ...paths])]
+      };
+    };
 
-  /** Same per-target send control as a shot, for an asset. */
-  const toggleAssetReferenceEntry = (asset, entry) => {
-    if (entry.inherited) {
-      // Assigned to every asset — opting out is this asset's own decision, so
-      // it is recorded on the asset rather than by detaching it for all of them.
-      const current = asset.refExclusions || [];
-      const next = current.includes(entry.ref.id)
-        ? current.filter(id => id !== entry.ref.id)
-        : [...current, entry.ref.id];
-      setAssetEditor(prev => (prev ? { ...prev, refExclusions: next } : prev));
-      setAssetLibrary(prev => prev.map(a => (a.id === asset.id ? { ...a, refExclusions: next } : a)));
-      return;
-    }
-    setRefAssignments(prev => setEdgeEnabled(prev, entry.edge.id, !entry.enabled));
+    setAssetLibrary(prev => prev.map(asset => (targets.has(asset.id) ? applyTo(asset) : asset)));
+    // Keep an open editor in step rather than letting it save over the change.
+    setAssetEditor(prev => (prev && targets.has(prev.id) ? applyTo(prev) : prev));
+
+    showToast(
+      `${paths.length} image${paths.length === 1 ? '' : 's'} added to ${assetIds.length} asset${assetIds.length === 1 ? '' : 's'}, ticked to send.`,
+      'success'
+    );
   };
 
   const handleRenameAsset = (galleryType, id, newName) => {
@@ -5288,9 +5284,6 @@ export default function App() {
                 const preview = buildAssetPrompt(assetEditor);
                 const capacity = refImageCapacity('image', modelId);
                 const picked = assetInputImages(assetEditor).filter(p => (assetEditor.images || []).includes(p));
-                // Board references aimed at this asset land after the picks
-                // above, so both counts have to be visible to explain the trim.
-                const boardCount = assetReferencePaths(assetEditor).filter(p => !picked.includes(p)).length;
                 const busy = loadingStates[`asset_gen_${assetEditor.id}`];
 
                 return (
@@ -5389,11 +5382,9 @@ export default function App() {
                       ) : (
                         <>
                           <span>
-                            Sending <strong>{picked.length}</strong> picked here
-                            {boardCount > 0 ? <> + <strong>{boardCount}</strong> from the board</> : null}
-                            {' '}of up to <strong>{capacity}</strong> reference image{capacity === 1 ? '' : 's'}.
+                            Sending <strong>{picked.length}</strong> of up to <strong>{capacity}</strong> reference image{capacity === 1 ? '' : 's'}.
                           </span>
-                          {picked.length + boardCount > capacity && (
+                          {picked.length > capacity && (
                             <span style={{ color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                               <AlertTriangle size={12} /> This model reads only the first {capacity}; untick the rest.
                             </span>
@@ -5430,18 +5421,6 @@ export default function App() {
                         Clear
                       </button>
                     </div>
-
-                    {/* Board references aimed at this asset, or at every asset.
-                        Same ticks as a shot: assigned by default, held back per
-                        asset without detaching it for the others. */}
-                    <ReferenceStrip
-                      compact
-                      label="Board references"
-                      entries={assetReferenceEntries(assetEditor)}
-                      capacity={capacity}
-                      onToggleEntry={(entry) => toggleAssetReferenceEntry(assetEditor, entry)}
-                      onOpenPanel={() => { setAssetEditor(null); setReferencePanelOpen(true); }}
-                    />
 
                     <div>
                       <label className="form-label" style={{ fontSize: '0.75rem' }}>
@@ -6080,6 +6059,7 @@ export default function App() {
           busy={loadingStates.ref_upload || loadingStates.project_images}
           onClose={() => setReferencePanelOpen(false)}
           onApplyAssignments={handleApplyAssignments}
+          onAddToAssets={handleAddReferencesToAssets}
           onUnassign={handleUnassignReferences}
           onUpdateReferences={handleUpdateReferences}
           onDeleteReferences={handleDeleteReferences}

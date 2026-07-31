@@ -459,6 +459,18 @@
   color: var(--accent);
 }
 
+/* Assets hold a copy, not a link, so they are reported here but removed in the
+   asset editor — hence a chip with no ✕. */
+.reference-inspector-static {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px dashed var(--border-light);
+  color: var(--text-dim);
+  font-size: 0.68rem;
+}
+
 /* --- selection action bar ----------------------------------------------- */
 
 .reference-actionbar {

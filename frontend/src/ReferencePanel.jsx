@@ -13,6 +13,7 @@ import {
   Tag as TagIcon,
   Trash2,
   Upload,
+  Users,
   X
 } from 'lucide-react';
 
@@ -24,6 +25,7 @@ import {
   REFERENCE_ROLES,
   SORT_MODES,
   allReferenceTags,
+  assetsContaining,
   assignmentStateFor,
   filterReferences,
   groupReferences,
@@ -52,6 +54,7 @@ export default function ReferencePanel({
   activeShotId,
   onClose,
   onApplyAssignments,
+  onAddToAssets,
   onUnassign,
   onUpdateReferences,
   onDeleteReferences,
@@ -71,6 +74,7 @@ export default function ReferencePanel({
   const [sortBy, setSortBy] = useState('added');
   const [collapsedGroups, setCollapsedGroups] = useState({});
   const [assignTarget, setAssignTarget] = useState(null); // null | { mode: 'add'|'replace' }
+  const [assetPush, setAssetPush] = useState(false);
   const [tagDraft, setTagDraft] = useState('');
   const [inspectId, setInspectId] = useState(null);
   const [dragOver, setDragOver] = useState(false);
@@ -342,6 +346,15 @@ export default function ReferencePanel({
               </button>
             </div>
 
+            <button
+              className="btn btn-primary"
+              disabled={assetLibrary.length === 0}
+              onClick={() => setAssetPush(true)}
+              title="Copy these into an asset's own images, ticked to send"
+            >
+              <Users size={13} /> Add to assets…
+            </button>
+
             <label className="mini-field">
               <span>Asset</span>
               <select
@@ -353,9 +366,9 @@ export default function ReferencePanel({
                   e.target.value = '';
                 }}
               >
-                <option value="">Link…</option>
+                <option value="">Depicts…</option>
                 <option value="__new">New asset from these…</option>
-                <option value="__none">Unlink</option>
+                <option value="__none">Nothing</option>
                 {assetLibrary.map(asset => <option key={asset.id} value={asset.id}>&lt;{asset.tag}&gt;</option>)}
               </select>
             </label>
@@ -396,7 +409,6 @@ export default function ReferencePanel({
       {assignTarget && (
         <AssignDialog
           scenes={scenes}
-          assetLibrary={assetLibrary}
           assignments={assignments}
           selectedIds={selection.selectedIds}
           activeSceneId={activeSceneId}
@@ -406,6 +418,18 @@ export default function ReferencePanel({
           onConfirm={(toAssign, toUnassign, options) => {
             onApplyAssignments(selection.selectedIds, toAssign, toUnassign, options);
             setAssignTarget(null);
+          }}
+        />
+      )}
+
+      {assetPush && (
+        <AddToAssetsDialog
+          assetLibrary={assetLibrary}
+          refs={selectedRefs}
+          onCancel={() => setAssetPush(false)}
+          onConfirm={(assetIds) => {
+            onAddToAssets(selection.selectedIds, assetIds);
+            setAssetPush(false);
           }}
         />
       )}
@@ -423,8 +447,10 @@ function ReferenceCard({ reference, selected, usage, scenes, assetLibrary, onCli
     if (scene) scopeBits.push(scene.name);
   });
   if (usage.shotIds.length > 0) scopeBits.push(`${usage.shotIds.length} shot${usage.shotIds.length === 1 ? '' : 's'}`);
-  if (usage.allAssets) scopeBits.push('all assets');
-  else if (usage.assetIds.length > 0) scopeBits.push(`${usage.assetIds.length} asset${usage.assetIds.length === 1 ? '' : 's'}`);
+  // Asset membership is read from the pools, not from an edge, so this stays
+  // truthful when an image is deleted inside the asset editor.
+  const inAssets = assetsContaining(assetLibrary, reference.path);
+  if (inAssets.length > 0) scopeBits.push(`${inAssets.length} asset${inAssets.length === 1 ? '' : 's'}`);
 
   return (
     <div
@@ -548,17 +574,13 @@ function ReferenceInspector({ reference, assetLibrary, scenes, assignments, onCh
             </button>
           ) : null;
         })}
-        {usage.allAssets && (
-          <button onClick={() => onUnassignFrom({ scope: 'asset', targetId: null })}>Every asset <X size={10} /></button>
-        )}
-        {usage.assetIds.map(id => {
-          const asset = assetLibrary.find(a => a.id === id);
-          return asset ? (
-            <button key={id} onClick={() => onUnassignFrom({ scope: 'asset', targetId: id })}>
-              &lt;{asset.tag}&gt; <X size={10} />
-            </button>
-          ) : null;
-        })}
+        {/* Assets are listed, not removable from here: the copy lives in the
+            asset's own pool, and taking it out is a click on that pool's ✕. */}
+        {assetsContaining(assetLibrary, reference.path).map(asset => (
+          <span key={asset.id} className="reference-inspector-static" title="In this asset's images — remove it there">
+            &lt;{asset.tag}&gt;
+          </span>
+        ))}
       </div>
     </div>
   );
@@ -569,7 +591,7 @@ function ReferenceInspector({ reference, assetLibrary, scenes, assignments, onCh
  * project, scenes and shots, then commit once.
  */
 function AssignDialog({
-  scenes, assetLibrary = [], assignments, selectedIds,
+  scenes, assignments, selectedIds,
   activeSceneId, activeShotId, count, onCancel, onConfirm
 }) {
   // Open showing what is already true. A write-only form looked identical
@@ -581,14 +603,11 @@ function AssignDialog({
   const [mode, setMode] = useState('add');
   const [live, setLive] = useState(true);
   const [expanded, setExpanded] = useState(() => (activeSceneId ? { [activeSceneId]: true } : {}));
-  const [assetsOpen, setAssetsOpen] = useState(false);
 
   const every = [
     { scope: 'project', targetId: null },
     ...scenes.map(scene => ({ scope: 'scene', targetId: scene.id })),
-    ...scenes.flatMap(scene => (scene.shots || []).map(shot => ({ scope: 'shot', targetId: shot.id }))),
-    { scope: 'asset', targetId: null },
-    ...assetLibrary.map(asset => ({ scope: 'asset', targetId: asset.id }))
+    ...scenes.flatMap(scene => (scene.shots || []).map(shot => ({ scope: 'shot', targetId: shot.id })))
   ];
 
   const stateOf = (scope, targetId) => state[targetKey(scope, targetId)] || 'none';
@@ -691,41 +710,6 @@ function AssignDialog({
               );
             })}
 
-            {/* Assets are a separate kind of target from the timeline: these
-                references ride along when the asset's own artwork is generated,
-                which is how one style board keeps every character sheet
-                consistent. */}
-            {assetLibrary.length > 0 && (() => {
-              const everyAssets = stateOf('asset', null) === 'all';
-              const attached = assetLibrary.filter(a => stateOf('asset', a.id) === 'all').length;
-
-              return (
-                <div className="assign-scene">
-                  <TriRow
-                    state={stateOf('asset', null)}
-                    onToggle={() => cycle('asset', null)}
-                    disclosure={assetsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                    onDisclosure={() => setAssetsOpen(v => !v)}
-                    label={<strong>Every asset</strong>}
-                    hint={everyAssets ? 'on — incl. ones you add later' : (attached > 0 ? `${attached}/${assetLibrary.length} picked` : 'incl. ones you add later')}
-                  />
-
-                  {assetsOpen && assetLibrary.map(asset => (
-                    <TriRow
-                      key={asset.id}
-                      indent
-                      state={everyAssets ? 'all' : stateOf('asset', asset.id)}
-                      // Covered by the blanket row, so ticking one individually
-                      // would be a no-op that looks like it did something.
-                      disabled={everyAssets}
-                      onToggle={() => cycle('asset', asset.id)}
-                      label={<span>&lt;{asset.tag}&gt;{asset.name && asset.name !== asset.tag ? ` — ${asset.name}` : ''}</span>}
-                      hint={everyAssets ? 'via Every asset' : undefined}
-                    />
-                  ))}
-                </div>
-              );
-            })()}
           </div>
 
           <div className="assign-options">
@@ -782,6 +766,69 @@ function AssignDialog({
  * so it is obvious that unticking one here is a decision about this shot rather
  * than about the scene it came from.
  */
+/**
+ * Copy a selection into assets' own image pools, ticked to send.
+ *
+ * Deliberately a one-way push rather than a live link. Once the images are in
+ * the asset they belong to it: untick them, reorder them or delete them right
+ * there, without coming back here. Re-running it on images the asset already
+ * has just re-ticks them, so it doubles as "switch these back on".
+ */
+function AddToAssetsDialog({ assetLibrary, refs, onCancel, onConfirm }) {
+  const [picked, setPicked] = useState([]);
+  const all = picked.length === assetLibrary.length && assetLibrary.length > 0;
+
+  const toggle = (id) => setPicked(prev => (prev.includes(id) ? prev.filter(v => v !== id) : [...prev, id]));
+
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal-window assign-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>Add {refs.length} image{refs.length === 1 ? '' : 's'} to assets</h2>
+          <button className="btn btn-secondary icon-btn" onClick={onCancel}><X size={15} /></button>
+        </div>
+
+        <div className="modal-body">
+          <p className="assign-intro">
+            These are copied into each asset's own <strong>Reference Images</strong>, ticked to send.
+            After that the asset owns them — untick or delete them in the asset editor. Images an asset
+            already has are simply re-ticked.
+          </p>
+
+          <div className="assign-quick">
+            <button className="btn btn-secondary" onClick={() => setPicked(all ? [] : assetLibrary.map(a => a.id))}>
+              {all ? 'Select none' : `Select all ${assetLibrary.length}`}
+            </button>
+          </div>
+
+          <div className="assign-tree">
+            {assetLibrary.map(asset => {
+              const already = refs.filter(ref => (asset.images || []).includes(ref.path)).length;
+              return (
+                <label key={asset.id} className="assign-row">
+                  <input type="checkbox" checked={picked.includes(asset.id)} onChange={() => toggle(asset.id)} />
+                  <span>&lt;{asset.tag}&gt;{asset.name && asset.name !== asset.tag ? ` — ${asset.name}` : ''}</span>
+                  <em>
+                    {(asset.images || []).length} image{(asset.images || []).length === 1 ? '' : 's'}
+                    {already > 0 ? ` · ${already} already here` : ''}
+                  </em>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
+          <button className="btn btn-primary" disabled={picked.length === 0} onClick={() => onConfirm(picked)}>
+            <Check size={14} /> Add to {picked.length} asset{picked.length === 1 ? '' : 's'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /**
  * One row of the assign tree. `state` is 'all' | 'some' | 'none' — 'some' shows
  * as a half-filled box, which is the only honest rendering when a multi-select

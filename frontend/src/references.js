@@ -41,19 +41,16 @@ export const REFERENCE_ROLES = [
   { id: 'composition', label: 'Composition', hint: 'Framing, blocking, camera' }
 ];
 
-// 'asset' targets the asset library rather than the timeline: a style board you
-// want every character sheet generated against. A null targetId on it means
-// *every* asset, including ones created later — the same open-ended promise
-// 'project' makes about shots.
+// Assets are deliberately NOT a scope here.
 //
-// Project scope deliberately does not reach assets. Reference artwork wants
-// neutral treatment (which is why assets have their own pre/post prompts), so
-// the film's grade leaking into every character sheet would be a silent wrong
-// answer rather than a convenience.
-export const REFERENCE_SCOPES = ['project', 'scene', 'shot', 'asset'];
-
-/** Scopes whose targetId may be null, meaning "everything of that kind". */
-const OPEN_ENDED_SCOPES = new Set(['project', 'asset']);
+// A shot's references are a live relationship — assign once, and the shot keeps
+// resolving them. An asset's are not: an asset already owns a pool of images
+// with its own per-image send ticks, and that pool is where people expect to
+// manage them. Modelling the board→asset relationship as a live edge produced
+// two parallel lists in the asset editor, and images the asset could mute but
+// not remove without going back to the board. So the board *pushes* into the
+// pool instead — see `assetsContaining` and the push helper in App.jsx.
+export const REFERENCE_SCOPES = ['project', 'scene', 'shot'];
 
 export function kindLabel(kindId) {
   return REFERENCE_KINDS.find(k => k.id === kindId)?.label || 'Other';
@@ -149,12 +146,12 @@ export function migrateReferenceState(state = {}) {
 
 function normalizeAssignment(edge) {
   if (!edge || !edge.refId || !REFERENCE_SCOPES.includes(edge.scope)) return null;
-  if (!OPEN_ENDED_SCOPES.has(edge.scope) && !edge.targetId) return null;
+  if (edge.scope !== 'project' && !edge.targetId) return null;
   return {
     id: edge.id || makeEdgeId(),
     refId: edge.refId,
     scope: edge.scope,
-    targetId: edge.scope === 'project' ? null : (edge.targetId || null),
+    targetId: edge.scope === 'project' ? null : edge.targetId,
     role: REFERENCE_ROLES.some(r => r.id === edge.role) ? edge.role : 'style',
     enabled: edge.enabled !== false,
     order: Number.isFinite(edge.order) ? edge.order : 0
@@ -165,13 +162,24 @@ function normalizeAssignment(edge) {
 
 /**
  * A stable identity for one assignment target, so the assign dialog and the
- * edge list agree on what "the same target" means. `asset` with no targetId is
- * the open-ended every-asset target and gets its own key.
+ * edge list agree on what "the same target" means.
  */
 export function targetKey(scope, targetId = null) {
   if (scope === 'project') return 'project';
-  if (scope === 'asset' && !targetId) return 'asset:all';
   return `${scope}:${targetId}`;
+}
+
+/**
+ * The assets whose own image pool contains this reference.
+ *
+ * Board→asset membership is derived rather than stored: pushing a reference
+ * into an asset copies its path into that asset's pool, so the pool itself is
+ * the record. That keeps one source of truth and means deleting the image from
+ * the asset actually removes it, instead of muting a link the asset cannot cut.
+ */
+export function assetsContaining(assetLibrary = [], path) {
+  if (!path) return [];
+  return assetLibrary.filter(asset => (asset.images || []).includes(path));
 }
 
 /**
@@ -210,8 +218,6 @@ export function usageOf(assignments = [], refId) {
     project: edges.some(e => e.scope === 'project'),
     sceneIds: [...new Set(edges.filter(e => e.scope === 'scene').map(e => e.targetId))],
     shotIds: [...new Set(edges.filter(e => e.scope === 'shot').map(e => e.targetId))],
-    allAssets: edges.some(e => e.scope === 'asset' && !e.targetId),
-    assetIds: [...new Set(edges.filter(e => e.scope === 'asset' && e.targetId).map(e => e.targetId))],
     total: edges.length
   };
 }
@@ -292,54 +298,6 @@ export function resolveSceneReferences({ scene, references = [], assignments = [
   collect('scene', scene.id, false);
   collect('project', null, true);
   return entries;
-}
-
-/**
- * The references that ride along when this asset's own artwork is generated.
- *
- * Same shape and same rules as a shot: the asset's own assignments first, then
- * the ones aimed at every asset, and an asset opts out of an all-assets
- * reference through its own `refExclusions` rather than by detaching it for
- * everybody.
- */
-export function resolveAssetReferences({ asset, references = [], assignments = [] }) {
-  if (!asset) return [];
-
-  const byId = new Map(references.map(ref => [ref.id, ref]));
-  const exclusions = new Set(asset.refExclusions || []);
-  const inheritsAtAll = asset.useInheritedRefs !== false;
-  const entries = [];
-  const seen = new Set();
-
-  const collect = (targetId, inherited) => {
-    edgesFor(assignments, 'asset', targetId).forEach(edge => {
-      const ref = byId.get(edge.refId);
-      if (!ref || seen.has(ref.id)) return;
-      seen.add(ref.id);
-
-      const excluded = inherited && exclusions.has(ref.id);
-      entries.push({
-        ref,
-        edge,
-        scope: 'asset',
-        inherited,
-        role: edge.role,
-        excluded,
-        enabled: edge.enabled !== false && !excluded && (!inherited || inheritsAtAll)
-      });
-    });
-  };
-
-  collect(asset.id, false);
-  collect(null, true);   // assigned to every asset
-  return entries;
-}
-
-/** Just the paths an asset's own generation should receive, in send order. */
-export function enabledAssetReferencePaths(args) {
-  return resolveAssetReferences(args)
-    .filter(entry => entry.enabled && entry.ref.path)
-    .map(entry => entry.ref.path);
 }
 
 // --- ASSIGNMENT MUTATIONS --------------------------------------------------
@@ -423,19 +381,15 @@ export function reorderEdge(assignments, edgeId, direction) {
 }
 
 /** Drop every edge for references or targets that no longer exist. */
-export function pruneAssignments(assignments = [], { references = [], scenes = [], assetLibrary = [] } = {}) {
+export function pruneAssignments(assignments = [], { references = [], scenes = [] } = {}) {
   const refIds = new Set(references.map(r => r.id));
   const sceneIds = new Set(scenes.map(s => s.id));
   const shotIds = new Set(scenes.flatMap(s => (s.shots || []).map(shot => shot.id)));
-  const assetIds = new Set(assetLibrary.map(a => a.id));
 
   return assignments.filter(edge => {
     if (!refIds.has(edge.refId)) return false;
     if (edge.scope === 'scene') return sceneIds.has(edge.targetId);
     if (edge.scope === 'shot') return shotIds.has(edge.targetId);
-    // A null targetId is the open-ended "every asset" edge and has nothing to
-    // dangle from, so it always survives.
-    if (edge.scope === 'asset') return !edge.targetId || assetIds.has(edge.targetId);
     return true;
   });
 }
@@ -525,24 +479,17 @@ export function groupReferences(references, mode, { assignments = [], scenes = [
   if (mode === 'asset') {
     // Two different relationships land in this view, and both matter: a
     // reference can *depict* an asset (the assetId link, shown as the card's
-    // tag badge) or be *sent when generating* one (an asset-scope assignment).
-    // Hiding either would make the view lie about where an image is in play.
+    // tag badge) or have been pushed into one's image pool. Membership is read
+    // from the pools rather than stored, so an image deleted inside the asset
+    // editor stops appearing here with no bookkeeping.
     references.forEach(ref => {
-      const usage = usageOf(assignments, ref.id);
-      let placed = false;
+      const related = new Map();
+      assetsContaining(assetLibrary, ref.path).forEach(asset => related.set(asset.id, asset));
+      const linked = assetLibrary.find(a => a.id === ref.assetId);
+      if (linked) related.set(linked.id, linked);
 
-      if (usage.allAssets) {
-        push('asset:all', 'Every asset', ref);
-        placed = true;
-      }
-
-      const relatedIds = new Set([...usage.assetIds, ...(ref.assetId ? [ref.assetId] : [])]);
-      relatedIds.forEach(assetId => {
-        const asset = assetLibrary.find(a => a.id === assetId);
-        if (asset) { push(`asset:${asset.id}`, `<${asset.tag}>`, ref); placed = true; }
-      });
-
-      if (!placed) orphans.push(ref);
+      if (related.size === 0) return orphans.push(ref);
+      related.forEach(asset => push(`asset:${asset.id}`, `<${asset.tag}>`, ref));
     });
   }
 

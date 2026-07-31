@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 
 import {
   REFERENCE_SCHEMA_VERSION,
+  assetsContaining,
   assignReferences,
   assignmentStateFor,
   edgesFor,
-  enabledAssetReferencePaths,
   enabledReferencePaths,
   filterReferences,
   groupReferences,
@@ -219,9 +219,7 @@ test('unassigning from one target leaves the others intact', () => {
   ]);
   const next = unassignReferences(edges, ['r1'], [{ scope: 'shot', targetId: 'sh1' }]);
 
-  assert.deepEqual(usageOf(next, 'r1'), {
-    project: true, sceneIds: [], shotIds: [], allAssets: false, assetIds: [], total: 1
-  });
+  assert.deepEqual(usageOf(next, 'r1'), { project: true, sceneIds: [], shotIds: [], total: 1 });
 });
 
 test('reordering swaps send priority within a target only', () => {
@@ -244,114 +242,97 @@ test('deleting a shot prunes its edges but spares project-wide ones', () => {
   assert.ok(!next.some(e => e.targetId === 'gone'));
 });
 
-// --- ASSET SCOPE -----------------------------------------------------------
+// --- PUSHING REFERENCES INTO ASSETS ----------------------------------------
+//
+// Mirrors handleAddReferencesToAssets in App.jsx. Assets take a *copy* rather
+// than a live link, so that once an image is in an asset it can be unticked or
+// deleted there without going back to the board.
 
-const assets = [
-  { id: 'a1', tag: 'Ralph' },
-  { id: 'a2', tag: 'Garage' },
-  { id: 'a3', tag: 'Wrench' }
-];
-const assetRefs = [ref('styleBoard'), ref('ralphOwn')];
+function pushIntoAsset(asset, paths) {
+  const images = [...new Set([...(asset.images || []), ...paths])];
+  return {
+    ...asset,
+    images,
+    primaryImage: asset.primaryImage || images[0] || null,
+    inputImages: [...new Set([...(asset.inputImages || []), ...paths])]
+  };
+}
 
-test('one style reference reaches every asset in a single assignment', () => {
-  const edges = assignReferences([], ['styleBoard'], [{ scope: 'asset', targetId: null }]);
-  assert.equal(edges.length, 1, 'one edge, not one per asset');
+const emptyAsset = { id: 'a1', tag: 'Ralph', images: [], primaryImage: null, inputImages: [] };
 
-  assets.forEach(asset => {
-    assert.deepEqual(
-      enabledAssetReferencePaths({ asset, references: assetRefs, assignments: edges }),
-      ['assets/styleBoard.png'],
-      `<${asset.tag}> receives it`
-    );
+test('pushed references land in the asset’s pool already ticked to send', () => {
+  const next = pushIntoAsset(emptyAsset, ['assets/style.png', 'assets/mood.png']);
+
+  assert.deepEqual(next.images, ['assets/style.png', 'assets/mood.png']);
+  assert.deepEqual(next.inputImages, ['assets/style.png', 'assets/mood.png'], 'checked on arrival');
+  assert.equal(next.primaryImage, 'assets/style.png', 'an asset with no primary gets one');
+});
+
+test('pushing does not disturb images the asset already had', () => {
+  const existing = { ...emptyAsset, images: ['assets/own.png'], primaryImage: 'assets/own.png', inputImages: ['assets/own.png'] };
+  const next = pushIntoAsset(existing, ['assets/style.png']);
+
+  assert.deepEqual(next.images, ['assets/own.png', 'assets/style.png']);
+  assert.equal(next.primaryImage, 'assets/own.png', 'an existing primary is kept');
+  assert.deepEqual(next.inputImages, ['assets/own.png', 'assets/style.png']);
+});
+
+test('pushing the same image twice neither duplicates it nor loses the tick', () => {
+  const once = pushIntoAsset(emptyAsset, ['assets/style.png']);
+  const twice = pushIntoAsset(once, ['assets/style.png']);
+
+  assert.deepEqual(twice.images, ['assets/style.png']);
+  assert.deepEqual(twice.inputImages, ['assets/style.png']);
+});
+
+test('re-pushing an image the asset unticked switches it back on', () => {
+  const added = pushIntoAsset(emptyAsset, ['assets/style.png']);
+  const unticked = { ...added, inputImages: [] };          // the user unticked it
+  const repushed = pushIntoAsset(unticked, ['assets/style.png']);
+
+  assert.deepEqual(repushed.images, ['assets/style.png'], 'still only one copy');
+  assert.deepEqual(repushed.inputImages, ['assets/style.png'], 'ticked again');
+});
+
+test('an image deleted inside the asset stays gone until pushed again', () => {
+  const added = pushIntoAsset(emptyAsset, ['assets/style.png']);
+  const deleted = { ...added, images: [], inputImages: [], primaryImage: null };
+
+  assert.deepEqual(assetsContaining([deleted], 'assets/style.png'), [], 'the board stops claiming it is there');
+  assert.deepEqual(pushIntoAsset(deleted, ['assets/style.png']).images, ['assets/style.png']);
+});
+
+test('board cards read asset membership straight off the pools', () => {
+  const library = [
+    { id: 'a1', tag: 'Ralph', images: ['assets/style.png', 'assets/ralph.png'] },
+    { id: 'a2', tag: 'Garage', images: ['assets/style.png'] },
+    { id: 'a3', tag: 'Wrench', images: [] }
+  ];
+
+  assert.deepEqual(assetsContaining(library, 'assets/style.png').map(a => a.tag), ['Ralph', 'Garage']);
+  assert.deepEqual(assetsContaining(library, 'assets/ralph.png').map(a => a.tag), ['Ralph']);
+  assert.deepEqual(assetsContaining(library, 'assets/nowhere.png'), []);
+});
+
+test('assets are not an assignment scope, so a stray asset edge is discarded', () => {
+  const { assignments } = migrateReferenceState({
+    referenceImages: [{ id: 'r1', path: 'assets/r1.png', name: 'x' }],
+    refAssignments: [{ refId: 'r1', scope: 'asset', targetId: 'a1', enabled: true, order: 0 }],
+    referenceSchemaVersion: REFERENCE_SCHEMA_VERSION
   });
-});
-
-test('an all-assets reference also covers assets created later', () => {
-  const edges = assignReferences([], ['styleBoard'], [{ scope: 'asset', targetId: null }]);
-  const brandNew = { id: 'a99', tag: 'LaterCharacter' };
-
-  assert.deepEqual(
-    enabledAssetReferencePaths({ asset: brandNew, references: assetRefs, assignments: edges }),
-    ['assets/styleBoard.png']
-  );
-});
-
-test('an asset’s own reference is sent before a shared one, surviving a capacity trim', () => {
-  let edges = assignReferences([], ['styleBoard'], [{ scope: 'asset', targetId: null }]);
-  edges = assignReferences(edges, ['ralphOwn'], [{ scope: 'asset', targetId: 'a1' }]);
-
-  assert.deepEqual(
-    enabledAssetReferencePaths({ asset: assets[0], references: assetRefs, assignments: edges }),
-    ['assets/ralphOwn.png', 'assets/styleBoard.png']
-  );
-});
-
-test('one asset can opt out of a shared reference without affecting the others', () => {
-  const edges = assignReferences([], ['styleBoard'], [{ scope: 'asset', targetId: null }]);
-  const picky = { ...assets[0], refExclusions: ['styleBoard'] };
-
-  assert.deepEqual(enabledAssetReferencePaths({ asset: picky, references: assetRefs, assignments: edges }), []);
-  assert.deepEqual(
-    enabledAssetReferencePaths({ asset: assets[1], references: assetRefs, assignments: edges }),
-    ['assets/styleBoard.png'],
-    'the other assets still get it'
-  );
-  assert.ok(!isUnassigned(edges, 'styleBoard'), 'and it stays assigned');
-});
-
-test('unticking an asset-specific reference stops the upload but keeps the assignment', () => {
-  const edges = assignReferences([], ['ralphOwn'], [{ scope: 'asset', targetId: 'a1' }]);
-  const next = setEdgeEnabled(edges, edges[0].id, false);
-
-  assert.deepEqual(enabledAssetReferencePaths({ asset: assets[0], references: assetRefs, assignments: next }), []);
-  assert.equal(usageOf(next, 'ralphOwn').assetIds.length, 1);
-});
-
-test('asset scope does not leak into shots, and project scope does not leak into assets', () => {
-  let edges = assignReferences([], ['styleBoard'], [{ scope: 'asset', targetId: null }]);
-  edges = assignReferences(edges, ['ralphOwn'], [{ scope: 'project' }]);
-
-  assert.deepEqual(
-    enabledReferencePaths({ shot, scene, references: assetRefs, assignments: edges }),
-    ['assets/ralphOwn.png'],
-    'a shot sees the project reference but not the asset one'
-  );
-  assert.deepEqual(
-    enabledAssetReferencePaths({ asset: assets[0], references: assetRefs, assignments: edges }),
-    ['assets/styleBoard.png'],
-    'an asset sees the asset reference but not the project one'
-  );
-});
-
-test('usage reports all-assets separately from individually picked assets', () => {
-  let edges = assignReferences([], ['styleBoard'], [{ scope: 'asset', targetId: null }]);
-  edges = assignReferences(edges, ['ralphOwn'], [{ scope: 'asset', targetId: 'a1' }, { scope: 'asset', targetId: 'a2' }]);
-
-  assert.equal(usageOf(edges, 'styleBoard').allAssets, true);
-  assert.deepEqual(usageOf(edges, 'styleBoard').assetIds, []);
-  assert.equal(usageOf(edges, 'ralphOwn').allAssets, false);
-  assert.deepEqual(usageOf(edges, 'ralphOwn').assetIds, ['a1', 'a2']);
-});
-
-test('deleting an asset prunes its edges but spares the all-assets one', () => {
-  let edges = assignReferences([], ['styleBoard'], [{ scope: 'asset', targetId: null }]);
-  edges = assignReferences(edges, ['styleBoard'], [{ scope: 'asset', targetId: 'gone' }]);
-
-  const next = pruneAssignments(edges, { references: [ref('styleBoard')], scenes: [], assetLibrary: assets });
-  assert.equal(next.length, 1);
-  assert.equal(next[0].targetId, null);
+  assert.deepEqual(assignments, []);
 });
 
 // --- WHAT THE ASSIGN DIALOG OPENS SHOWING ----------------------------------
 
 test('a target holding the whole selection reads as fully attached', () => {
-  const edges = assignReferences([], ['r1', 'r2'], [{ scope: 'asset', targetId: null }]);
-  assert.deepEqual(assignmentStateFor(edges, ['r1', 'r2']), { 'asset:all': 'all' });
+  const edges = assignReferences([], ['r1', 'r2'], [{ scope: 'scene', targetId: 'sc1' }]);
+  assert.deepEqual(assignmentStateFor(edges, ['r1', 'r2']), { 'scene:sc1': 'all' });
 });
 
 test('a target holding only part of the selection reads as partial', () => {
-  const edges = assignReferences([], ['r1'], [{ scope: 'asset', targetId: null }]);
-  assert.deepEqual(assignmentStateFor(edges, ['r1', 'r2']), { 'asset:all': 'some' });
+  const edges = assignReferences([], ['r1'], [{ scope: 'scene', targetId: 'sc1' }]);
+  assert.deepEqual(assignmentStateFor(edges, ['r1', 'r2']), { 'scene:sc1': 'some' });
 });
 
 test('a target holding none of the selection is simply absent', () => {
@@ -359,50 +340,46 @@ test('a target holding none of the selection is simply absent', () => {
   assert.deepEqual(assignmentStateFor(edges, ['r1']), {});
 });
 
-test('every scope gets a distinct key, and every-asset is not the same as one asset', () => {
+test('every scope gets a distinct key', () => {
   let edges = assignReferences([], ['r1'], [{ scope: 'project' }]);
   edges = assignReferences(edges, ['r1'], [{ scope: 'scene', targetId: 'sc1' }]);
   edges = assignReferences(edges, ['r1'], [{ scope: 'shot', targetId: 'sh1' }]);
-  edges = assignReferences(edges, ['r1'], [{ scope: 'asset', targetId: null }]);
-  edges = assignReferences(edges, ['r1'], [{ scope: 'asset', targetId: 'a1' }]);
 
   assert.deepEqual(assignmentStateFor(edges, ['r1']), {
     project: 'all',
     'scene:sc1': 'all',
-    'shot:sh1': 'all',
-    'asset:all': 'all',
-    'asset:a1': 'all'
+    'shot:sh1': 'all'
   });
 });
 
-test('the every-asset assignment can be taken back', () => {
-  const edges = assignReferences([], ['r1'], [{ scope: 'asset', targetId: null }]);
-  assert.equal(assignmentStateFor(edges, ['r1'])['asset:all'], 'all');
+test('a project-wide assignment can be taken back from the dialog', () => {
+  const edges = assignReferences([], ['r1'], [{ scope: 'project' }]);
+  assert.equal(assignmentStateFor(edges, ['r1']).project, 'all');
 
-  const next = unassignReferences(edges, ['r1'], [{ scope: 'asset', targetId: null }]);
+  const next = unassignReferences(edges, ['r1'], [{ scope: 'project' }]);
   assert.deepEqual(assignmentStateFor(next, ['r1']), {});
-  assert.deepEqual(enabledAssetReferencePaths({ asset: assets[0], references: [ref('r1')], assignments: next }), []);
+  assert.deepEqual(enabledReferencePaths({ shot, scene, references: [ref('r1')], assignments: next }), []);
 });
 
-test('detaching from every-asset leaves an individual asset assignment alone', () => {
-  let edges = assignReferences([], ['r1'], [{ scope: 'asset', targetId: null }]);
-  edges = assignReferences(edges, ['r1'], [{ scope: 'asset', targetId: 'a1' }]);
+test('detaching from the project leaves a shot assignment alone', () => {
+  let edges = assignReferences([], ['r1'], [{ scope: 'project' }]);
+  edges = assignReferences(edges, ['r1'], [{ scope: 'shot', targetId: 'sh1' }]);
 
-  const next = unassignReferences(edges, ['r1'], [{ scope: 'asset', targetId: null }]);
-  assert.deepEqual(assignmentStateFor(next, ['r1']), { 'asset:a1': 'all' });
+  const next = unassignReferences(edges, ['r1'], [{ scope: 'project' }]);
+  assert.deepEqual(assignmentStateFor(next, ['r1']), { 'shot:sh1': 'all' });
 });
 
 test('references can be attached but held back, then switched on later', () => {
-  const edges = assignReferences([], ['r1'], [{ scope: 'asset', targetId: null }], { enabled: false });
-  const refs = [ref('r1')];
+  const edges = assignReferences([], ['held'], [{ scope: 'shot', targetId: 'sh1' }], { enabled: false });
+  const refs2 = [ref('held')];
 
-  assert.ok(!isUnassigned(edges, 'r1'), 'attached');
-  assert.deepEqual(enabledAssetReferencePaths({ asset: assets[0], references: refs, assignments: edges }), [], 'but not sent');
+  assert.ok(!isUnassigned(edges, 'held'), 'attached');
+  assert.deepEqual(enabledReferencePaths({ shot, scene, references: refs2, assignments: edges }), [], 'but not sent');
 
   const live = setEdgeEnabled(edges, edges[0].id, true);
   assert.deepEqual(
-    enabledAssetReferencePaths({ asset: assets[0], references: refs, assignments: live }),
-    ['assets/r1.png']
+    enabledReferencePaths({ shot, scene, references: refs2, assignments: live }),
+    ['assets/held.png']
   );
 });
 
