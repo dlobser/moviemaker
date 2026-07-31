@@ -1,0 +1,177 @@
+/* Global menu bar. Destinations, actions and settings stop being the same
+   thirteen identical buttons in a row. */
+
+.menu-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+.menu {
+  position: relative;
+}
+
+.menu-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-body);
+  font-size: 0.84rem;
+  cursor: pointer;
+  transition: var(--transition);
+  white-space: nowrap;
+}
+
+.menu-trigger:hover {
+  background: rgba(139, 92, 246, 0.1);
+  color: var(--text-main);
+}
+
+.menu-trigger.open {
+  background: rgba(139, 92, 246, 0.16);
+  border-color: var(--border-focus);
+  color: var(--text-main);
+}
+
+.menu-caret { opacity: 0.5; flex-shrink: 0; }
+
+.menu-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 244px;
+  padding: 5px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  z-index: 600;
+  animation: menuDrop 0.14s ease-out;
+  max-height: 78vh;
+  overflow-y: auto;
+}
+
+@keyframes menuDrop {
+  from { transform: translateY(-4px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-body);
+  font-size: 0.83rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.menu-item:hover:not(:disabled) {
+  background: rgba(139, 92, 246, 0.14);
+  color: var(--text-main);
+}
+
+.menu-item:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
+.menu-item.danger:hover:not(:disabled) {
+  background: rgba(244, 63, 94, 0.15);
+  color: var(--accent-hover);
+}
+
+.menu-item-label { flex: 1; }
+.menu-item-spacer { width: 14px; flex-shrink: 0; }
+
+.menu-item-hint {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 5px 8px;
+  background: var(--border-light);
+}
+
+.menu-label {
+  padding: 7px 10px 4px;
+  font-size: 0.66rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.menu-group-body {
+  padding-left: 14px;
+  margin-left: 9px;
+  border-left: 1px solid var(--border-light);
+}
+
+.menu-group.open > .menu-item > .menu-caret { transform: rotate(180deg); }
+
+.menu-badge {
+  font-size: 0.66rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 9px;
+  background: rgba(139, 92, 246, 0.25);
+  color: var(--primary-hover);
+  flex-shrink: 0;
+}
+
+.menu-badge.warn {
+  background: var(--accent);
+  color: #fff;
+}
+
+.menu-badge.ok {
+  background: rgba(16, 185, 129, 0.22);
+  color: var(--success);
+}
+
+/* The Create / Edit switch: a mode change, not a menu item. */
+.view-switch {
+  display: flex;
+  padding: 3px;
+  border-radius: var(--radius-sm);
+  background: rgba(128, 128, 128, 0.1);
+  border: 1px solid var(--border-light);
+}
+
+.view-switch button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-dim);
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.view-switch button.active {
+  background: var(--primary);
+  color: #fff;
+}

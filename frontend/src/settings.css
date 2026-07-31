@@ -1,0 +1,236 @@
+/* Tabbed settings. The old panel was one long scroll of five stacked cards. */
+
+.settings-window {
+  max-width: 880px;
+  width: 92%;
+  height: 82vh;
+  max-height: 82vh;
+}
+
+.settings-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.settings-tabs {
+  width: 190px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 8px;
+  border-right: 1px solid var(--border-light);
+  background: rgba(128, 128, 128, 0.03);
+  overflow-y: auto;
+}
+
+.settings-tab {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-body);
+  font-size: 0.83rem;
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.settings-tab:hover { background: rgba(139, 92, 246, 0.1); color: var(--text-main); }
+
+.settings-tab.active {
+  background: var(--primary);
+  color: #fff;
+}
+
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.settings-section h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.92rem;
+  color: var(--primary-hover);
+  margin: 0;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.settings-note {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin: 0;
+}
+
+.settings-save { align-self: flex-start; }
+
+.settings-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 0.84rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.settings-check input { margin-top: 3px; flex-shrink: 0; }
+
+.settings-check em {
+  display: block;
+  font-style: normal;
+  font-size: 0.74rem;
+  color: var(--text-dim);
+}
+
+.field-hint {
+  display: block;
+  margin-top: 3px;
+  font-size: 0.71rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* A filled key gets a green dot — the fastest way to see what is missing. */
+.key-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 7px;
+  background: var(--text-dim);
+  opacity: 0.4;
+}
+
+.key-dot.set { background: var(--success); opacity: 1; }
+
+/* --- prompt slots -------------------------------------------------------- */
+
+.prompt-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 13px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: rgba(128, 128, 128, 0.03);
+}
+
+.prompt-slot.overridden { border-color: rgba(139, 92, 246, 0.45); }
+
+.prompt-slot-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.prompt-slot-title {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  color: var(--text-main);
+  font-family: var(--font-title);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.prompt-slot-badge {
+  font-size: 0.62rem;
+  padding: 1px 6px;
+  border-radius: 9px;
+  background: rgba(139, 92, 246, 0.22);
+  color: var(--primary-hover);
+  font-weight: 500;
+}
+
+.prompt-slot-reset {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-dim);
+  font-family: var(--font-body);
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.prompt-slot-reset:hover { border-color: var(--accent); color: var(--accent); }
+
+.prompt-slot-desc {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  line-height: 1.55;
+  margin: 0;
+}
+
+.prompt-slot-body {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  resize: vertical;
+}
+
+.prompt-slot-tokens {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+}
+
+.prompt-slot-tokens code {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(6, 182, 212, 0.15);
+  color: var(--secondary-hover);
+  font-size: 0.68rem;
+}
+
+.prompt-slot-warning {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.71rem;
+  color: var(--accent);
+}
+
+@media (max-width: 760px) {
+  .settings-layout { flex-direction: column; }
+  .settings-tabs {
+    width: auto;
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border-light);
+  }
+}

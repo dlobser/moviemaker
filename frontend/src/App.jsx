@@ -8,9 +8,7 @@ import {
   Plus,
   ChevronUp,
   ChevronDown,
-  Download,
   Upload,
-  Play,
   Check,
   FolderOpen,
   Edit2,
@@ -20,11 +18,8 @@ import {
   Save,
   X,
   FileJson,
-  Eye,
   Maximize2,
   Minimize2,
-  Sun,
-  Moon,
   Clock,
   AlertTriangle,
   GripVertical,
@@ -68,10 +63,31 @@ import { createEmptyEdit, migrateEdit } from './edit/model.js';
 import EditView from './edit/EditView.jsx';
 import { AssetImage, AssetVideo, useAssetUrl } from './AssetMedia.jsx';
 import * as projectFs from './static/fileSystem.js';
-
-
-const DEFAULT_IMAGE_SYSTEM_PROMPT = "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual description optimized for AI generation (like Flux/Midjourney or Kling). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.";
-const DEFAULT_VIDEO_SYSTEM_PROMPT = "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual video description optimized for AI generation (like Kling, Runway, or Veo). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.";
+import {
+  compactPromptSettings,
+  fillTemplate,
+  migratePromptSettings,
+  promptNumber,
+  promptText
+} from './prompts.js';
+import {
+  REFERENCE_SCHEMA_VERSION,
+  assignReferences,
+  enabledReferencePaths,
+  migrateReferenceState,
+  normalizeReference,
+  pruneAssignments,
+  resolveSceneReferences,
+  resolveShotReferences,
+  setEdgeEnabled,
+  unassignReferences
+} from './references.js';
+import ReferencePanel, { ReferenceStrip } from './ReferencePanel.jsx';
+import SettingsPanel from './SettingsPanel.jsx';
+import { Menu, MenuItem, MenuLabel, MenuSeparator } from './MenuBar.jsx';
+import './reference.css';
+import './menu.css';
+import './settings.css';
 
 /** Render a model <select>'s options grouped by provider, with pricing inline. */
 function ModelOptions({ models, unit }) {
@@ -106,7 +122,13 @@ export default function App() {
   ]);
   const [imageGallery, setImageGallery] = useState([]);
   const [videoGallery, setVideoGallery] = useState([]);
+  // The reference board. `referenceImages` are the records; `refAssignments` is
+  // the edge list saying which of them apply to the project, a scene or a shot.
+  // Keeping assignment out of the shot is what makes assigning a dozen images to
+  // three shots one operation instead of a nested rewrite of every scene.
   const [referenceImages, setReferenceImages] = useState([]);
+  const [refAssignments, setRefAssignments] = useState([]);
+  const [referencePanelOpen, setReferencePanelOpen] = useState(false);
   const [apiKeys, setApiKeys] = useState({
     geminiKey: '',
     openaiKey: '',
@@ -135,13 +157,11 @@ export default function App() {
   const [activeImageGenerator, setActiveImageGenerator] = useState('fal-ai');
   const [imageModel, setImageModel] = useState('fal-ai/flux/schnell');
   const [imageResolution, setImageResolution] = useState('16:9');
-  const [imageSystemPrompt, setImageSystemPrompt] = useState(DEFAULT_IMAGE_SYSTEM_PROMPT);
 
   const [activeVideoGenerator, setActiveVideoGenerator] = useState('fal-ai');
   const [videoResolution, setVideoResolution] = useState('1280x720');
   const [videoModel, setVideoModel] = useState('fal-ai/kling-video');
   const [videoDuration, setVideoDuration] = useState('5');
-  const [videoSystemPrompt, setVideoSystemPrompt] = useState(DEFAULT_VIDEO_SYSTEM_PROMPT);
 
   // --- REFERENCE IMAGE ATTACHMENT DEFAULTS ---
   // Images want the tagged character/environment art for consistency. Video is
@@ -152,11 +172,27 @@ export default function App() {
   const [attachTagsForVideos, setAttachTagsForVideos] = useState(false);
   const [genModalAttachTags, setGenModalAttachTags] = useState(true);
 
-  // --- GLOBAL PRE/POST PROMPTS (wrapped around every generated prompt) ---
-  const [prePrompt, setPrePrompt] = useState('');
-  const [postPrompt, setPostPrompt] = useState('');
-  const [videoPrePrompt, setVideoPrePrompt] = useState('');
-  const [videoPostPrompt, setVideoPostPrompt] = useState('');
+  // --- PROMPTS ---
+  // Every editable prompt in one bag, keyed by the slot ids in prompts.js. A
+  // slot the project has never touched simply isn't present, so a later change
+  // to a shipped default still reaches it.
+  const [promptSettings, setPromptSettings] = useState({});
+
+  const imageSystemPrompt = promptText(promptSettings, 'imageSystemPrompt');
+  const videoSystemPrompt = promptText(promptSettings, 'videoSystemPrompt');
+  const prePrompt = promptText(promptSettings, 'prePrompt');
+  const postPrompt = promptText(promptSettings, 'postPrompt');
+  const videoPrePrompt = promptText(promptSettings, 'videoPrePrompt');
+  const videoPostPrompt = promptText(promptSettings, 'videoPostPrompt');
+  const assetPrePrompt = promptText(promptSettings, 'assetPrePrompt');
+  const assetPostPrompt = promptText(promptSettings, 'assetPostPrompt');
+
+  const setPromptSetting = (slotId, value) => setPromptSettings(prev => ({ ...prev, [slotId]: value }));
+  const resetPromptSetting = (slotId) => setPromptSettings(prev => {
+    const next = { ...prev };
+    delete next[slotId];
+    return next;
+  });
 
   // --- THEME STATE ---
   const [theme, setTheme] = useState('dark'); // 'dark' | 'light'
@@ -370,11 +406,21 @@ export default function App() {
         }
       ];
     }
+    // Reference migration has to see the scenes, because pre-v2 projects kept
+    // assignments inside each shot. It hands back scenes with those legacy
+    // arrays cleared, so this must run before the scenes reach state.
+    const migratedRefs = migrateReferenceState({ ...state, scenes: loadedScenes });
+    loadedScenes = migratedRefs.scenes;
+
     setScenes(loadedScenes);
 
     setImageGallery(state.imageGallery || []);
     setVideoGallery(state.videoGallery || []);
-    setReferenceImages(state.referenceImages || []);
+    setReferenceImages(migratedRefs.references);
+    setRefAssignments(pruneAssignments(migratedRefs.assignments, {
+      references: migratedRefs.references,
+      scenes: loadedScenes
+    }));
     setAssetLibrary(state.assetLibrary || []);
     setPromptSnippets(state.promptSnippets || promptSnippets);
     setActiveLlm(state.activeLlm || 'gemini');
@@ -386,14 +432,12 @@ export default function App() {
     setVideoResolution(state.videoResolution || '1280x720');
     setVideoModel(state.videoModel || 'fal-ai/kling-video');
     setVideoDuration(state.videoDuration || '5');
-    setPrePrompt(state.prePrompt || '');
-    setPostPrompt(state.postPrompt || '');
-    setVideoPrePrompt(state.videoPrePrompt || '');
-    setVideoPostPrompt(state.videoPostPrompt || '');
+    setBatchConcurrency(state.batchConcurrency || 3);
     setAttachTagsForImages(state.attachTagsForImages !== false);
     setAttachTagsForVideos(state.attachTagsForVideos === true);
-    setImageSystemPrompt(state.imageSystemPrompt || DEFAULT_IMAGE_SYSTEM_PROMPT);
-    setVideoSystemPrompt(state.videoSystemPrompt || DEFAULT_VIDEO_SYSTEM_PROMPT);
+    // Folds the flat pre/post and system-prompt fields older projects saved at
+    // the top level into the prompt bag.
+    setPromptSettings(migratePromptSettings(state));
     // Projects saved before the editor existed simply have no `edit` key.
     setEdit(migrateEdit(state.edit));
     setConcatenatedVideo(state.concatenatedVideo || null);
@@ -425,6 +469,8 @@ export default function App() {
       imageGallery,
       videoGallery,
       referenceImages,
+      refAssignments,
+      referenceSchemaVersion: REFERENCE_SCHEMA_VERSION,
       assetLibrary,
       promptSnippets,
       activeLlm,
@@ -436,12 +482,18 @@ export default function App() {
       videoResolution,
       videoModel,
       videoDuration,
+      batchConcurrency,
+      attachTagsForImages,
+      attachTagsForVideos,
+      // Only the slots that differ from their defaults are written, so a future
+      // change to a default still reaches projects that never edited it.
+      promptSettings: compactPromptSettings(promptSettings),
+      // Mirrored flat for anything still reading the old shape (shot-list
+      // export, older tooling). The prompt bag is the source of truth.
       prePrompt,
       postPrompt,
       videoPrePrompt,
       videoPostPrompt,
-      attachTagsForImages,
-      attachTagsForVideos,
       imageSystemPrompt,
       videoSystemPrompt,
       concatenatedVideo: extra.concatenatedVideo !== undefined ? extra.concatenatedVideo : concatenatedVideo,
@@ -477,13 +529,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeOverlay]);
 
+  // The docked panel overlays the page rather than reflowing it, so the app
+  // needs a right gutter while it is open or the timeline sits underneath.
+  useEffect(() => {
+    document.body.classList.toggle('reference-docked', referencePanelOpen);
+    return () => document.body.classList.remove('reference-docked');
+  }, [referencePanelOpen]);
+
   const saveStateRef = useRef();
   saveStateRef.current = () => { saveProjectState(); };
   useEffect(() => {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, prePrompt, postPrompt, videoPrePrompt, videoPostPrompt, imageSystemPrompt, videoSystemPrompt, concatenatedVideo, edit]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, promptSettings, concatenatedVideo, edit]);
 
   // Save Credentials
   const saveConfig = async (newKeys) => {
@@ -704,10 +763,14 @@ export default function App() {
     setGenerationModal({ type, shotId, existingPromptId });
     setGenModalPrompt('');
     setGenModalImageInput('');
-    setGenModalInputImages((shot.referenceImages || [])
-      .map(refId => referenceImages.find(ref => ref.id === refId)?.path)
-      .filter(Boolean)
-      .slice(0, 3));
+    // Everything this shot is set to send — its own references first, then the
+    // ones it inherits from its scene and the project, minus anything held back.
+    // Trimmed to the model's capacity so the preview never promises more than
+    // will be uploaded.
+    setGenModalInputImages(shotReferencePaths(shot).slice(
+      0,
+      refImageCapacity(type, type === 'image' ? (shot.imageModel || imageModel) : (shot.videoModel || videoModel))
+    ));
     setGenModalDuration(videoDuration);
     setGenModalExcludedImages([]);
 
@@ -791,8 +854,20 @@ export default function App() {
     }
 
     setLoadingStates(prev => ({ ...prev, modal_llm: true }));
-    const systemPrompt = generationModal.type === 'image' ? imageSystemPrompt : videoSystemPrompt;
-    const promptPayload = `Write a visual prompt based on this scene description: "${shot.description}"\nCamera/Shot setup to apply: "${shot.setup}"\nAdditional Notes: "${shot.notes}"`;
+    const isImage = generationModal.type === 'image';
+    const systemPrompt = isImage ? imageSystemPrompt : videoSystemPrompt;
+    const sceneOfShot = scenes.find(s => (s.shots || []).some(sh => sh.id === shot.id));
+    const promptPayload = fillTemplate(
+      promptText(promptSettings, isImage ? 'imageUserTemplate' : 'videoUserTemplate'),
+      {
+        description: shot.description,
+        setup: shot.setup,
+        notes: shot.notes,
+        dialogue: shot.dialogue,
+        name: shot.name,
+        sceneName: sceneOfShot?.name || ''
+      }
+    );
 
     try {
       const res = await apiFetch(`/api/llm/generate`, {
@@ -1218,8 +1293,13 @@ export default function App() {
 
         // Video batches animate the shot's own selected still. That image is
         // the primary input and must never be displaced by a tagged asset.
+        //
+        // Image batches use the same resolution the generation modal shows, so
+        // a reference you unticked on a shot stays unticked when the batch runs
+        // — previously the modal's choices were session-only and a sweep sent
+        // everything regardless.
         const primaryImagePaths = isImage
-          ? (shot.referenceImages || []).map(refId => referenceImages.find(r => r.id === refId)?.path).filter(Boolean)
+          ? shotReferencePaths(shot)
           : (shot.selectedImage ? [shot.selectedImage] : []);
 
         const result = await submitGenerationJob({
@@ -1300,7 +1380,9 @@ export default function App() {
   };
 
   /** The asset editor's prompt, falling back to one derived from the description. */
-  const effectiveAssetPrompt = (draft) => (draft?.imagePrompt?.trim() ? draft.imagePrompt : defaultAssetPrompt(draft));
+  const effectiveAssetPrompt = (draft) => (
+    draft?.imagePrompt?.trim() ? draft.imagePrompt : defaultAssetPrompt(draft, promptSettings)
+  );
 
   /**
    * Compose an asset's generation prompt. Other assets' <Tag>s still resolve
@@ -1314,10 +1396,23 @@ export default function App() {
     // grid must not keep riding along invisibly in the saved selection.
     const pool = draft.images || [];
     const picked = assetInputImages(draft).filter(p => pool.includes(p));
+
+    // Three-way, because reference art and film frames want opposite treatment.
+    // 'asset' is the default: the dedicated asset pre/post, which is usually
+    // neutral. 'image' borrows the film's own grade language, which is only
+    // right when you want the reference to match the look. 'none' sends the
+    // prompt bare.
+    const wrap = draft.promptWrap || (draft.applyGlobalPrompts ? 'image' : 'asset');
+    const wraps = {
+      none: ['', ''],
+      image: [prePrompt, postPrompt],
+      asset: [assetPrePrompt, assetPostPrompt]
+    }[wrap] || ['', ''];
+
     return composeGenerationPrompt({
       prompt: effectiveAssetPrompt(draft),
-      prePrompt: draft.applyGlobalPrompts ? prePrompt : '',
-      postPrompt: draft.applyGlobalPrompts ? postPrompt : '',
+      prePrompt: wraps[0],
+      postPrompt: wraps[1],
       assetLibrary: others,
       primaryImagePaths: picked,
       attachTaggedImages: true,
@@ -1452,7 +1547,9 @@ export default function App() {
       if (detail) lines.push(`- [${scene.name} / ${shot.name}] ${detail}`);
     }));
 
-    return lines.slice(0, 12); // enough signal without blowing the context
+    // How many lines is a settings slot now — more is more faithful and more
+    // expensive, and 12 was only ever a guess baked into the source.
+    return lines.slice(0, promptNumber(promptSettings, 'assetContextLimit'));
   };
 
   /**
@@ -1464,24 +1561,20 @@ export default function App() {
     const context = gatherAssetContext(asset);
     const styleHint = [prePrompt, postPrompt].filter(Boolean).join(' … ');
 
-    const systemPrompt = `You write prompts for clean REFERENCE artwork used to keep a subject consistent across many shots of a film — not cinematic frames.
+    const systemPrompt = promptText(promptSettings, 'assetWriterSystem');
 
-The image must isolate the subject: neutral pose, plain uncluttered background, even lighting, whole subject in frame, no motion blur, no dramatic grade, no other characters.
-
-You are given a subject and the lines from the script where it appears. Infer concrete visual specifics that the script implies but never states — age, build, hair, wardrobe, materials, colour, wear and era. Be decisive and specific; do not hedge or offer alternatives. Never invent plot.
-
-Reply with ONLY a JSON object, no markdown fence:
-{"description":"<one dense sentence of physical description, reusable wherever this subject is named>","imagePrompt":"<the full reference image prompt>"}`;
-
-    const userPrompt = [
-      `Subject type: ${asset.type || 'character'}`,
-      `Name: ${asset.name || asset.tag}`,
-      `Existing description: ${asset.description?.trim() || '(none — infer it)'}`,
-      context.length > 0
+    const userPrompt = fillTemplate(promptText(promptSettings, 'assetWriterUser'), {
+      type: asset.type || 'character',
+      tag: asset.tag || '',
+      name: asset.name || asset.tag,
+      description: asset.description?.trim() || '(none — infer it)',
+      context: context.length > 0
         ? `\nScript lines referencing this subject:\n${context.join('\n')}`
         : '\n(This subject is not referenced in any shot yet — work from the name and description alone.)',
-      styleHint ? `\nProject look, for tone only — do NOT copy this into the reference prompt: ${styleHint}` : ''
-    ].filter(Boolean).join('\n');
+      styleHint: styleHint
+        ? `\nProject look, for tone only — do NOT copy this into the reference prompt: ${styleHint}`
+        : ''
+    });
 
     const res = await apiFetch(`/api/llm/generate`, {
       method: 'POST',
@@ -1626,12 +1719,19 @@ Reply with ONLY a JSON object, no markdown fence:
       imagePrompt: assetEditor.imagePrompt || '',
       imageModel: assetEditor.imageModel || null,
       imageResolution: assetEditor.imageResolution || null,
-      applyGlobalPrompts: Boolean(assetEditor.applyGlobalPrompts)
+      promptWrap: assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset')
     };
 
     setAssetLibrary(prev => (
       prev.some(a => a.id === record.id) ? prev.map(a => (a.id === record.id ? record : a)) : [...prev, record]
     ));
+
+    // An asset built from a board selection links back to those references, so
+    // the board can show which asset each one belongs to and the two never
+    // drift into being separate copies of the same file.
+    if (assetEditor.linkedReferenceIds?.length) {
+      handleUpdateReferences(assetEditor.linkedReferenceIds, { assetId: record.id });
+    }
     // Carry the id back so repeat generations update this asset instead of forking a new one.
     setAssetEditor(prev => (prev ? { ...prev, ...record } : prev));
     return record;
@@ -2736,10 +2836,18 @@ Reply with ONLY a JSON object, no markdown fence:
       }));
 
       if (dest === 'ref') {
-        const newRefs = uploaded.map(({ file, data, index }) => ({ id: `ref_${Date.now()}_${index}`, path: data.filePath, name: file.name }));
+        const newRefs = uploaded.map(({ file, data, index }) => normalizeReference({
+          id: `ref_${Date.now()}_${index}`,
+          path: data.filePath,
+          // Drop the extension: "neon_alley.png" is a filename, "neon_alley" is
+          // a name you might actually keep.
+          name: file.name.replace(/\.[^.]+$/, ''),
+          source: 'upload'
+        }));
         setReferenceImages(prev => [...newRefs, ...prev]);
         if (generationModal?.type === 'image') {
-          setGenModalInputImages(prev => [...prev, ...newRefs.map(ref => ref.path)].slice(0, 3));
+          const capacity = refImageCapacity('image', genModalModel);
+          setGenModalInputImages(prev => [...prev, ...newRefs.map(ref => ref.path)].slice(0, capacity));
         }
         showToast(`${newRefs.length} reference image${newRefs.length === 1 ? '' : 's'} added.`, 'success');
       } else {
@@ -2813,58 +2921,143 @@ Reply with ONLY a JSON object, no markdown fence:
       return;
     }
     if (projectImagesSelector.target === 'ref') {
-      // Add to referenceImages
       if (referenceImages.some(r => r.path === image.path)) {
-        showToast('This image is already in the reference imagery.', 'warning');
+        showToast('This image is already on the reference board.', 'warning');
         setProjectImagesSelector(null);
         return;
       }
-      const newRef = {
-        id: `ref_${Date.now()}`,
+      const newRef = normalizeReference({
         path: image.path,
-        name: image.name
-      };
+        name: image.name.replace(/\.[^.]+$/, ''),
+        source: 'project'
+      });
       setReferenceImages(prev => [newRef, ...prev]);
-      
-      // If we are in the generation modal, also auto-select it as one of the
-      // active inputs — trimmed to what this model will actually read.
+
+      // Adding from inside the generation modal means "use this now", so it goes
+      // straight into the inputs — trimmed to what the model will actually read.
       if (generationModal?.type === 'image' || generationModal?.type === 'video') {
         const capacity = refImageCapacity(generationModal.type, genModalModel);
         setGenModalInputImages(prev => [...prev, image.path].slice(0, capacity));
       }
-      
-      // If there is an active shot, also associate it with the active shot!
-      if (activeShotId) {
-        const activeShot = shots.find(s => s.id === activeShotId);
-        if (activeShot) {
-          const updatedRefs = [...(activeShot.referenceImages || []), newRef.id];
-          handleUpdateShotField(activeShotId, 'referenceImages', updatedRefs);
-        }
-      }
-      
-      showToast(`Added ${image.name} to reference imagery.`, 'success');
+
+      // Adding from the board itself does not silently attach to whatever shot
+      // happens to be active — that hidden side effect is why references used to
+      // turn up on shots nobody assigned them to. Use the panel's Assign for it.
+      showToast(`Added ${newRef.name} to the reference board.`, 'success');
     }
     setProjectImagesSelector(null);
   };
 
-  const toggleRefImageMapping = (refId) => {
-    if (!activeShotId) {
-      showToast('Select a shot to assign reference imagery.', 'warning');
+  // --- REFERENCE BOARD ------------------------------------------------------
+
+  /** Attach many references to many targets in one go. */
+  const handleAssignReferences = (refIds, targets, options) => {
+    setRefAssignments(prev => assignReferences(prev, refIds, targets, options));
+    const targetLabel = targets.length === 1 ? 'target' : `${targets.length} targets`;
+    showToast(`${refIds.length} reference${refIds.length === 1 ? '' : 's'} assigned to ${targetLabel}.`, 'success');
+  };
+
+  /** Detach from specific targets, or from everywhere when targets is null. */
+  const handleUnassignReferences = (refIds, targets) => {
+    setRefAssignments(prev => unassignReferences(prev, refIds, targets));
+    showToast(targets ? 'Reference detached.' : `${refIds.length} reference${refIds.length === 1 ? '' : 's'} detached everywhere.`);
+  };
+
+  /**
+   * Patch a set of references. `patch` may be an object applied to all of them,
+   * or a function of the reference for per-item values such as merging tags.
+   */
+  const handleUpdateReferences = (refIds, patch) => {
+    const ids = new Set(refIds);
+    setReferenceImages(prev => prev.map(ref => (
+      ids.has(ref.id) ? { ...ref, ...(typeof patch === 'function' ? patch(ref) : patch) } : ref
+    )));
+  };
+
+  const handleLinkReferencesToAsset = (refIds, assetId) => {
+    handleUpdateReferences(refIds, { assetId });
+    showToast(assetId ? 'Linked to asset.' : 'Unlinked.');
+  };
+
+  /**
+   * Turn a selection into a new asset.
+   *
+   * The images are *linked*, not copied: the asset's own pool used to receive
+   * duplicate paths off the board, leaving two records for one file that then
+   * drifted apart. Here the reference stays the single record and the asset
+   * points at it.
+   */
+  const handleCreateAssetFromReferences = (refs) => {
+    if (refs.length === 0) return;
+    const paths = refs.map(ref => ref.path);
+    const suggestedTag = (refs[0].name || 'Asset').replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9]/g, '') || 'Asset';
+
+    setAssetEditor({
+      tag: suggestedTag,
+      type: refs[0].kind === 'scenery' ? 'environment' : (ASSET_TYPES.some(t => t.id === refs[0].kind) ? refs[0].kind : 'character'),
+      name: refs[0].name || '',
+      description: refs.map(ref => ref.notes).filter(Boolean).join('; '),
+      images: paths,
+      primaryImage: paths[0],
+      inputImages: [],
+      imagePrompt: '',
+      imageModel: null,
+      imageResolution: null,
+      applyGlobalPrompts: false,
+      // Remembered so saving the asset can stamp its id back onto the sources.
+      linkedReferenceIds: refs.map(ref => ref.id)
+    });
+    setReferencePanelOpen(false);
+  };
+
+  const handleDeleteReferences = (refIds) => {
+    const ids = new Set(refIds);
+    setReferenceImages(prev => prev.filter(ref => !ids.has(ref.id)));
+    setRefAssignments(prev => prev.filter(edge => !ids.has(edge.refId)));
+    showToast(`${refIds.length} reference${refIds.length === 1 ? '' : 's'} removed from the board.`);
+  };
+
+  /** Flip whether one resolved entry is uploaded with this shot's generations. */
+  const toggleShotReferenceEntry = (shot, entry) => {
+    if (entry.inherited) {
+      // An inherited reference is switched per shot, so the scene keeps it for
+      // every other shot that wants it.
+      const current = shot.refExclusions || [];
+      const next = current.includes(entry.ref.id)
+        ? current.filter(id => id !== entry.ref.id)
+        : [...current, entry.ref.id];
+      handleUpdateShotField(shot.id, 'refExclusions', next);
       return;
     }
-    const activeShot = shots.find(s => s.id === activeShotId);
-    if (!activeShot) return;
-
-    let updatedRefs = [...activeShot.referenceImages];
-    if (updatedRefs.includes(refId)) {
-      updatedRefs = updatedRefs.filter(id => id !== refId);
-      showToast('Reference image unassigned.');
-    } else {
-      updatedRefs.push(refId);
-      showToast('Reference image assigned to active shot.');
-    }
-    handleUpdateShotField(activeShotId, 'referenceImages', updatedRefs);
+    setRefAssignments(prev => setEdgeEnabled(prev, entry.edge.id, !entry.enabled));
   };
+
+  const toggleSceneReferenceEntry = (entry) => {
+    // A project-wide reference is only shown here for context. Toggling it from
+    // a scene header would quietly switch it off for the whole film, which is
+    // never what the click meant — that decision belongs to the board.
+    if (entry.inherited) {
+      showToast('That one is assigned to the whole project — change it in the reference board.', 'warning');
+      return;
+    }
+    setRefAssignments(prev => setEdgeEnabled(prev, entry.edge.id, !entry.enabled));
+  };
+
+  /** Everything in play for a shot, with provenance and send state. */
+  const shotReferenceEntries = (shot) => resolveShotReferences({
+    shot,
+    scene: scenes.find(s => (s.shots || []).some(sh => sh.id === shot.id)),
+    references: referenceImages,
+    assignments: refAssignments
+  });
+
+  /** Just the paths a generation for this shot should receive, in send order. */
+  const shotReferencePaths = (shot) => enabledReferencePaths({
+    shot,
+    scene: scenes.find(s => (s.shots || []).some(sh => sh.id === shot.id)),
+    references: referenceImages,
+    assignments: refAssignments
+  });
 
   const handleRenameAsset = (galleryType, id, newName) => {
     if (!newName.trim()) return;
@@ -2899,16 +3092,8 @@ Reply with ONLY a JSON object, no markdown fence:
       setScenes(updated);
       saveProjectState(updated);
     } else if (galleryType === 'reference') {
-      setReferenceImages(referenceImages.filter(r => r.id !== id));
-      const updated = scenes.map(sc => ({
-        ...sc,
-        shots: (sc.shots || []).map(s => ({
-          ...s,
-          referenceImages: (s.referenceImages || []).filter(refId => refId !== id)
-        }))
-      }));
-      setScenes(updated);
-      saveProjectState(updated);
+      handleDeleteReferences([id]);
+      return;
     }
     showToast('Asset deleted');
   };
@@ -3053,7 +3238,6 @@ Reply with ONLY a JSON object, no markdown fence:
   // Filter batch jobs active count
   const activeJobsCount = batchJobs.filter(j => j.status === 'running').length;
 
-  const activeShotObj = shots.find(s => s.id === activeShotId);
   const activeScene = scenes.find(s => s.id === activeSceneId) || scenes[0];
   const activeSceneShots = activeScene ? (activeScene.shots || []) : [];
 
@@ -3182,109 +3366,194 @@ Reply with ONLY a JSON object, no markdown fence:
         </div>
 
         <div className="header-actions">
-          {/* FFmpeg Video Concatenator Trigger — needs the local server */}
-          <button
-            className="btn btn-accent"
-            onClick={handleStitchCompilation}
-            disabled={loadingStates.compilation || isStatic()}
-            title={isStatic() ? 'Stitching needs FFmpeg — only available in the local server build' : 'Stitch all selected shot videos'}
-            style={isStatic() ? { opacity: 0.45 } : undefined}
-          >
-            {loadingStates.compilation ? (
-              <>
-                <RefreshCw className="spinner" size={16} /> Compiling...
-              </>
-            ) : (
-              <>
-                <Film size={16} /> <span className="btn-label-optional">Concatenate Video</span>
-              </>
-            )}
-          </button>
+          {/* Menus carry every global command. What stays outside them reports
+              live state (the batch chip) or switches mode (Create / Edit) —
+              neither is a command, so neither belongs in a dropdown. */}
+          <nav className="menu-bar">
+            <Menu label="Project" icon={FolderOpen}>
+              <MenuItem icon={Plus} onClick={() => { setActiveOverlay('projects'); setNewProjectDraft({ directory: '', name: '' }); }}>
+                New project…
+              </MenuItem>
+              <MenuItem icon={FolderOpen} onClick={() => setActiveOverlay('projects')}>
+                Open / recent…
+              </MenuItem>
+              <MenuItem icon={Save} disabled={isStatic()} onClick={handleSaveProjectAs} title={isStatic() ? 'Needs the local server build' : undefined}>
+                Save a copy as…
+              </MenuItem>
+              <MenuItem icon={Clock} onClick={() => setActiveOverlay('projects')}>
+                Checkpoints…
+              </MenuItem>
 
-          {/* Editor. A separate view, so it gets its own window rather than an overlay. */}
-          <button
-            className="btn btn-secondary"
-            onClick={() => setView('edit')}
-            title="Open the timeline editor: trim, reorder, dissolve and mix"
-          >
-            <Scissors size={16} /> <span className="btn-label-optional">Edit</span>
-          </button>
+              <MenuSeparator />
+              <MenuLabel>Shot list</MenuLabel>
+              <MenuItem
+                icon={Copy}
+                onClick={handleCopyLlmPrompt}
+                title="Copy the full schema + live model list to paste into an LLM"
+              >
+                Copy LLM prompt
+              </MenuItem>
+              <MenuItem
+                icon={Upload}
+                onClick={() => { shotListInputRef.current.dataset.mode = 'replace'; shotListInputRef.current.click(); }}
+              >
+                Import shot list…
+              </MenuItem>
+              <MenuItem
+                icon={Plus}
+                onClick={() => { shotListInputRef.current.dataset.mode = 'append'; shotListInputRef.current.click(); }}
+                hint="append"
+              >
+                Import and add after…
+              </MenuItem>
 
-          {/* Theme toggler */}
-          <button className="btn btn-secondary" style={{ padding: '8px', borderRadius: '50%' }} onClick={handleToggleTheme} title="Toggle Theme (Dark/Light)">
-            {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
-          </button>
+              <MenuSeparator />
+              <MenuItem icon={FileJson} onClick={() => setActiveOverlay('settings')}>
+                Backup / export…
+              </MenuItem>
+              <MenuItem icon={Upload} disabled={isStatic()} onClick={handleImportAssetsFromProject}>
+                Import assets from another project…
+              </MenuItem>
+            </Menu>
 
-          {/* Batch Status indicator */}
+            <Menu label="Library" icon={Layers}>
+              {(() => {
+                const missingImages = assetLibrary.filter(a => (a.images || []).length === 0).length;
+                return (
+                  <MenuItem
+                    icon={Users}
+                    onClick={() => setActiveOverlay('assets')}
+                    badge={assetLibrary.length > 0 && (
+                      <span className={`menu-badge ${missingImages ? 'warn' : 'ok'}`}>
+                        {missingImages ? `${missingImages} / ${assetLibrary.length}` : assetLibrary.length}
+                      </span>
+                    )}
+                  >
+                    Assets
+                  </MenuItem>
+                );
+              })()}
+              <MenuItem
+                icon={ImageIcon}
+                onClick={() => setReferencePanelOpen(true)}
+                badge={referenceImages.length > 0 && <span className="menu-badge">{referenceImages.length}</span>}
+              >
+                Reference board
+              </MenuItem>
+              <MenuSeparator />
+              <MenuItem icon={ImageIcon} onClick={() => setActiveOverlay('images')}>Generated images</MenuItem>
+              <MenuItem icon={Film} onClick={() => setActiveOverlay('videos')}>Generated videos</MenuItem>
+              <MenuItem icon={MessageSquare} onClick={() => setActiveOverlay('snippets')}>Prompt snippets</MenuItem>
+            </Menu>
+
+            <Menu label="Generate" icon={Zap}>
+              <MenuItem
+                icon={ImageIcon}
+                disabled={Boolean(batchRunner)}
+                onClick={() => setBatchDialog({ type: 'image', scope: 'scene' })}
+              >
+                Batch images…
+              </MenuItem>
+              <MenuItem
+                icon={Film}
+                disabled={Boolean(batchRunner)}
+                onClick={() => setBatchDialog({ type: 'video', scope: 'scene' })}
+              >
+                Batch videos…
+              </MenuItem>
+              <MenuItem
+                icon={Users}
+                disabled={Boolean(batchRunner) || assetLibrary.length === 0}
+                onClick={() => setAssetBatchDialog({ onlyMissing: true, useLlm: true, rewriteExisting: false })}
+              >
+                Batch asset references…
+              </MenuItem>
+
+              <MenuSeparator />
+              <MenuItem
+                icon={Clock}
+                onClick={() => setActiveOverlay('batch')}
+                badge={activeJobsCount > 0 && <span className="menu-badge">{activeJobsCount}</span>}
+              >
+                Batch manager
+              </MenuItem>
+              {batchRunner && (
+                <MenuItem icon={StopCircle} danger onClick={handleCancelBatch}>
+                  Stop the running batch ({batchRunner.done}/{batchRunner.total})
+                </MenuItem>
+              )}
+            </Menu>
+
+            <Menu label="Render" icon={Film}>
+              <MenuItem
+                icon={Film}
+                disabled={loadingStates.compilation || isStatic()}
+                onClick={handleStitchCompilation}
+                title={isStatic() ? 'Stitching needs FFmpeg — only in the local server build' : 'Stitch every selected shot video'}
+              >
+                Concatenate the whole film
+              </MenuItem>
+              <MenuItem
+                icon={Film}
+                disabled={loadingStates.compilation || isStatic() || !activeScene}
+                onClick={() => activeScene && handleConcatenateScene(activeScene.id)}
+              >
+                Compile this scene only
+              </MenuItem>
+              <MenuSeparator />
+              <MenuItem icon={LayoutGrid} onClick={() => setActiveOverlay('storyboard')}>
+                Storyboard
+              </MenuItem>
+            </Menu>
+          </nav>
+
+          {/* Create / Edit is a mode switch, so it reads as one rather than as
+              another button in the row. */}
+          <div className="view-switch">
+            <button className="active">Create</button>
+            <button onClick={() => setView('edit')} title="Trim, reorder, dissolve and mix">
+              <Scissors size={13} /> Edit
+            </button>
+          </div>
+
           <div
             className={`batch-status-chip ${activeJobsCount > 0 ? 'active' : ''}`}
-            onClick={() => setActiveOverlay(activeOverlay === 'batch' ? null : 'batch')}
-            title="Open Batch Manager"
+            onClick={() => setActiveOverlay('batch')}
+            title="Open the batch manager"
           >
             <Clock size={16} />
             <span>
               {batchRunner
                 ? `Batch ${batchRunner.done}/${batchRunner.total}`
-                : `${activeJobsCount} Generating`}
+                : `${activeJobsCount} generating`}
             </span>
           </div>
 
-          {/* Overlays Toggles */}
-          <button className={`btn btn-secondary ${activeOverlay === 'storyboard' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'storyboard' ? null : 'storyboard')} title="Storyboard: every shot's selected image, in order">
-            <LayoutGrid size={16} /> <span className="btn-label-optional">Storyboard</span>
-          </button>
-          {(() => {
-            const missingImages = assetLibrary.filter(a => (a.images || []).length === 0).length;
-            return (
-              <button
-                className={`btn btn-secondary ${activeOverlay === 'assets' ? 'active' : ''}`}
-                onClick={() => setActiveOverlay(activeOverlay === 'assets' ? null : 'assets')}
-                title={assetLibrary.length === 0
-                  ? 'Character / environment library'
-                  : `${assetLibrary.length} asset${assetLibrary.length === 1 ? '' : 's'}${missingImages ? `, ${missingImages} still without an image` : ', all have images'}`}
-              >
-                <Users size={16} /> <span className="btn-label-optional">Assets</span>
-                {assetLibrary.length > 0 && (
-                  <span style={{
-                    marginLeft: '2px', fontSize: '0.7rem', fontWeight: 'bold',
-                    padding: '1px 6px', borderRadius: '9px',
-                    background: missingImages ? 'var(--accent)' : 'rgba(16,185,129,0.25)',
-                    color: missingImages ? '#fff' : 'var(--success)'
-                  }}>
-                    {missingImages ? `${missingImages} / ${assetLibrary.length}` : assetLibrary.length}
-                  </span>
-                )}
-              </button>
-            );
-          })()}
-          <button className={`btn btn-secondary ${activeOverlay === 'images' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'images' ? null : 'images')} title="Master image library">
-            <ImageIcon size={16} /> <span className="btn-label-optional">Images</span>
-          </button>
-          <button className={`btn btn-secondary ${activeOverlay === 'videos' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'videos' ? null : 'videos')} title="Master video library">
-            <Film size={16} /> <span className="btn-label-optional">Videos</span>
-          </button>
-          <button className={`btn btn-secondary ${activeOverlay === 'reference' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'reference' ? null : 'reference')} title="Reference imagery mood board">
-            <FolderOpen size={16} /> <span className="btn-label-optional">Reference</span>
-          </button>
-          <button className={`btn btn-secondary ${activeOverlay === 'snippets' ? 'active' : ''}`} onClick={() => setActiveOverlay(activeOverlay === 'snippets' ? null : 'snippets')} title="Prompt snippet library">
-            <MessageSquare size={16} /> <span className="btn-label-optional">Snippets</span>
+          <button
+            className={`btn btn-secondary ${referencePanelOpen ? 'active' : ''}`}
+            style={{ padding: '8px', borderRadius: '50%' }}
+            onClick={() => setReferencePanelOpen(v => !v)}
+            title="Reference board"
+          >
+            <ImageIcon size={17} />
           </button>
 
-          {/* Combined Settings Gear */}
           <button
             className={`btn btn-secondary ${activeOverlay === 'settings' ? 'active' : ''}`}
+            style={{ padding: '8px', borderRadius: '50%' }}
             onClick={() => setActiveOverlay(activeOverlay === 'settings' ? null : 'settings')}
-            title="Settings & Credentials"
+            title="Settings"
           >
-            <Settings size={18} />
+            <Settings size={17} />
           </button>
 
           <button
-            className={`btn btn-secondary ${activeOverlay === 'help' ? 'active' : ''}`}
-            onClick={() => setActiveOverlay(activeOverlay === 'help' ? null : 'help')}
-            title="Help & LLM Import Guide"
+            className="btn btn-secondary"
+            style={{ padding: '8px', borderRadius: '50%' }}
+            onClick={() => setActiveOverlay('help')}
+            title="Help & import guide"
           >
-            <HelpCircle size={18} />
+            <HelpCircle size={17} />
           </button>
         </div>
       </header>
@@ -3374,83 +3643,34 @@ Reply with ONLY a JSON object, no markdown fence:
               </div>
             </div>
 
-            {/* Rename Scene panel for active scene */}
+            {/* The shot-list file input is hidden but must stay mounted — the
+                Project menu triggers it. */}
+            <input type="file" accept=".json" ref={shotListInputRef} onChange={(e) => handleImportShotList(e, shotListInputRef.current?.dataset.mode || 'replace')} style={{ display: 'none' }} />
+
             {activeScene && (
-              <div style={{ display: 'flex', gap: '12px', alignItems: 'center', background: 'rgba(255,255,255,0.02)', padding: '8px 12px', borderRadius: '4px', flexWrap: 'wrap' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Rename Scene:</label>
+              <div className="scene-meta-row">
+                <label>
+                  Scene name
                   <input
                     type="text"
                     className="input-field"
-                    style={{ maxWidth: '200px', padding: '4px 8px', fontSize: '0.85rem' }}
                     value={activeScene.name || ''}
                     onChange={(e) => handleRenameScene(activeScene.id, e.target.value)}
                   />
-                </div>
-                
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => handleConcatenateScene(activeScene.id)}
-                  disabled={loadingStates.compilation || isStatic()}
-                  title={isStatic() ? 'Stitching needs FFmpeg — only available in the local server build' : undefined}
-                  style={{ fontSize: '0.8rem', padding: '6px 12px', marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px', opacity: isStatic() ? 0.45 : 1 }}
-                >
-                  <Film size={12} /> Compile Scene Video
-                </button>
+                </label>
+
+                {/* References the whole scene carries, and whether each is
+                    actually sent. Shots inherit these unless they opt out. */}
+                <ReferenceStrip
+                  compact
+                  label="Scene references"
+                  entries={resolveSceneReferences({ scene: activeScene, references: referenceImages, assignments: refAssignments })}
+                  onToggleEntry={toggleSceneReferenceEntry}
+                  onOpenPanel={() => setReferencePanelOpen(true)}
+                  capacity={0}
+                />
               </div>
             )}
-
-            {/* Batch + shot list toolbar */}
-            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', background: 'rgba(139, 92, 246, 0.06)', border: '1px solid var(--border-light)', padding: '8px 12px', borderRadius: '6px' }}>
-              <Zap size={14} style={{ color: 'var(--primary)' }} />
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginRight: '4px' }}>Batch:</span>
-
-              <button className="btn btn-primary" style={{ fontSize: '0.78rem', padding: '5px 10px' }} disabled={Boolean(batchRunner)} onClick={() => setBatchDialog({ type: 'image', scope: 'scene' })}>
-                <ImageIcon size={12} /> Images — This Scene
-              </button>
-              <button className="btn btn-primary" style={{ fontSize: '0.78rem', padding: '5px 10px' }} disabled={Boolean(batchRunner)} onClick={() => setBatchDialog({ type: 'image', scope: 'all' })}>
-                <ImageIcon size={12} /> Images — All Scenes
-              </button>
-              <button className="btn btn-accent" style={{ fontSize: '0.78rem', padding: '5px 10px' }} disabled={Boolean(batchRunner)} onClick={() => setBatchDialog({ type: 'video', scope: 'scene' })}>
-                <Film size={12} /> Videos — This Scene
-              </button>
-              <button className="btn btn-accent" style={{ fontSize: '0.78rem', padding: '5px 10px' }} disabled={Boolean(batchRunner)} onClick={() => setBatchDialog({ type: 'video', scope: 'all' })}>
-                <Film size={12} /> Videos — All Scenes
-              </button>
-
-              {batchRunner && (
-                <button className="btn btn-danger" style={{ fontSize: '0.78rem', padding: '5px 10px' }} onClick={handleCancelBatch}>
-                  <StopCircle size={12} /> Stop ({batchRunner.done}/{batchRunner.total})
-                </button>
-              )}
-
-              <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <input type="file" accept=".json" ref={shotListInputRef} onChange={(e) => handleImportShotList(e, shotListInputRef.current?.dataset.mode || 'replace')} style={{ display: 'none' }} />
-                <button
-                  className="btn btn-secondary"
-                  style={{ fontSize: '0.78rem', padding: '5px 10px' }}
-                  onClick={handleCopyLlmPrompt}
-                  title="Copy the full schema + model list to give an LLM"
-                >
-                  <Copy size={12} /> Copy LLM Prompt
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  style={{ fontSize: '0.78rem', padding: '5px 10px' }}
-                  onClick={() => { shotListInputRef.current.dataset.mode = 'replace'; shotListInputRef.current.click(); }}
-                >
-                  <Upload size={12} /> Import Shot List
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  style={{ fontSize: '0.78rem', padding: '5px 10px' }}
-                  onClick={() => { shotListInputRef.current.dataset.mode = 'append'; shotListInputRef.current.click(); }}
-                  title="Add the imported scenes after the existing ones"
-                >
-                  <Plus size={12} /> Append
-                </button>
-              </div>
-            </div>
           </div>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-light)', paddingBottom: '12px' }}>
@@ -3685,6 +3905,19 @@ Reply with ONLY a JSON object, no markdown fence:
                             placeholder="Director comments/notes..."
                           />
                         </div>
+                      </div>
+
+                      {/* What this shot will actually upload. Assigned references
+                          were previously invisible here — you could attach one and
+                          never see it again outside the generation modal. Each tick
+                          persists, so a batch run sends exactly this set. */}
+                      <div style={{ marginTop: '12px' }}>
+                        <ReferenceStrip
+                          entries={shotReferenceEntries(shot)}
+                          capacity={refImageCapacity('image', shot.imageModel || imageModel)}
+                          onToggleEntry={(entry) => toggleShotReferenceEntry(shot, entry)}
+                          onOpenPanel={() => { setActiveShotId(shot.id); setReferencePanelOpen(true); }}
+                        />
                       </div>
 
                       {/* Active Previews and Generate Actions Grid */}
@@ -5067,15 +5300,21 @@ Reply with ONLY a JSON object, no markdown fence:
                       </div>
                     )}
 
-                    <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                        <input
-                          type="checkbox"
-                          checked={Boolean(assetEditor.applyGlobalPrompts)}
-                          onChange={(e) => setAssetEditor({ ...assetEditor, applyGlobalPrompts: e.target.checked })}
-                        />
-                        Apply global pre/post prompt
-                      </label>
+                    {/* Three-way rather than a checkbox: reference art usually
+                        wants its own neutral wrapper, not the film's grade. The
+                        old boolean could only pick between the image pre/post
+                        and nothing at all. */}
+                    <div className="form-group" style={{ maxWidth: '320px' }}>
+                      <label className="form-label">Pre / post prompt to wrap this in</label>
+                      <select
+                        className="select-field"
+                        value={assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset')}
+                        onChange={(e) => setAssetEditor({ ...assetEditor, promptWrap: e.target.value })}
+                      >
+                        <option value="asset">Asset reference pre/post{assetPrePrompt || assetPostPrompt ? '' : ' (empty — set it in Settings)'}</option>
+                        <option value="image">The film's image pre/post</option>
+                        <option value="none">None — prompt exactly as written</option>
+                      </select>
                     </div>
 
                     {/* What the model is being shown. Picked below in Reference Images. */}
@@ -5321,8 +5560,17 @@ Reply with ONLY a JSON object, no markdown fence:
                   className="btn btn-primary"
                   disabled={chosen.length === 0}
                   onClick={() => {
+                    // Also remember which board records these came from, so
+                    // saving the asset links them instead of leaving two
+                    // unrelated records pointing at one file.
+                    const sourceIds = referenceImages.filter(r => chosen.includes(r.path)).map(r => r.id);
                     setAssetEditor(prev => (prev
-                      ? { ...prev, images: [...(prev.images || []), ...chosen.filter(p => !(prev.images || []).includes(p))], primaryImage: prev.primaryImage || chosen[0] }
+                      ? {
+                        ...prev,
+                        images: [...(prev.images || []), ...chosen.filter(p => !(prev.images || []).includes(p))],
+                        primaryImage: prev.primaryImage || chosen[0],
+                        linkedReferenceIds: [...new Set([...(prev.linkedReferenceIds || []), ...sourceIds])]
+                      }
                       : prev));
                     setRefBoardPicker(null);
                     showToast(`${chosen.length} reference${chosen.length === 1 ? '' : 's'} added — tick the ones to send.`, 'success');
@@ -5408,15 +5656,31 @@ Reply with ONLY a JSON object, no markdown fence:
                     const withoutStill = batchDialog.type === 'video'
                       ? candidates.filter(({ shot }) => !shot.selectedImage).length
                       : 0;
+                    // Count what will really be uploaded, so the dialog agrees
+                    // with the ticks on the shot cards rather than promising
+                    // every assigned reference.
+                    const refTotal = batchDialog.type === 'image'
+                      ? candidates.reduce((n, { shot }) => n + shotReferencePaths(shot).length, 0)
+                      : 0;
+                    const withoutRefs = batchDialog.type === 'image'
+                      ? candidates.filter(({ shot }) => shotReferencePaths(shot).length === 0).length
+                      : 0;
                     return (
                       <>
                         <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
                           Reference images: <strong style={{ color: 'var(--text-muted)' }}>
-                            {batchDialog.type === 'video' ? "each shot's own selected image" : 'each shot’s assigned references'}
+                            {batchDialog.type === 'video'
+                              ? "each shot's own selected image"
+                              : `${refTotal} across these shots — only the ones still ticked`}
                           </strong>
                           {attaching ? ', plus tagged asset images where slots remain.' : '. Tagged asset images are NOT attached.'}
                           {' '}Change this in Settings.
                         </div>
+                        {withoutRefs > 0 && batchDialog.type === 'image' && (
+                          <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                            {withoutRefs} shot{withoutRefs === 1 ? '' : 's'} will run from the prompt alone — no references assigned or all held back.
+                          </div>
+                        )}
                         {withoutStill > 0 && (
                           <div style={{ fontSize: '0.78rem', color: 'var(--accent)', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
                             <AlertTriangle size={12} style={{ marginTop: '3px', flexShrink: 0 }} />
@@ -5675,78 +5939,27 @@ Reply with ONLY a JSON object, no markdown fence:
       );
     })()}
 
-      {/* --- D. FLOATING OVERLAY: REFERENCE IMAGERY --- */}
-      {activeOverlay === 'reference' && (
-        <div className="modal-overlay" onClick={() => setActiveOverlay(null)}>
-          <div className="modal-window gallery-modal-window" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><FolderOpen size={20} /> Master Reference Imagery mood board</h2>
-              <div style={{ display: 'flex', gap: '12px' }}>
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => openProjectImageSelector('ref')}
-                  disabled={loadingStates.project_images}
-                >
-                  <FolderOpen size={14} /> Add Reference from Project
-                </button>
-                <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setActiveOverlay(null)}>
-                  <X size={16} />
-                </button>
-              </div>
-            </div>
-
-            <div className="modal-body">
-              <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '10px' }}>
-                {activeShotObj ? (
-                  <span>Click reference cards below to associate/de-associate them with the active shot: <strong>{activeShotObj.name}</strong></span>
-                ) : (
-                  <span>Select a shot timeline row first to assign references.</span>
-                )}
-              </div>
-
-              <div className="media-grid">
-                {referenceImages.map((ref) => {
-                  const isAssigned = activeShotObj?.referenceImages?.includes(ref.id);
-                  return (
-                    <div
-                      key={ref.id}
-                      className={`media-card ${isAssigned ? 'selected-select' : ''}`}
-                      onClick={() => toggleRefImageMapping(ref.id)}
-                      style={{ cursor: 'pointer' }}
-                    >
-                      <div className="media-thumb-container">
-                        <AssetImage path={ref.path} alt={ref.name} />
-                        {isAssigned && <div className="media-badge">Assigned</div>}
-                      </div>
-                      <div className="media-info">
-                        <input
-                          type="text"
-                          className="input-field"
-                          style={{ padding: '2px 4px', fontSize: '0.8rem', background: 'none', border: 'none' }}
-                          value={ref.name}
-                          onChange={(e) => handleRenameAsset('reference', ref.id, e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
-                        />
-                        <div className="media-actions">
-                          <button
-                            className="btn btn-danger"
-                            style={{ padding: '4px 8px', width: '100%' }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleDeleteAsset('reference', ref.id);
-                            }}
-                          >
-                            Delete Reference
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        </div>
+      {/* --- REFERENCE BOARD (docked panel, not a modal — see ReferencePanel) --- */}
+      {referencePanelOpen && (
+        <ReferencePanel
+          references={referenceImages}
+          assignments={refAssignments}
+          scenes={scenes}
+          assetLibrary={assetLibrary}
+          activeSceneId={activeSceneId}
+          activeShotId={activeShotId}
+          busy={loadingStates.ref_upload || loadingStates.project_images}
+          onClose={() => setReferencePanelOpen(false)}
+          onAssign={handleAssignReferences}
+          onUnassign={handleUnassignReferences}
+          onUpdateReferences={handleUpdateReferences}
+          onDeleteReferences={handleDeleteReferences}
+          onLinkToAsset={handleLinkReferencesToAsset}
+          onCreateAssetFrom={handleCreateAssetFromReferences}
+          onUpload={(files) => handleGalleryImageUpload({ target: { files } }, 'ref')}
+          onAddFromProject={() => openProjectImageSelector('ref')}
+          onPreview={(ref) => handleImageDoubleClick(ref.path, ref.name)}
+        />
       )}
 
       {projectImagesSelector && (
@@ -5857,370 +6070,33 @@ Reply with ONLY a JSON object, no markdown fence:
         </div>
       )}
 
-      {/* --- F. CONSOLIDATED SETTINGS & CREDENTIALS OVERLAY --- */}
+      {/* --- SETTINGS (tabbed — see SettingsPanel) --- */}
       {activeOverlay === 'settings' && (
-        <div className="modal-overlay" onClick={() => setActiveOverlay(null)}>
-          <div className="modal-window" style={{ maxWidth: '600px' }} onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><Settings size={20} /> System Studio Settings</h2>
-              <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setActiveOverlay(null)}>
-                <X size={16} />
-              </button>
-            </div>
-
-            <div className="modal-body">
-              {/* API Credentials */}
-              <div className="glass-panel" style={{ padding: '16px', background: 'rgba(128,128,128,0.02)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h3 style={{ fontSize: '0.95rem', color: 'var(--primary-hover)', display: 'flex', alignItems: 'center', gap: '6px' }}><Settings size={16} /> API Key Setup</h3>
-
-                {isStatic() && (
-                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                    Keys are saved in this browser's localStorage and sent straight from this page to each
-                    provider — this site has no server to receive them. Anything running on this origin can
-                    read them, so prefer keys you can rotate.
-                  </span>
-                )}
-
-                <div className="form-group">
-                  <label className="form-label">Google AI Studio Key (Gemini)</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={apiKeys.geminiKey || ''}
-                    onChange={(e) => setApiKeys({ ...apiKeys, geminiKey: e.target.value })}
-                    placeholder="AIzaSy..."
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">OpenAI API Key (ChatGPT / DALL-E)</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={apiKeys.openaiKey || ''}
-                    onChange={(e) => setApiKeys({ ...apiKeys, openaiKey: e.target.value })}
-                    placeholder="sk-proj-..."
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Anthropic API Key (Claude)</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={apiKeys.claudeKey || ''}
-                    onChange={(e) => setApiKeys({ ...apiKeys, claudeKey: e.target.value })}
-                    placeholder="sk-ant-..."
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Fal.ai API Key (Nano Banana / Wav2Lip)</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={apiKeys.falKey || ''}
-                    onChange={(e) => setApiKeys({ ...apiKeys, falKey: e.target.value })}
-                    placeholder="fal-key-..."
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Runway API Key (Gen-3)</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={apiKeys.runwayKey || ''}
-                    onChange={(e) => setApiKeys({ ...apiKeys, runwayKey: e.target.value })}
-                    placeholder="rwy-..."
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Kling AI API Key</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={apiKeys.klingKey || ''}
-                    onChange={(e) => setApiKeys({ ...apiKeys, klingKey: e.target.value })}
-                    placeholder="Kling Dev Key..."
-                  />
-                </div>
-
-                <div className="control-grid">
-                  <div className="form-group">
-                    <label className="form-label">Higgsfield API Key</label>
-                    <input
-                      type="text"
-                      className="input-field"
-                      value={apiKeys.higgsfieldKey || ''}
-                      onChange={(e) => setApiKeys({ ...apiKeys, higgsfieldKey: e.target.value })}
-                      placeholder="from cloud.higgsfield.ai"
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Higgsfield API Secret</label>
-                    <input
-                      type="text"
-                      className="input-field"
-                      value={apiKeys.higgsfieldSecret || ''}
-                      onChange={(e) => setApiKeys({ ...apiKeys, higgsfieldSecret: e.target.value })}
-                      placeholder="paired secret"
-                    />
-                  </div>
-                </div>
-
-                {isStatic() ? (
-                  <div className="form-group">
-                    <label className="form-label">CORS Proxy (Optional)</label>
-                    <input
-                      type="text"
-                      className="input-field"
-                      value={apiKeys.corsProxy || ''}
-                      onChange={(e) => setApiKeys({ ...apiKeys, corsProxy: e.target.value })}
-                      placeholder="https://my-proxy.example/?url={url}"
-                    />
-                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginTop: '2px', display: 'block' }}>
-                      Only needed if a provider refuses direct browser calls. Requests are rewritten to this
-                      URL, with <code>{'{url}'}</code> replaced by the encoded target (appended if you omit it).
-                      Use a proxy you control — it will see your API keys.
-                    </small>
-                  </div>
-                ) : (
-                  <div className="form-group">
-                    <label className="form-label">Local Working Folder Path (Optional - Shared Drive)</label>
-                    <input
-                      type="text"
-                      className="input-field"
-                      value={apiKeys.workingFolder || ''}
-                      onChange={(e) => setApiKeys({ ...apiKeys, workingFolder: e.target.value })}
-                      placeholder="e.g. X:\SharedFolder or C:\SharedProjects"
-                    />
-                    <small style={{ color: 'var(--text-muted)', fontSize: '0.7rem', marginTop: '2px', display: 'block' }}>
-                      If specified and exists, project assets and states will save to/load from this folder.
-                    </small>
-                  </div>
-                )}
-
-                <button className="btn btn-primary" onClick={() => saveConfig(apiKeys)} style={{ alignSelf: 'flex-end', marginTop: '6px' }}>
-                  <Save size={14} /> Save Credentials & Settings
-                </button>
-              </div>
-
-              {/* JSON I/O Import/Export */}
-              <div className="glass-panel" style={{ padding: '16px', background: 'rgba(128,128,128,0.02)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h3 style={{ fontSize: '0.95rem', color: 'var(--secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}><FileJson size={16} /> Workspace File Sharing</h3>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Backup or share work relative to the project root directory.</span>
-                <div style={{ display: 'flex', gap: '12px' }}>
-                  <label className="btn btn-secondary" style={{ cursor: 'pointer', flex: 1 }}>
-                    <FileJson size={14} /> Import State JSON
-                    <input type="file" accept=".json" onChange={handleImportState} style={{ display: 'none' }} />
-                  </label>
-                  <button className="btn btn-secondary" style={{ flex: 1 }} onClick={handleExportState}>
-                    <Download size={14} /> Export State JSON
-                  </button>
-                </div>
-              </div>
-
-              {/* System Defaults */}
-              <div className="glass-panel" style={{ padding: '16px', background: 'rgba(128,128,128,0.02)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h3 style={{ fontSize: '0.95rem', color: 'var(--primary-hover)' }}>Default Model Options</h3>
-                <div className="control-grid">
-                  <div className="form-group">
-                    <label className="form-label">LLM Writer Engine</label>
-                    <select className="select-field" value={activeLlm} onChange={(e) => setActiveLlm(e.target.value)}>
-                      {LLM_PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-                    </select>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Specific LLM Model</label>
-                    <select className="select-field" value={llmModel} onChange={(e) => setLlmModel(e.target.value)}>
-                      {llmModelsList.map(m => (
-                        <option key={m.id} value={m.id}>{m.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-                <div className="control-grid" style={{ marginTop: '8px' }}>
-                  <div className="form-group">
-                    <label className="form-label">Default Image Model</label>
-                    <select
-                      className="select-field"
-                      value={isKnownImageModel(imageModel) ? imageModel : 'custom'}
-                      onChange={(e) => setImageModel(e.target.value === 'custom' ? '' : e.target.value)}
-                    >
-                      <ModelOptions models={IMAGE_MODELS} unit="img" />
-                      <option value="custom">Custom model path…</option>
-                    </select>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Default Image Aspect Ratio</label>
-                    <select className="select-field" value={imageResolution} onChange={(e) => setImageResolution(e.target.value)}>
-                      {IMAGE_ASPECT_RATIOS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                    </select>
-                  </div>
-                </div>
-                {!isKnownImageModel(imageModel) && (
-                  <div className="form-group" style={{ marginTop: '4px' }}>
-                    <label className="form-label">Custom Default Image Model ID</label>
-                    <input
-                      type="text"
-                      className="input-field"
-                      value={imageModel}
-                      onChange={(e) => setImageModel(e.target.value)}
-                      placeholder="e.g. fal-ai/flux-lora"
-                    />
-                  </div>
-                )}
-
-                <div className="control-grid" style={{ marginTop: '8px' }}>
-                  <div className="form-group">
-                    <label className="form-label">Default Video Model</label>
-                    <select
-                      className="select-field"
-                      value={isKnownVideoModel(videoModel) ? videoModel : 'custom'}
-                      onChange={(e) => setVideoModel(e.target.value === 'custom' ? '' : e.target.value)}
-                    >
-                      <ModelOptions models={VIDEO_MODELS} unit="video" />
-                      <option value="custom">Custom model path…</option>
-                    </select>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Default Video Resolution</label>
-                    <select className="select-field" value={videoResolution} onChange={(e) => setVideoResolution(e.target.value)}>
-                      {VIDEO_RESOLUTIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                    </select>
-                  </div>
-                </div>
-                {!isKnownVideoModel(videoModel) && (
-                  <div className="form-group" style={{ marginTop: '4px' }}>
-                    <label className="form-label">Custom Default Video Model ID</label>
-                    <input
-                      type="text"
-                      className="input-field"
-                      value={videoModel}
-                      onChange={(e) => setVideoModel(e.target.value)}
-                      placeholder="e.g. higgsfield-ai/dop/standard"
-                    />
-                  </div>
-                )}
-
-                <div className="form-group" style={{ maxWidth: '220px', marginTop: '8px' }}>
-                  <label className="form-label">Default Video Duration</label>
-                  <select className="select-field" value={videoDuration} onChange={(e) => setVideoDuration(e.target.value)}>
-                    <option value="5">5 Seconds</option>
-                    <option value="10">10 Seconds</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Global Pre/Post Prompts */}
-              <div className="glass-panel" style={{ padding: '16px', background: 'rgba(128,128,128,0.02)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h3 style={{ fontSize: '0.95rem', color: 'var(--primary-hover)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <Layers size={16} /> Global Pre / Post Prompts
-                </h3>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                  Wrapped around every prompt at generation time — put film stock, lens and grade language here
-                  instead of repeating it in each shot. The generation modal shows the combined result before you submit.
-                </span>
-
-                <div className="control-grid">
-                  <div className="form-group">
-                    <label className="form-label">Image Pre-Prompt</label>
-                    <textarea
-                      className="input-field"
-                      style={{ minHeight: '60px', fontSize: '0.85rem' }}
-                      value={prePrompt}
-                      onChange={(e) => setPrePrompt(e.target.value)}
-                      placeholder="cinematic film still, shot on 35mm anamorphic,"
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Image Post-Prompt</label>
-                    <textarea
-                      className="input-field"
-                      style={{ minHeight: '60px', fontSize: '0.85rem' }}
-                      value={postPrompt}
-                      onChange={(e) => setPostPrompt(e.target.value)}
-                      placeholder=", volumetric lighting, ultra detailed, 8k"
-                    />
-                  </div>
-                </div>
-
-                <div style={{ borderTop: '1px solid var(--border-light)', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  <strong style={{ fontSize: '0.85rem' }}>Attach tagged asset images by default</strong>
-                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                    Whether a <code>&lt;Tag&gt;</code>'s reference image is uploaded with the request. Your explicitly
-                    chosen image always takes the first slot — most image-to-video models accept only one input, so
-                    tagged images would otherwise displace the shot frame you meant to animate.
-                  </span>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.85rem' }}>
-                    <input type="checkbox" checked={attachTagsForImages} onChange={(e) => setAttachTagsForImages(e.target.checked)} />
-                    Image generation <span style={{ color: 'var(--text-dim)' }}>(recommended on — this is how characters stay consistent)</span>
-                  </label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.85rem' }}>
-                    <input type="checkbox" checked={attachTagsForVideos} onChange={(e) => setAttachTagsForVideos(e.target.checked)} />
-                    Video generation <span style={{ color: 'var(--text-dim)' }}>(recommended off — animate the shot's own image)</span>
-                  </label>
-                </div>
-
-                <div className="control-grid">
-                  <div className="form-group">
-                    <label className="form-label">Video Pre-Prompt</label>
-                    <textarea
-                      className="input-field"
-                      style={{ minHeight: '60px', fontSize: '0.85rem' }}
-                      value={videoPrePrompt}
-                      onChange={(e) => setVideoPrePrompt(e.target.value)}
-                      placeholder="Leave blank to reuse nothing"
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Video Post-Prompt</label>
-                    <textarea
-                      className="input-field"
-                      style={{ minHeight: '60px', fontSize: '0.85rem' }}
-                      value={videoPostPrompt}
-                      onChange={(e) => setVideoPostPrompt(e.target.value)}
-                      placeholder=", smooth cinematic camera motion"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* LLM Prompts Config */}
-              <div className="glass-panel" style={{ padding: '16px', background: 'rgba(128,128,128,0.02)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <h3 style={{ fontSize: '0.95rem', color: 'var(--secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}><MessageSquare size={16} /> LLM Prompt Engineering Settings</h3>
-                
-                <div className="form-group">
-                  <label className="form-label">LLM Image Prompt Generator (System Instruction)</label>
-                  <textarea
-                    className="input-field"
-                    style={{ minHeight: '80px', fontSize: '0.85rem' }}
-                    value={imageSystemPrompt}
-                    onChange={(e) => setImageSystemPrompt(e.target.value)}
-                    placeholder="System prompt instructions..."
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">LLM Video Prompt Generator (System Instruction)</label>
-                  <textarea
-                    className="input-field"
-                    style={{ minHeight: '80px', fontSize: '0.85rem' }}
-                    value={videoSystemPrompt}
-                    onChange={(e) => setVideoSystemPrompt(e.target.value)}
-                    placeholder="System prompt instructions..."
-                  />
-                </div>
-              </div>
-            </div>
-            
-            <div className="modal-footer">
-              <button className="btn btn-primary" onClick={() => setActiveOverlay(null)}>Done</button>
-            </div>
-          </div>
-        </div>
+        <SettingsPanel
+          apiKeys={apiKeys}
+          setApiKeys={setApiKeys}
+          onSaveCredentials={saveConfig}
+          isStatic={isStatic()}
+          activeLlm={activeLlm} setActiveLlm={setActiveLlm}
+          llmModel={llmModel} setLlmModel={setLlmModel}
+          llmModelsList={llmModelsList}
+          imageModel={imageModel} setImageModel={setImageModel}
+          imageResolution={imageResolution} setImageResolution={setImageResolution}
+          videoModel={videoModel} setVideoModel={setVideoModel}
+          videoResolution={videoResolution} setVideoResolution={setVideoResolution}
+          videoDuration={videoDuration} setVideoDuration={setVideoDuration}
+          batchConcurrency={batchConcurrency} setBatchConcurrency={setBatchConcurrency}
+          attachTagsForImages={attachTagsForImages} setAttachTagsForImages={setAttachTagsForImages}
+          attachTagsForVideos={attachTagsForVideos} setAttachTagsForVideos={setAttachTagsForVideos}
+          theme={theme} onToggleTheme={handleToggleTheme}
+          promptSettings={promptSettings}
+          setPromptSetting={setPromptSetting}
+          resetPromptSetting={resetPromptSetting}
+          onImportState={handleImportState}
+          onExportState={handleExportState}
+          ModelOptions={ModelOptions}
+          onClose={() => setActiveOverlay(null)}
+        />
       )}
 
       {/* --- I. HELP & LLM IMPORT GUIDE OVERLAY --- */}

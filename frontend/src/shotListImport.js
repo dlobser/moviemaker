@@ -3,6 +3,7 @@
 
 import { IMAGE_MODELS, VIDEO_MODELS, LLM_PROVIDERS } from './catalog.js';
 import { ASSET_TYPES } from './promptTags.js';
+import { DEFAULT_IMPORT_INTRO } from './prompts.js';
 
 export const SHOT_LIST_SCHEMA_VERSION = 1;
 
@@ -71,7 +72,7 @@ const SCHEMA_EXAMPLE = `{
  * catalog and the project's existing asset tags so the LLM writes prompts that
  * reference assets that actually exist.
  */
-export function buildLlmImportPrompt({ assetLibrary = [], sourceMaterial = '' } = {}) {
+export function buildLlmImportPrompt({ assetLibrary = [], sourceMaterial = '', intro = '' } = {}) {
   const imageModelList = IMAGE_MODELS
     .map(m => `  - "${m.id}" — ${m.label}${m.refImages ? ` (accepts up to ${m.refImages} reference image${m.refImages === 1 ? '' : 's'})` : ''}`)
     .join('\n');
@@ -87,25 +88,17 @@ export function buildLlmImportPrompt({ assetLibrary = [], sourceMaterial = '' } 
       .join('\n')
     : '  (none yet — invent the assets this story needs and list them in "assets")';
 
-  return `You are a professional storyboard supervisor. Convert the material below into a single JSON document that MovieMaker Studio can import directly.
-
-=== OUTPUT RULES ===
-1. Return ONLY raw JSON. No markdown fences, no commentary before or after.
-2. Use the exact key names shown in the schema. Omit keys you have no value for; never invent new keys.
-3. Do not generate "id" fields — the studio assigns those on import.
-4. Escape all inner quotes properly, or use single quotes inside dialogue strings.
+  return `${intro || DEFAULT_IMPORT_INTRO}
 
 === SCHEMA ===
 ${SCHEMA_EXAMPLE}
 
 === ASSET TAGS ===
-Recurring characters, environments, props and styles go in the "assets" array.
-Anywhere in an "imagePrompt" or "videoPrompt" you may reference one by wrapping its
-tag in angle brackets, e.g. <Ralph>. On generation the studio substitutes the
-asset's name and description into the prompt AND uploads that asset's reference
-image to any model that accepts image inputs — this is how character consistency
-is maintained across shots. Use tags aggressively: every time a named character,
-location or signature prop appears in a shot, tag it rather than re-describing it.
+Anywhere in an "imagePrompt" or "videoPrompt" you may reference an asset by
+wrapping its tag in angle brackets, e.g. <Ralph>. On generation the studio
+substitutes the asset's name and description into the prompt AND uploads that
+asset's reference image to any model that accepts image inputs — this is how
+character consistency is maintained across shots.
 
 Tags must be a single word (letters, digits, _ or -), and every tag used in a
 prompt must exist in the "assets" array.
@@ -113,19 +106,6 @@ Valid asset "type" values: ${assetTypeList}.
 
 Assets already defined in this project (reuse these tags, do not redefine them):
 ${existingAssets}
-
-=== FIELD NOTES ===
-- "prePrompt" / "postPrompt" are prepended/appended to EVERY image prompt in the
-  project — put global film-stock, lens and grade language there, not in shots.
-- "videoPrePrompt" / "videoPostPrompt" do the same for video prompts.
-- "imageSystemPrompt" / "videoSystemPrompt" are the system instructions used when
-  the studio asks an LLM to rewrite a shot description into a model prompt.
-- "setup" is camera/lens/blocking. "description" is what happens on screen.
-  "dialogue" is spoken lines. "notes" is director intent.
-- "imagePrompt" / "videoPrompt" are the ready-to-run model prompts. Write them as
-  dense visual descriptions, not sentences about the story.
-- Per-shot "imageModel"/"videoModel" override the project defaults; include them
-  only when a specific shot genuinely needs a different model.
 
 === AVAILABLE IMAGE MODELS ===
 ${imageModelList}

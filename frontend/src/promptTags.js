@@ -7,6 +7,7 @@
 //     images: ['assets/ref_123.png'], primaryImage: 'assets/ref_123.png' }
 
 import { refImageCapacity } from './catalog.js';
+import { assetTemplateText, fillTemplate } from './prompts.js';
 
 export const ASSET_TYPES = [
   { id: 'character', label: 'Character' },
@@ -49,31 +50,26 @@ export function findAssetByTag(assetLibrary, tag) {
   return (assetLibrary || []).find(asset => normalizeTag(asset.tag) === key) || null;
 }
 
-// Starting prompts for generating an asset's reference image. Reference art
-// wants the opposite of a cinematic frame: neutral pose, plain background,
-// even light — anything the model can lift the subject cleanly out of.
-const ASSET_PROMPT_TEMPLATES = {
-  character: (name, description) => `full body character reference sheet of ${name}, ${description}, neutral standing pose, facing camera, plain light grey studio background, soft even lighting, sharp focus, full figure visible`,
-  environment: (name, description) => `establishing wide shot of ${name}, ${description}, no people in frame, natural lighting, deep focus`,
-  prop: (name, description) => `product photograph of ${name}, ${description}, centred, plain neutral background, soft studio lighting, sharp focus`,
-  style: (name, description) => `style reference board: ${description}, cohesive colour palette and texture treatment`,
-  vehicle: (name, description) => `three-quarter front view of ${name}, ${description}, plain neutral background, even studio lighting, full vehicle in frame`
-};
-
 /**
  * A sensible starting prompt for generating this asset's reference image,
  * derived from its type, name and description.
+ *
+ * The per-type templates live in prompts.js and are editable per project, so
+ * `promptSettings` is threaded through; omitting it uses the shipped defaults.
  */
-export function defaultAssetPrompt(asset) {
+export function defaultAssetPrompt(asset, promptSettings) {
   if (!asset) return '';
   const name = (asset.name || asset.tag || '').trim();
   const description = (asset.description || '').trim();
   if (!name && !description) return '';
 
-  const template = ASSET_PROMPT_TEMPLATES[asset.type] || ASSET_PROMPT_TEMPLATES.character;
+  const template = assetTemplateText(promptSettings, asset.type || 'character');
   // With no description the template's ", ," reads badly — fall back to the name.
-  if (!description) return template(name, name).replace(/,\s*,/g, ',');
-  return template(name || description, description);
+  const filled = fillTemplate(template, {
+    name: name || description,
+    description: description || name
+  });
+  return description ? filled : filled.replace(/,\s*,/g, ',');
 }
 
 /**
