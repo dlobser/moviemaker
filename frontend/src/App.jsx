@@ -33,13 +33,13 @@ import {
   Scissors,
   RotateCcw,
   Moon,
-  ClipboardPaste
+  ClipboardPaste,
+  Undo2,
+  Redo2
 } from 'lucide-react';
 import {
   IMAGE_MODELS,
   VIDEO_MODELS,
-  IMAGE_ASPECT_RATIOS,
-  VIDEO_RESOLUTIONS,
   LLM_PROVIDERS,
   PROVIDER_LABELS,
   getImageModel,
@@ -48,7 +48,10 @@ import {
   isKnownVideoModel,
   priceLabel,
   groupedModelOptions,
-  refImageCapacity
+  parseModelId,
+  durationOptions,
+  refImageCapacity,
+  sizeOptions
 } from './catalog.js';
 import {
   ASSET_TYPES,
@@ -86,6 +89,7 @@ import {
 } from './references.js';
 import ReferencePanel, { ReferenceStrip } from './ReferencePanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
+import CustomModelPath from './CustomModelPath.jsx';
 import DreamDialog from './DreamDialog.jsx';
 import {
   DEFAULT_DREAM_SYSTEM_PROMPT,
@@ -96,6 +100,17 @@ import {
   parseDreamReply
 } from './dream.js';
 import { captureLastFrame } from './dreamFrame.js';
+import {
+  canRedo as historyCanRedo,
+  canUndo as historyCanUndo,
+  createHistory,
+  describeChange,
+  pushHistory,
+  redoHistory,
+  redoLabel as historyRedoLabel,
+  undoHistory,
+  undoLabel as historyUndoLabel
+} from './history.js';
 import { Menu, MenuItem, MenuLabel, MenuSeparator } from './MenuBar.jsx';
 import './reference.css';
 import './menu.css';
@@ -181,6 +196,9 @@ export default function App() {
   // attaching a character portrait there silently replaces the frame you meant
   // to animate, so it is off unless explicitly asked for.
   const [attachTagsForImages, setAttachTagsForImages] = useState(true);
+  // Atlas Cloud's open-weight image models expose their safety checker as a
+  // request flag. Defaults to the provider's own default (on).
+  const [atlasSafetyChecker, setAtlasSafetyChecker] = useState(true);
   const [attachTagsForVideos, setAttachTagsForVideos] = useState(false);
   const [genModalAttachTags, setGenModalAttachTags] = useState(true);
 
@@ -217,6 +235,13 @@ export default function App() {
   const [batchDialog, setBatchDialog] = useState(null); // { type: 'image'|'video', scope: 'scene'|'all' }
   const [batchOnlyMissing, setBatchOnlyMissing] = useState(true);
   const [batchConcurrency, setBatchConcurrency] = useState(3);
+
+  // --- UNDO / REDO ---
+  // Snapshots of the whole project, taken from the same payload the autosave
+  // writes. See history.js for why it is whole-project rather than per-action.
+  const [history, setHistory] = useState(createHistory);
+  const lastSnapshotRef = useRef(null);   // the state the last snapshot captured
+  const skipHistoryRef = useRef(true);    // true while loading, so a load is not a step
 
   // --- DREAM MODE (self-contained; nothing else reads this) ---
   const [dreamOpen, setDreamOpen] = useState(false);
@@ -389,8 +414,15 @@ export default function App() {
     }
   };
 
-  /** Push a saved state blob into every piece of studio state. */
-  const applyLoadedState = (state) => {
+  /**
+   * Push a saved state blob into every piece of studio state.
+   *
+   * `resetHistory` is on for every real load — opening a project, restoring a
+   * checkpoint, importing — because undoing across a project switch would
+   * paste one film into another. Undo and redo replay through here too, and
+   * pass false so they keep the stack they are walking.
+   */
+  const applyLoadedState = (state, { resetHistory = true } = {}) => {
     // Migrate or load scenes
     let loadedScenes = state.scenes || [];
     if (loadedScenes.length === 0 && state.shots && state.shots.length > 0) {
@@ -456,6 +488,7 @@ export default function App() {
     setBatchConcurrency(state.batchConcurrency || 3);
     setAttachTagsForImages(state.attachTagsForImages !== false);
     setAttachTagsForVideos(state.attachTagsForVideos === true);
+    setAtlasSafetyChecker(state.atlasSafetyChecker !== false);
     // Only the fields a dream saved are stored, so unset ones follow the
     // project's current models rather than a pinned stale one.
     setDreamSettings(createDreamSettings(state.dreamSettings || {}));
@@ -482,6 +515,10 @@ export default function App() {
       foundShotId = loadedScenes[0]?.shots[0]?.id || null;
     }
     setActiveShotId(foundShotId);
+
+    // A load is not an undoable step: the next snapshot becomes the new floor.
+    if (resetHistory) setHistory(createHistory());
+    skipHistoryRef.current = true;
   };
 
   // The full serialisable studio state. Shared by autosave and Save As.
@@ -509,6 +546,7 @@ export default function App() {
       batchConcurrency,
       attachTagsForImages,
       attachTagsForVideos,
+      atlasSafetyChecker,
       dreamSettings: compactDreamSettings(dreamSettings),
       // Only the slots that differ from their defaults are written, so a future
       // change to a default still reaches projects that never edited it.
@@ -561,13 +599,117 @@ export default function App() {
     return () => document.body.classList.remove('reference-docked');
   }, [referencePanelOpen]);
 
+  /**
+   * Capture the state that existed *before* the change we just settled on.
+   *
+   * Sharing the autosave's debounce is deliberate: it means a burst of typing
+   * becomes one undo step rather than sixty, and that what undo restores is
+   * always something that was also written to disk.
+   */
+  const recordHistory = () => {
+    const snapshot = buildStatePayload();
+    if (skipHistoryRef.current) {
+      // The change came from a load or from undo itself — take it as the new
+      // baseline without recording a step.
+      skipHistoryRef.current = false;
+      lastSnapshotRef.current = snapshot;
+      return;
+    }
+    const previous = lastSnapshotRef.current;
+    lastSnapshotRef.current = snapshot;
+    if (!previous) return;
+    setHistory(prev => pushHistory(prev, {
+      state: previous,
+      label: describeChange(previous, snapshot),
+      at: Date.now()
+    }));
+  };
+
   const saveStateRef = useRef();
-  saveStateRef.current = () => { saveProjectState(); };
+  saveStateRef.current = () => { saveProjectState(); recordHistory(); };
   useEffect(() => {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, promptSettings, concatenatedVideo, edit, dreamSettings]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, promptSettings, concatenatedVideo, edit, dreamSettings]);
+
+  // --- UNDO / REDO ----------------------------------------------------------
+
+  const undoBusyReason = () => {
+    if (batchRunner) return 'a batch is running';
+    if (dreamRun?.active) return 'a dream is running';
+    return null;
+  };
+
+  /**
+   * Step the whole project back one state.
+   *
+   * Refused mid-batch and mid-dream: those write results in asynchronously, so
+   * rolling the project back underneath them would drop whatever landed next
+   * into a project that no longer expects it.
+   */
+  const handleUndo = () => {
+    const busy = undoBusyReason();
+    if (busy) {
+      showToast(`Cannot undo while ${busy}. Stop it first.`, 'warning');
+      return;
+    }
+    const label = historyUndoLabel(history);
+    const step = undoHistory(history, { state: buildStatePayload(), label, at: Date.now() });
+    if (!step) {
+      showToast('Nothing left to undo.', 'info');
+      return;
+    }
+    applyLoadedState(step.entry.state, { resetHistory: false });
+    setHistory(step.history);
+    showToast(`Undid ${step.entry.label}.`);
+  };
+
+  const handleRedo = () => {
+    const busy = undoBusyReason();
+    if (busy) {
+      showToast(`Cannot redo while ${busy}. Stop it first.`, 'warning');
+      return;
+    }
+    const label = historyRedoLabel(history);
+    const step = redoHistory(history, { state: buildStatePayload(), label, at: Date.now() });
+    if (!step) {
+      showToast('Nothing left to redo.', 'info');
+      return;
+    }
+    applyLoadedState(step.entry.state, { resetHistory: false });
+    setHistory(step.history);
+    showToast(`Redid ${label || 'change'}.`);
+  };
+
+  // Kept in refs so the key listener can be bound once rather than rebound on
+  // every history change.
+  const undoRef = useRef();
+  const redoRef = useRef();
+  undoRef.current = handleUndo;
+  redoRef.current = handleRedo;
+
+  useEffect(() => {
+    const onKey = (event) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const key = event.key.toLowerCase();
+      if (key !== 'z' && key !== 'y') return;
+
+      // A text field has its own undo stack and the browser's is better than
+      // ours inside one — stepping the whole project back mid-sentence is not
+      // what Ctrl+Z means while the caret is in a textarea.
+      const target = event.target;
+      if (target?.isContentEditable) return;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+      event.preventDefault();
+      if (key === 'y' || event.shiftKey) redoRef.current();
+      else undoRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // Save Credentials
   const saveConfig = async (newKeys) => {
@@ -1061,10 +1203,13 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: model,
-          providerFamily: getImageModel(model)?.provider || null,
+          // A custom path may declare its host as `fal:` / `higgsfield:`;
+          // a catalog model carries its provider in the catalog itself.
+          providerFamily: parseModelId(model).family || getImageModel(model)?.provider || null,
           prompt: promptText,
           resolution: resOption,
-          inputImagePaths
+          inputImagePaths,
+          safetyChecker: atlasSafetyChecker
         })
       });
 
@@ -1157,7 +1302,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: model,
-          providerFamily: getVideoModel(model)?.provider || null,
+          providerFamily: parseModelId(model).family || getVideoModel(model)?.provider || null,
           videoModel: model,
           prompt: promptText,
           imageUrls: imageUrlsToSend,
@@ -1813,7 +1958,9 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: model,
-          providerFamily: getImageModel(model)?.provider || null,
+          // A custom path may declare its host as `fal:` / `higgsfield:`;
+          // a catalog model carries its provider in the catalog itself.
+          providerFamily: parseModelId(model).family || getImageModel(model)?.provider || null,
           prompt: composed.prompt,
           resolution,
           inputImagePaths: composed.inputImagePaths
@@ -3795,6 +3942,23 @@ export default function App() {
               neither is a command, so neither belongs in a dropdown. */}
           <nav className="menu-bar">
             <Menu label="Project" icon={FolderOpen}>
+              <MenuItem
+                icon={Undo2}
+                disabled={!historyCanUndo(history)}
+                hint="Ctrl+Z"
+                onClick={handleUndo}
+              >
+                {historyCanUndo(history) ? `Undo ${historyUndoLabel(history)}` : 'Undo'}
+              </MenuItem>
+              <MenuItem
+                icon={Redo2}
+                disabled={!historyCanRedo(history)}
+                hint="Ctrl+Shift+Z"
+                onClick={handleRedo}
+              >
+                {historyCanRedo(history) ? `Redo ${historyRedoLabel(history)}` : 'Redo'}
+              </MenuItem>
+              <MenuSeparator />
               <MenuItem icon={Plus} onClick={() => { setActiveOverlay('projects'); setNewProjectDraft({ directory: '', name: '' }); }}>
                 New project…
               </MenuItem>
@@ -3969,6 +4133,27 @@ export default function App() {
                 ? `Batch ${batchRunner.done}/${batchRunner.total}`
                 : `${activeJobsCount} generating`}
             </span>
+          </div>
+
+          <div style={{ display: 'flex', gap: '2px' }}>
+            <button
+              className="btn btn-secondary"
+              style={{ padding: '8px', borderRadius: '50%' }}
+              disabled={!historyCanUndo(history)}
+              onClick={handleUndo}
+              title={historyCanUndo(history) ? `Undo ${historyUndoLabel(history)} (Ctrl+Z)` : 'Nothing to undo'}
+            >
+              <Undo2 size={17} />
+            </button>
+            <button
+              className="btn btn-secondary"
+              style={{ padding: '8px', borderRadius: '50%' }}
+              disabled={!historyCanRedo(history)}
+              onClick={handleRedo}
+              title={historyCanRedo(history) ? `Redo ${historyRedoLabel(history)} (Ctrl+Shift+Z)` : 'Nothing to redo'}
+            >
+              <Redo2 size={17} />
+            </button>
           </div>
 
           <button
@@ -4889,7 +5074,7 @@ export default function App() {
                     value={genModalRes}
                     onChange={(e) => setGenModalRes(e.target.value)}
                   >
-                    {(generationModal.type === 'image' ? IMAGE_ASPECT_RATIOS : VIDEO_RESOLUTIONS).map(opt => (
+                    {sizeOptions(generationModal.type, genModalModel, genModalRes).map(opt => (
                       <option key={opt.value} value={opt.value}>{opt.label}</option>
                     ))}
                   </select>
@@ -4897,18 +5082,16 @@ export default function App() {
               </div>
 
               {!(generationModal.type === 'image' ? isKnownImageModel(genModalModel) : isKnownVideoModel(genModalModel)) && (
-                <div className="form-group" style={{ marginTop: '10px' }}>
-                  <label className="form-label">Custom Model Path</label>
-                  <input
-                    type="text"
-                    className="input-field"
+                <div style={{ marginTop: '10px' }}>
+                  <CustomModelPath
+                    label="Custom Model Path"
                     value={genModalModel}
-                    onChange={(e) => {
-                      setGenModalModel(e.target.value);
-                      if (generationModal.type === 'image') setImageModel(e.target.value);
-                      else setVideoModel(e.target.value);
+                    onChange={(next) => {
+                      setGenModalModel(next);
+                      if (generationModal.type === 'image') setImageModel(next);
+                      else setVideoModel(next);
                     }}
-                    placeholder="e.g. fal-ai/flux-lora or higgsfield-ai/soul/standard"
+                    placeholder={generationModal.type === 'image' ? 'e.g. fal-ai/flux-lora' : 'e.g. bytedance/seedance-2.0/image-to-video'}
                   />
                 </div>
               )}
@@ -4967,8 +5150,9 @@ export default function App() {
                       value={genModalDuration}
                       onChange={(e) => setGenModalDuration(e.target.value)}
                     >
-                      <option value="5">5 Seconds</option>
-                      <option value="10">10 Seconds</option>
+                      {durationOptions(genModalModel, genModalDuration).map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
                     </select>
                   </div>
 
@@ -5726,22 +5910,18 @@ export default function App() {
                           value={assetEditor.imageResolution || imageResolution}
                           onChange={(e) => setAssetEditor({ ...assetEditor, imageResolution: e.target.value })}
                         >
-                          {IMAGE_ASPECT_RATIOS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                          {sizeOptions('image', modelId, assetEditor.imageResolution).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                         </select>
                       </div>
                     </div>
 
                     {!isKnownImageModel(modelId) && (
-                      <div className="form-group">
-                        <label className="form-label">Custom Model Path</label>
-                        <input
-                          type="text"
-                          className="input-field"
-                          value={assetEditor.imageModel || ''}
-                          onChange={(e) => setAssetEditor({ ...assetEditor, imageModel: e.target.value })}
-                          placeholder="e.g. higgsfield-ai/soul/standard"
-                        />
-                      </div>
+                      <CustomModelPath
+                        label="Custom Model Path"
+                        value={assetEditor.imageModel || ''}
+                        onChange={(next) => setAssetEditor({ ...assetEditor, imageModel: next })}
+                        placeholder="e.g. higgsfield-ai/soul/standard"
+                      />
                     )}
 
                     {/* Three-way rather than a checkbox: reference art usually
@@ -6702,6 +6882,7 @@ export default function App() {
           batchConcurrency={batchConcurrency} setBatchConcurrency={setBatchConcurrency}
           attachTagsForImages={attachTagsForImages} setAttachTagsForImages={setAttachTagsForImages}
           attachTagsForVideos={attachTagsForVideos} setAttachTagsForVideos={setAttachTagsForVideos}
+          atlasSafetyChecker={atlasSafetyChecker} setAtlasSafetyChecker={setAtlasSafetyChecker}
           theme={theme} onToggleTheme={handleToggleTheme}
           promptSettings={promptSettings}
           setPromptSetting={setPromptSetting}

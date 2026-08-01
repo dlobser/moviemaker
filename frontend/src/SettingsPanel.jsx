@@ -14,15 +14,16 @@ import {
 } from 'lucide-react';
 
 import {
-  IMAGE_ASPECT_RATIOS,
   IMAGE_MODELS,
   LLM_PROVIDERS,
   VIDEO_MODELS,
-  VIDEO_RESOLUTIONS,
+  durationOptions,
   isKnownImageModel,
-  isKnownVideoModel
+  isKnownVideoModel,
+  sizeOptions
 } from './catalog.js';
 import { PROMPT_GROUPS, PROMPT_SLOTS, isPromptOverridden, promptDefault, promptText } from './prompts.js';
+import CustomModelPath from './CustomModelPath.jsx';
 
 const TABS = [
   { id: 'providers', label: 'Providers & keys', icon: KeyRound },
@@ -40,7 +41,8 @@ const KEY_FIELDS = [
   { id: 'runwayKey', label: 'Runway (Gen-3)', placeholder: 'rwy-…' },
   { id: 'klingKey', label: 'Kling AI', placeholder: 'Kling dev key…' },
   { id: 'higgsfieldKey', label: 'Higgsfield key', placeholder: 'from cloud.higgsfield.ai' },
-  { id: 'higgsfieldSecret', label: 'Higgsfield secret', placeholder: 'paired secret' }
+  { id: 'higgsfieldSecret', label: 'Higgsfield secret', placeholder: 'paired secret' },
+  { id: 'atlasKey', label: 'Atlas Cloud key', placeholder: 'from atlascloud.ai — one key, 400+ models' }
 ];
 
 /**
@@ -62,6 +64,7 @@ export default function SettingsPanel({
   batchConcurrency, setBatchConcurrency,
   attachTagsForImages, setAttachTagsForImages,
   attachTagsForVideos, setAttachTagsForVideos,
+  atlasSafetyChecker, setAtlasSafetyChecker,
   theme, onToggleTheme,
   promptSettings, setPromptSetting, resetPromptSetting,
   onImportState, onExportState,
@@ -193,15 +196,17 @@ export default function SettingsPanel({
                     <div className="form-group">
                       <label className="form-label">Aspect ratio</label>
                       <select className="select-field" value={imageResolution} onChange={(e) => setImageResolution(e.target.value)}>
-                        {IMAGE_ASPECT_RATIOS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                        {sizeOptions('image', imageModel, imageResolution).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                       </select>
                     </div>
                   </div>
                   {!isKnownImageModel(imageModel) && (
-                    <div className="form-group">
-                      <label className="form-label">Custom image model id</label>
-                      <input type="text" className="input-field" value={imageModel} onChange={(e) => setImageModel(e.target.value)} placeholder="e.g. fal-ai/flux-lora" />
-                    </div>
+                    <CustomModelPath
+                      label="Custom image model id"
+                      value={imageModel}
+                      onChange={setImageModel}
+                      placeholder="e.g. fal-ai/flux-lora"
+                    />
                   )}
                 </section>
 
@@ -222,21 +227,22 @@ export default function SettingsPanel({
                     <div className="form-group">
                       <label className="form-label">Resolution</label>
                       <select className="select-field" value={videoResolution} onChange={(e) => setVideoResolution(e.target.value)}>
-                        {VIDEO_RESOLUTIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                        {sizeOptions('video', videoModel, videoResolution).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                       </select>
                     </div>
                   </div>
                   {!isKnownVideoModel(videoModel) && (
-                    <div className="form-group">
-                      <label className="form-label">Custom video model id</label>
-                      <input type="text" className="input-field" value={videoModel} onChange={(e) => setVideoModel(e.target.value)} placeholder="e.g. higgsfield-ai/dop/standard" />
-                    </div>
+                    <CustomModelPath
+                      label="Custom video model id"
+                      value={videoModel}
+                      onChange={setVideoModel}
+                      placeholder="e.g. bytedance/seedance-2.0/image-to-video"
+                    />
                   )}
                   <div className="form-group" style={{ maxWidth: '220px' }}>
                     <label className="form-label">Duration</label>
                     <select className="select-field" value={videoDuration} onChange={(e) => setVideoDuration(e.target.value)}>
-                      <option value="5">5 seconds</option>
-                      <option value="10">10 seconds</option>
+                      {durationOptions(videoModel, videoDuration).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                     </select>
                   </div>
                 </section>
@@ -282,6 +288,23 @@ export default function SettingsPanel({
                   <label className="settings-check">
                     <input type="checkbox" checked={attachTagsForVideos} onChange={(e) => setAttachTagsForVideos(e.target.checked)} />
                     <span>Attach on video generation <em>recommended off — animate the shot’s own image</em></span>
+                  </label>
+                </section>
+
+                <section className="settings-section">
+                  <h3>Atlas Cloud</h3>
+                  <p className="settings-note">
+                    Atlas’s open-weight image models (FLUX, Qwen-Image, Z-Image) expose their safety checker as a
+                    request flag; closed partner models moderate upstream and ignore it. Turning it off only affects
+                    Atlas image generation, and Atlas’s own acceptable-use policy still applies to everything you make.
+                  </p>
+                  <label className="settings-check">
+                    <input
+                      type="checkbox"
+                      checked={atlasSafetyChecker !== false}
+                      onChange={(e) => setAtlasSafetyChecker(e.target.checked)}
+                    />
+                    <span>Safety checker on Atlas image models <em>provider default — on</em></span>
                   </label>
                 </section>
 

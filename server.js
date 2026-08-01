@@ -566,7 +566,7 @@ app.post('/api/llm/generate', async (req, res) => {
         candidate?.content?.parts?.map(p => p.text).filter(Boolean).join('\n'),
         'Gemini', candidate?.finishReason || data.promptFeedback?.blockReason);
 
-    } else if (provider === 'chatgpt') {
+    } else if (modelPath === 'chatgpt') {
       const apiKey = config.openaiKey;
       if (!apiKey) throw new Error('OpenAI API key is not configured.');
 
@@ -745,6 +745,66 @@ app.get('/api/llm/models', async (req, res) => {
 });
 
 // --- HELPER FOR FAL.AI QUEUE POLLING ---
+
+/**
+ * The queue endpoints for a Fal model hang off the *app*, not the full model
+ * path. A request submitted to
+ *   fal-ai/bytedance/seedance-2.0/image-to-video
+ * is polled and collected at
+ *   fal-ai/bytedance/requests/{id}
+ * Keeping the sub-path yields a 404 whose body names the part it could not
+ * route ("Path /seedance-2.0/image-to-video not found"), which is how this
+ * surfaced: a clip that generated fine and then could not be fetched.
+ *
+ * The two-segment models in the catalog were unaffected, so only a custom path
+ * deeper than owner/app ever hit it.
+ */
+function falQueueBase(modelId) {
+  return String(modelId).split('/').filter(Boolean).slice(0, 2).join('/');
+}
+
+/**
+ * The result URL for a status URL: the same address without its /status.
+ * Deriving it means a status URL Fal handed us is never paired with a result
+ * URL we guessed — if polling worked, collecting works.
+ */
+function falResultUrlFromStatus(statusUrl) {
+  try {
+    const url = new URL(statusUrl);
+    url.pathname = url.pathname.replace(/\/status$/, '');
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turn a Fal error body into something a director can act on.
+ *
+ * Fal answers a rejected generation with a FastAPI-shaped `detail` array whose
+ * useful part is one `msg`, wrapped in a echo of the entire request. Dumping
+ * the raw body buried "Output video has sensitive content" inside several
+ * hundred characters of prompt and URL echo.
+ */
+function describeFalError(body) {
+  try {
+    const parsed = JSON.parse(body);
+    const detail = parsed.detail;
+    const entries = Array.isArray(detail) ? detail : detail ? [detail] : [];
+    const messages = entries
+      .map(entry => (typeof entry === 'string' ? entry : entry && (entry.msg || entry.message)))
+      .filter(Boolean);
+    if (messages.length === 0) return body;
+
+    const policy = entries.some(entry => entry && entry.type === 'content_policy_violation');
+    return policy
+      ? `${messages.join('; ')} This is the model host's own moderation refusing the finished video — it ran, then was withheld. Rewording the prompt is the only route through; nothing in the studio can override it.`
+      : messages.join('; ');
+  } catch {
+    return body; // not JSON after all
+  }
+}
+
 async function callFalModel(modelId, input, apiKey) {
   const submitUrl = `https://queue.fal.run/${modelId}`;
   console.log(`[FAL] Submitting to queue: ${submitUrl}`);
@@ -769,8 +829,12 @@ async function callFalModel(modelId, input, apiKey) {
   console.log('[FAL] Queue submission response payload:', submitData);
   const request_id = submitData.request_id || submitData.gateway_request_id;
   
-  const statusUrl = submitData.status_url || `https://queue.fal.run/${encodeURIComponent(modelId)}/requests/${request_id}/status`;
-  const checkUrl = submitData.response_url || `https://queue.fal.run/${encodeURIComponent(modelId)}/requests/${request_id}`;
+  // encodeURIComponent used to be applied to the whole model id here, which
+  // percent-escaped the slashes that make up the path — wrong for every model,
+  // and only survivable because Fal normally returns both URLs itself.
+  const queueBase = `https://queue.fal.run/${falQueueBase(modelId)}/requests/${request_id}`;
+  const statusUrl = submitData.status_url || `${queueBase}/status`;
+  const checkUrl = submitData.response_url || falResultUrlFromStatus(statusUrl) || queueBase;
 
   console.log(`[FAL] Polling statusUrl: ${statusUrl}, checkUrl: ${checkUrl}`);
 
@@ -788,15 +852,29 @@ async function callFalModel(modelId, input, apiKey) {
 
     const statusData = await statusResponse.json();
     if (statusData.status === 'COMPLETED') {
-      const resultResponse = await fetch(checkUrl, {
-        headers: { 'Authorization': `Key ${apiKey}` }
-      });
-      if (!resultResponse.ok) {
-        const errBody = await resultResponse.text();
-        console.error(`[FAL] Result retrieval failed status: ${resultResponse.status}, body: ${errBody}`);
-        throw new Error(`Fal.ai failed to retrieve completed task details (${resultResponse.status}): ${errBody}`);
+      // The work is done and paid for by this point, so a 404 on collection is
+      // the worst possible failure. If the URL we were given does not resolve,
+      // try the canonical app-level one before giving up — whether the bad URL
+      // came from our own fallback or from Fal is not worth guessing at here.
+      const candidates = [checkUrl, `https://queue.fal.run/${falQueueBase(modelId)}/requests/${request_id}`]
+        .filter((url, index, all) => url && all.indexOf(url) === index);
+
+      let lastStatus = 0;
+      let lastBody = '';
+      for (const url of candidates) {
+        const resultResponse = await fetch(url, { headers: { 'Authorization': `Key ${apiKey}` } });
+        if (resultResponse.ok) return await resultResponse.json();
+        lastStatus = resultResponse.status;
+        lastBody = await resultResponse.text();
+        console.error(`[FAL] Result retrieval failed at ${url} — status ${lastStatus}, body: ${lastBody}`);
+        // Only a 404 means we may have asked at the wrong address. Anything
+        // else is a real answer about this request — a moderation refusal, a
+        // bad input — and asking again elsewhere just gets the same answer.
+        if (resultResponse.status !== 404) break;
       }
-      return await resultResponse.json();
+      throw new Error(lastStatus === 404
+        ? `Fal.ai failed to retrieve completed task details (${lastStatus}): ${describeFalError(lastBody)}`
+        : `Fal.ai refused the finished result (${lastStatus}): ${describeFalError(lastBody)}`);
     } else if (statusData.status === 'FAILED') {
       throw new Error(`Fal.ai task failed: ${statusData.error || 'Unknown error'}`);
     }
@@ -825,6 +903,41 @@ const HIGGSFIELD_PREFIXES = [
 
 function isHiggsfieldModel(modelId) {
   return typeof modelId === 'string' && HIGGSFIELD_PREFIXES.some(prefix => modelId.startsWith(prefix));
+}
+
+// Which service a model id belongs to, and the path to call it with.
+//
+// The prefix guess above is no longer decidable on its own: the same vendor
+// namespaces exist on both hosts, so `bytedance/seedance-2.0/image-to-video`
+// (Fal) and `bytedance/seedance/v1/pro/image-to-video` (Higgsfield) are
+// indistinguishable. A custom path may therefore declare its host inline as
+// `fal:<path>` or `higgsfield:<path>`, and the client also sends the family it
+// resolved. Without either, the old guess still applies unchanged.
+const FAMILY_ALIASES = {
+  fal: 'fal-ai', 'fal-ai': 'fal-ai', falai: 'fal-ai',
+  higgsfield: 'higgsfield', 'higgsfield-ai': 'higgsfield', hf: 'higgsfield',
+  atlas: 'atlas', atlascloud: 'atlas', 'atlas-cloud': 'atlas'
+};
+
+function normalizeFamily(family) {
+  return FAMILY_ALIASES[String(family || '').trim().toLowerCase()] || null;
+}
+
+function resolveRouting(id, declaredFamily) {
+  const raw = String(id || '').trim();
+  const colon = raw.indexOf(':');
+  const slash = raw.indexOf('/');
+  if (colon > 0 && (slash === -1 || colon < slash)) {
+    const family = normalizeFamily(raw.slice(0, colon));
+    if (family) return { family, path: raw.slice(colon + 1).trim() };
+  }
+  return { family: normalizeFamily(declaredFamily), path: raw };
+}
+
+/** True when this id should be sent to Higgsfield rather than Fal. */
+function routesToHiggsfieldModel(family, modelPath) {
+  if (family) return family === 'higgsfield';
+  return modelPath === 'higgsfield' || isHiggsfieldModel(modelPath);
 }
 
 function higgsfieldAuthHeader(config) {
@@ -883,6 +996,83 @@ async function callHiggsfieldModel(modelId, input, config) {
   throw new Error('Higgsfield generation timed out.');
 }
 
+
+// --- ATLAS CLOUD -----------------------------------------------------------
+//
+// An aggregator: one key, one endpoint pair, models re-served from many
+// vendors. Submit a prediction, then poll it by id. Unlike Fal it accepts a
+// data: URL for the input image directly, so there is no upload step.
+const ATLAS_BASE = 'https://api.atlascloud.ai/api/v1/model';
+
+/**
+ * Submit to Atlas, then poll the prediction to completion.
+ *
+ * `candidates` is a list of request bodies tried in order, because 400+ models
+ * from a dozen vendors do not agree on field names — Seedance 2.0 takes
+ * `ratio` and `resolution`, Seedance 1.5 takes `aspect_ratio` and neither of
+ * the others. Rather than keeping a per-model schema table that would rot, the
+ * richest body is tried first and a rejected submission falls back to the
+ * fields every video model shares. A refused submission costs nothing, so the
+ * retry is free; once one is accepted the rest are skipped.
+ */
+async function callAtlasModel(endpoint, candidates, apiKey) {
+  if (!apiKey) throw new Error('Atlas Cloud API key is not configured. Add it in Settings first.');
+  const bodies = Array.isArray(candidates) ? candidates : [candidates];
+
+  let submitBody = '';
+  let lastStatus = 0;
+  let accepted = false;
+  for (let i = 0; i < bodies.length; i++) {
+    console.log(`[ATLAS] Submitting ${endpoint}: ${bodies[i].model}${i > 0 ? ' (reduced fields)' : ''}`);
+    const submit = await fetch(`${ATLAS_BASE}/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify(bodies[i])
+    });
+    submitBody = await submit.text();
+    lastStatus = submit.status;
+    if (submit.ok) { accepted = true; break; }
+    console.error(`[ATLAS] Submission rejected (${lastStatus}): ${submitBody}`);
+    // A 5xx is Atlas being unwell, not the body being wrong — do not reshape.
+    if (lastStatus >= 500) break;
+  }
+  if (!accepted) {
+    throw new Error(`Atlas Cloud submission failed (${lastStatus}): ${describeFalError(submitBody)}`);
+  }
+
+  const predictionId = JSON.parse(submitBody)?.data?.id;
+  if (!predictionId) throw new Error('Atlas Cloud returned no prediction id.');
+
+  for (let attempt = 0; attempt < 150; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 4000));
+    const poll = await fetch(`${ATLAS_BASE}/prediction/${predictionId}`, {
+      headers: { 'Authorization': `Bearer ${apiKey}` }
+    });
+    if (!poll.ok) throw new Error(`Atlas Cloud status check failed: ${poll.status}`);
+    const data = (await poll.json())?.data || {};
+    if (data.status === 'completed') {
+      const url = Array.isArray(data.outputs) ? data.outputs[0] : data.outputs;
+      if (!url) throw new Error('Atlas Cloud reported completion but returned no output.');
+      return url;
+    }
+    if (data.status === 'failed' || data.status === 'canceled') {
+      throw new Error(`Atlas Cloud generation ${data.status}: ${data.error || 'no reason given'}`);
+    }
+  }
+  throw new Error('Atlas Cloud generation timed out.');
+}
+
+/** Atlas wants pixels as "W*H"; the studio speaks in aspect ratios. */
+function atlasImageSize(resolution) {
+  const sizes = {
+    '16:9': '1344*768', '9:16': '768*1344', '1:1': '1024*1024',
+    '4:3': '1152*896', '3:2': '1216*832', '21:9': '1536*640'
+  };
+  if (sizes[resolution]) return sizes[resolution];
+  if (typeof resolution === 'string' && resolution.includes('x')) return resolution.replace('x', '*');
+  return '1344*768';
+}
+
 // Read a project asset into a data URL so it can be shipped inline to providers
 // that accept base64 image inputs.
 function assetToDataUrl(inputPath) {
@@ -901,14 +1091,39 @@ function assetToDataUrl(inputPath) {
 
 // --- IMAGE GENERATION PROXY ---
 app.post('/api/image/generate', async (req, res) => {
-  const { provider, prompt, resolution, inputImagePaths = [] } = req.body;
+  const { provider, providerFamily, prompt, resolution, inputImagePaths = [], safetyChecker } = req.body;
   const config = readJsonFile(CONFIG_FILE);
 
   try {
     let localPath = '';
+    const { family, path: modelPath } = resolveRouting(provider, providerFamily);
+    const routesToHiggsfield = routesToHiggsfieldModel(family, modelPath);
+    // An explicitly declared host wins over the "starts with fal-ai" guess, so
+    // a Fal model published under a vendor namespace finally reaches Fal.
+    const routesToFal = family
+      ? family === 'fal-ai'
+      : (modelPath === 'fal-ai' || modelPath.startsWith('fal-ai'));
 
-    if (provider === 'higgsfield' || isHiggsfieldModel(provider)) {
-      const modelId = provider === 'higgsfield' ? 'higgsfield-ai/soul/standard' : provider;
+    if (family === 'atlas') {
+      const input = {
+        model: modelPath,
+        prompt,
+        size: atlasImageSize(resolution),
+        num_images: 1
+      };
+      // Open-weight models on Atlas expose their safety checker as a request
+      // flag; it stays on unless the project turns it off.
+      if (safetyChecker === false) input.enable_safety_checker = false;
+      if (inputImagePaths && inputImagePaths.length > 0) input.image = assetToDataUrl(inputImagePaths[0]);
+
+      const remoteUrl = await callAtlasModel('generateImage', [
+        input,
+        { model: input.model, prompt: input.prompt, ...(input.image ? { image: input.image } : {}) }
+      ], config.atlasKey);
+      localPath = await downloadFile(remoteUrl, 'img', '.png');
+
+    } else if (routesToHiggsfield) {
+      const modelId = modelPath === 'higgsfield' ? 'higgsfield-ai/soul/standard' : modelPath;
 
       const input = { prompt };
       if (resolution && resolution.includes(':')) {
@@ -936,11 +1151,11 @@ app.post('/api/image/generate', async (req, res) => {
       if (!remoteUrl) throw new Error('No image returned from Higgsfield.');
       localPath = await downloadFile(remoteUrl, 'img', '.png');
 
-    } else if (provider === 'fal-ai' || provider.startsWith('fal-ai')) {
+    } else if (routesToFal) {
       const apiKey = config.falKey;
       if (!apiKey) throw new Error('Fal.ai API key is not configured.');
 
-      const modelId = provider === 'fal-ai' ? 'fal-ai/flux/schnell' : provider;
+      const modelId = modelPath === 'fal-ai' ? 'fal-ai/flux/schnell' : modelPath;
       
       let imageSize = 'landscape_16_9';
       if (resolution === '16:9') imageSize = 'landscape_16_9';
@@ -981,7 +1196,7 @@ app.post('/api/image/generate', async (req, res) => {
       const remoteUrl = result.images[0].url;
       localPath = await downloadFile(remoteUrl, 'img', '.png');
 
-    } else if (provider === 'google-gemini-image') {
+    } else if (modelPath === 'google-gemini-image') {
       const apiKey = config.geminiKey;
       if (!apiKey) throw new Error('Google AI Studio key is not configured. Add it in Settings first.');
 
@@ -1082,14 +1297,15 @@ app.post('/api/image/generate', async (req, res) => {
 
 // --- VIDEO GENERATION PROXY ---
 app.post('/api/video/generate', async (req, res) => {
-  const { provider, prompt, imageUrls, resolution, duration, videoModel } = req.body;
+  const { provider, providerFamily, prompt, imageUrls, resolution, duration, videoModel } = req.body;
   const config = readJsonFile(CONFIG_FILE);
 
   try {
     let localPath = '';
     const hasImage = imageUrls && imageUrls.length > 0;
-    
-    const routesToHiggsfield = provider === 'higgsfield' || isHiggsfieldModel(provider);
+
+    const { family, path: modelPath } = resolveRouting(provider, providerFamily);
+    const routesToHiggsfield = routesToHiggsfieldModel(family, modelPath);
 
     // Convert relative asset paths to something the remote API can read.
     // Higgsfield takes inline data URLs; the others need a publicly reachable
@@ -1100,7 +1316,7 @@ app.post('/api/video/generate', async (req, res) => {
         const absolutePath = path.join(getWorkingRoot(), imgPath);
         if (!fs.existsSync(absolutePath)) continue;
 
-        if (routesToHiggsfield) {
+        if (routesToHiggsfield || family === 'atlas') {
           publicImageUrls.push(assetToDataUrl(imgPath));
         } else if (config.falKey) {
           publicImageUrls.push(await uploadToFalMedia(absolutePath, config.falKey));
@@ -1110,8 +1326,23 @@ app.post('/api/video/generate', async (req, res) => {
       }
     }
 
-    if (routesToHiggsfield) {
-      const modelId = provider === 'higgsfield' ? 'higgsfield-ai/dop/preview' : provider;
+    if (family === 'atlas') {
+      const aspect = resolution === '720x1280' ? '9:16' : '16:9';
+      const core = { model: modelPath, prompt, duration: Number(duration) || 5 };
+      if (publicImageUrls.length > 0) core.image = publicImageUrls[0];
+
+      const remoteUrl = await callAtlasModel('generateVideo', [
+        // Seedance 2.0 and friends.
+        { ...core, resolution: '720p', ratio: aspect },
+        // Seedance 1.5 and anything else naming it the OpenAPI way.
+        { ...core, aspect_ratio: aspect },
+        // Last resort: only what every video model on the platform takes.
+        core
+      ], config.atlasKey);
+      localPath = await downloadFile(remoteUrl, 'vid', '.mp4');
+
+    } else if (routesToHiggsfield) {
+      const modelId = modelPath === 'higgsfield' ? 'higgsfield-ai/dop/preview' : modelPath;
 
       const input = {
         prompt: prompt,
@@ -1128,11 +1359,11 @@ app.post('/api/video/generate', async (req, res) => {
       if (!remoteUrl) throw new Error('No video returned from Higgsfield.');
       localPath = await downloadFile(remoteUrl, 'vid', '.mp4');
 
-    } else if (provider === 'fal-ai' || provider.startsWith('fal-ai')) {
+    } else if (family ? family === 'fal-ai' : (provider === 'fal-ai' || provider.startsWith('fal-ai'))) {
       const apiKey = config.falKey;
       if (!apiKey) throw new Error('Fal.ai API key is not configured.');
 
-      let baseModel = provider === 'fal-ai' ? (videoModel || 'fal-ai/kling-video') : provider;
+      let baseModel = modelPath === 'fal-ai' ? (resolveRouting(videoModel, providerFamily).path || 'fal-ai/kling-video') : modelPath;
       
       // Determine the specific endpoint depending on if we have input images
       let modelId = baseModel;
@@ -1152,8 +1383,10 @@ app.post('/api/video/generate', async (req, res) => {
 
       let durationValue = duration || '5';
       if (modelId.startsWith('fal-ai/veo')) {
-        // Veo expects string values like '5s' or '8s' (max 8s)
-        durationValue = durationValue === '10' ? '8s' : '5s';
+        // Veo speaks in '5s' / '8s' and tops out at 8. The catalog now offers
+        // exactly those two, but a project saved before it did still holds 10,
+        // so both round to the nearest length Veo can actually produce.
+        durationValue = Number(durationValue) >= 8 ? '8s' : '5s';
       }
 
       let input = {
@@ -1171,7 +1404,7 @@ app.post('/api/video/generate', async (req, res) => {
       if (!remoteUrl) throw new Error('No video URL returned from Fal.ai Kling/Veo');
       localPath = await downloadFile(remoteUrl, 'vid', '.mp4');
 
-    } else if (provider === 'runway') {
+    } else if (modelPath === 'runway') {
       const apiKey = config.runwayKey;
       if (!apiKey) throw new Error('Runway API key is not configured.');
 
@@ -1222,7 +1455,7 @@ app.post('/api/video/generate', async (req, res) => {
       if (!completedUrl) throw new Error('Runway task timed out.');
       localPath = await downloadFile(completedUrl, 'vid', '.mp4');
 
-    } else if (provider === 'kling') {
+    } else if (modelPath === 'kling') {
       const apiKey = config.klingKey;
       if (!apiKey) throw new Error('Kling API key is not configured.');
 

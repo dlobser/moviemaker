@@ -9,14 +9,17 @@ import { Moon, X, StopCircle, Play, RotateCcw, AlertTriangle, Check, RefreshCw }
 import {
   IMAGE_MODELS,
   VIDEO_MODELS,
-  IMAGE_ASPECT_RATIOS,
-  VIDEO_RESOLUTIONS,
   PROVIDER_LABELS,
+  durationOptions,
+  sizeOptions,
   getVideoModel,
   groupedModelOptions,
+  isKnownImageModel,
+  isKnownVideoModel,
   priceLabel
 } from './catalog.js';
 import { DEFAULT_DREAM_SYSTEM_PROMPT, describeAssetLibrary } from './dream.js';
+import CustomModelPath from './CustomModelPath.jsx';
 
 function ModelOptions({ models, unit }) {
   return groupedModelOptions(models).map(group => (
@@ -79,7 +82,13 @@ export default function DreamDialog({
     .slice(1)
     .filter(shot => !String(shot.draftVideoPrompt || shot.description || '').trim());
 
-  const videoModelId = settings.videoModel || defaults.videoModel;
+  // `null` means "whatever the project is set to"; an empty string means the
+  // user picked Custom and has not typed the path yet. Collapsing the two with
+  // `||` snapped the dropdown straight back to the project default and the
+  // custom field never appeared.
+  const resolveModel = (chosen, fallback) => (chosen === null || chosen === undefined ? fallback : chosen);
+  const videoModelId = resolveModel(settings.videoModel, defaults.videoModel);
+  const imageModelId = resolveModel(settings.imageModel, defaults.imageModel);
   const videoModel = getVideoModel(videoModelId);
 
   // What the run will actually pay for: every clip needs a video, and the first
@@ -101,6 +110,14 @@ export default function DreamDialog({
     }
     if (chaining && available < 2) {
       return 'Chaining needs at least one shot after the starting one.';
+    }
+    // A half-filled custom path would otherwise fall back to the project's
+    // model silently, which is the wrong kind of quiet.
+    if (!String(videoModelId || '').trim()) {
+      return 'Enter a custom video model path, or pick one from the list.';
+    }
+    if (imagesToMake > 0 && !String(imageModelId || '').trim()) {
+      return 'Enter a custom opening image model path, or pick one from the list.';
     }
     return null;
   })();
@@ -226,12 +243,24 @@ export default function DreamDialog({
               <select
                 className="select-field"
                 disabled={running}
-                value={videoModelId}
-                onChange={(e) => set({ videoModel: e.target.value })}
+                value={isKnownVideoModel(videoModelId) ? videoModelId : 'custom'}
+                onChange={(e) => set({ videoModel: e.target.value === 'custom' ? '' : e.target.value })}
               >
                 <ModelOptions models={VIDEO_MODELS} unit="video" />
+                <option value="custom">Custom model path…</option>
               </select>
             </div>
+            {!isKnownVideoModel(videoModelId) && (
+              <div style={{ flex: '1 1 100%' }}>
+                <CustomModelPath
+                  label="Custom video model"
+                  value={videoModelId}
+                  disabled={running}
+                  onChange={(next) => set({ videoModel: next })}
+                  placeholder="e.g. bytedance/seedance-2.0/image-to-video"
+                />
+              </div>
+            )}
             <div className="form-group" style={{ flex: '0 0 150px' }}>
               <label className="form-label">Clip length</label>
               <select
@@ -240,8 +269,8 @@ export default function DreamDialog({
                 value={settings.videoDuration || defaults.videoDuration || '5'}
                 onChange={(e) => set({ videoDuration: e.target.value })}
               >
-                <option value="5">5 seconds</option>
-                <option value="10">10 seconds</option>
+                {durationOptions(videoModelId, settings.videoDuration || defaults.videoDuration || '5')
+                  .map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
               </select>
             </div>
             <div className="form-group" style={{ flex: '1 1 200px' }}>
@@ -252,7 +281,8 @@ export default function DreamDialog({
                 value={settings.videoResolution || defaults.videoResolution || '1280x720'}
                 onChange={(e) => set({ videoResolution: e.target.value })}
               >
-                {VIDEO_RESOLUTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+                {sizeOptions('video', videoModelId, settings.videoResolution || defaults.videoResolution)
+                  .map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
               </select>
             </div>
           </div>
@@ -312,10 +342,11 @@ export default function DreamDialog({
                   <select
                     className="select-field"
                     disabled={running}
-                    value={settings.imageModel || defaults.imageModel}
-                    onChange={(e) => set({ imageModel: e.target.value })}
+                    value={isKnownImageModel(imageModelId) ? imageModelId : 'custom'}
+                    onChange={(e) => set({ imageModel: e.target.value === 'custom' ? '' : e.target.value })}
                   >
                     <ModelOptions models={IMAGE_MODELS} unit="img" />
+                    <option value="custom">Custom model path…</option>
                   </select>
                 </div>
                 <div className="form-group" style={{ flex: '0 0 200px', margin: 0 }}>
@@ -326,10 +357,20 @@ export default function DreamDialog({
                     value={settings.imageResolution || defaults.imageResolution}
                     onChange={(e) => set({ imageResolution: e.target.value })}
                   >
-                    {IMAGE_ASPECT_RATIOS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+                    {sizeOptions('image', imageModelId, settings.imageResolution || defaults.imageResolution)
+                      .map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
                   </select>
                 </div>
               </div>
+              {!isKnownImageModel(imageModelId) && (
+                <CustomModelPath
+                  label="Custom opening image model"
+                  value={imageModelId}
+                  disabled={running}
+                  onChange={(next) => set({ imageModel: next })}
+                  placeholder="e.g. black-forest-labs/flux-dev"
+                />
+              )}
               <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
                 Only used when the starting shot has no image yet. Every later clip is animated from a captured
                 frame, so no other image is ever generated.

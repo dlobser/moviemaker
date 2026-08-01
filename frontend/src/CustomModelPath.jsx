@@ -1,0 +1,53 @@
+// The custom model path field: a path, plus which host to send it to.
+//
+// The host used to be inferred from the path's prefix, which stopped working
+// once the same vendor namespaces appeared on both services —
+// `bytedance/seedance-2.0/image-to-video` is a Fal model and
+// `bytedance/seedance/v1/pro/image-to-video` is a Higgsfield one, and no rule
+// separates them. "Auto" keeps the old guess for everything already saved;
+// picking a host stores it in the id as `fal:…` / `higgsfield:…`.
+
+import React from 'react';
+import { MODEL_FAMILIES, formatModelId, parseModelId } from './catalog.js';
+
+const HINTS = {
+  'fal-ai': 'fal.ai/models/<this is the path> — the id is whatever follows /models/ in the URL.',
+  higgsfield: 'The model id from the Higgsfield gallery, e.g. higgsfield-ai/dop/standard.',
+  atlas: 'atlascloud.ai/models/<this is the path> — the id is whatever follows /models/ in the URL.',
+  auto: 'Guessed from the path: known vendor prefixes go to Higgsfield, anything else to Fal.ai. Pick a host if that guess is wrong.'
+};
+
+export default function CustomModelPath({ label, value, onChange, placeholder, disabled }) {
+  const { family, path } = parseModelId(value);
+
+  return (
+    <div className="form-group">
+      <label className="form-label">{label}</label>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+        <input
+          type="text"
+          className="input-field"
+          style={{ flex: '1 1 260px', minWidth: 0 }}
+          value={path}
+          disabled={disabled}
+          placeholder={placeholder}
+          onChange={(e) => onChange(formatModelId(family, e.target.value))}
+        />
+        <select
+          className="select-field"
+          style={{ flex: '0 0 150px' }}
+          value={family || 'auto'}
+          disabled={disabled}
+          onChange={(e) => onChange(formatModelId(e.target.value === 'auto' ? null : e.target.value, path))}
+          title="Which service this path is served by"
+        >
+          <option value="auto">Auto-detect</option>
+          {MODEL_FAMILIES.map(f => <option key={f.id} value={f.id}>{f.label}</option>)}
+        </select>
+      </div>
+      <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+        {HINTS[family || 'auto']}
+      </span>
+    </div>
+  );
+}
