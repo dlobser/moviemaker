@@ -539,6 +539,11 @@ app.post('/api/llm/generate', async (req, res) => {
   try {
     let responseText = '';
     const images = (imagePaths || []).filter(Boolean).map(assetToInlineImage);
+    // Auto Prompt can deliberately send no system prompt — "just do what I
+    // typed". That has to mean *no system message at all*, not an empty one:
+    // an empty system field is a small waste on two of these APIs and, on
+    // Gemini, leaves the user's text wearing a stray "User text:" label.
+    const system = String(systemPrompt || '').trim();
 
     if (provider === 'gemini') {
       const apiKey = config.geminiKey;
@@ -552,7 +557,7 @@ app.post('/api/llm/generate', async (req, res) => {
         body: JSON.stringify({
           contents: [{
             parts: [
-              { text: `${systemPrompt}\n\nUser text: ${prompt}` },
+              { text: system ? `${system}\n\nUser text: ${prompt}` : prompt },
               ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))
             ]
           }]
@@ -566,7 +571,7 @@ app.post('/api/llm/generate', async (req, res) => {
         candidate?.content?.parts?.map(p => p.text).filter(Boolean).join('\n'),
         'Gemini', candidate?.finishReason || data.promptFeedback?.blockReason);
 
-    } else if (modelPath === 'chatgpt') {
+    } else if (provider === 'chatgpt') {
       const apiKey = config.openaiKey;
       if (!apiKey) throw new Error('OpenAI API key is not configured.');
 
@@ -581,7 +586,7 @@ app.post('/api/llm/generate', async (req, res) => {
         body: JSON.stringify({
           model: targetModel,
           messages: [
-            { role: 'system', content: systemPrompt },
+            ...(system ? [{ role: 'system', content: system }] : []),
             {
               role: 'user',
               content: images.length === 0 ? prompt : [
@@ -618,7 +623,7 @@ app.post('/api/llm/generate', async (req, res) => {
         body: JSON.stringify({
           model: targetModel,
           max_tokens: 1024,
-          system: systemPrompt,
+          ...(system ? { system } : {}),
           messages: [{
             role: 'user',
             // Images before text: Anthropic's own guidance for image questions.
@@ -1023,7 +1028,15 @@ async function callAtlasModel(endpoint, candidates, apiKey) {
   let lastStatus = 0;
   let accepted = false;
   for (let i = 0; i < bodies.length; i++) {
-    console.log(`[ATLAS] Submitting ${endpoint}: ${bodies[i].model}${i > 0 ? ' (reduced fields)' : ''}`);
+    // Naming the image fields matters more than it looks: Atlas accepts a body
+    // carrying a field it does not know, so a wrong field name never surfaces
+    // as an error — only as a generation that ignored its references. The log
+    // is the only place that mismatch is visible.
+    const imageFields = ['image', 'images', 'reference_images', 'last_image']
+      .filter(field => bodies[i][field] !== undefined)
+      .map(field => `${field}×${Array.isArray(bodies[i][field]) ? bodies[i][field].length : 1}`)
+      .join(', ') || 'no images';
+    console.log(`[ATLAS] Submitting ${endpoint}: ${bodies[i].model} [${imageFields}]${i > 0 ? ' (reduced fields)' : ''}`);
     const submit = await fetch(`${ATLAS_BASE}/${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
@@ -1250,7 +1263,7 @@ app.post('/api/image/generate', async (req, res) => {
       fs.writeFileSync(path.join(getAssetsDir(), filename), Buffer.from(imagePart.inlineData.data, 'base64'));
       localPath = `assets/${filename}`;
 
-    } else if (provider === 'chatgpt') {
+    } else if (modelPath === 'chatgpt') {
       // OpenAI DALL-E 3
       const apiKey = config.openaiKey;
       if (!apiKey) throw new Error('OpenAI API key is not configured.');
@@ -1329,16 +1342,34 @@ app.post('/api/video/generate', async (req, res) => {
     if (family === 'atlas') {
       const aspect = resolution === '720x1280' ? '9:16' : '16:9';
       const core = { model: modelPath, prompt, duration: Number(duration) || 5 };
-      if (publicImageUrls.length > 0) core.image = publicImageUrls[0];
 
-      const remoteUrl = await callAtlasModel('generateVideo', [
+      // Where the images go depends on the endpoint, not the model family.
+      // `reference-to-video` takes an array of up to nine in `reference_images`
+      // and the prompt addresses them as @image1..@image9; `image-to-video`
+      // takes a single still in `image` and treats it as the first frame.
+      const wantsReferenceArray = /reference-to-video/.test(modelPath);
+      const candidates = [];
+
+      if (wantsReferenceArray) {
+        // Never fall back to a single-image body here. A reduced body would be
+        // accepted and would quietly produce a video missing eight of the nine
+        // references the prompt points at — an expensive silent wrong answer,
+        // where a rejection costs nothing and says what happened.
+        const refs = { ...core, reference_images: publicImageUrls };
+        candidates.push({ ...refs, resolution: '720p', ratio: aspect });
+        candidates.push({ ...refs, aspect_ratio: aspect });
+        candidates.push(refs);
+      } else {
+        if (publicImageUrls.length > 0) core.image = publicImageUrls[0];
         // Seedance 2.0 and friends.
-        { ...core, resolution: '720p', ratio: aspect },
+        candidates.push({ ...core, resolution: '720p', ratio: aspect });
         // Seedance 1.5 and anything else naming it the OpenAPI way.
-        { ...core, aspect_ratio: aspect },
+        candidates.push({ ...core, aspect_ratio: aspect });
         // Last resort: only what every video model on the platform takes.
-        core
-      ], config.atlasKey);
+        candidates.push(core);
+      }
+
+      const remoteUrl = await callAtlasModel('generateVideo', candidates, config.atlasKey);
       localPath = await downloadFile(remoteUrl, 'vid', '.mp4');
 
     } else if (routesToHiggsfield) {

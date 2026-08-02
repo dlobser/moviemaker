@@ -24,11 +24,21 @@ export const DEFAULT_VIDEO_SYSTEM_PROMPT = "You are a professional cinematograph
 
 export const DEFAULT_IMAGE_USER_TEMPLATE = `Write a visual prompt based on this scene description: "{description}"
 Camera/Shot setup to apply: "{setup}"
-Additional Notes: "{notes}"`;
+Additional Notes: "{notes}"
+{tags}`;
 
 export const DEFAULT_VIDEO_USER_TEMPLATE = `Write a motion prompt based on this scene description: "{description}"
 Camera/Shot setup to apply: "{setup}"
-Additional Notes: "{notes}"`;
+Additional Notes: "{notes}"
+{tags}`;
+
+// The editable half of "include all context". Everything factual — the asset
+// list, the neighbouring shots — is generated and appended after it, for the
+// same reason the import prompt works that way: a stale hand-written copy of
+// the project's own data is worse than none.
+export const DEFAULT_AUTO_CONTEXT_INTRO = `=== PROJECT CONTEXT ===
+Below is the film's asset library and the shots either side of this one. Use it to keep this shot continuous with its neighbours — the same wardrobe, weather, time of day and lens language — without describing what the neighbouring shots already show.
+Whenever the shot involves one of the tagged assets, write its tag in angle brackets exactly as listed (for example <Ralph>) instead of describing it. The studio expands each tag into its full description and attaches its reference artwork, so a tag is always better than your own words for it.`;
 
 export const DEFAULT_ASSET_WRITER_SYSTEM = `You write prompts for clean REFERENCE artwork used to keep a subject consistent across many shots of a film — not cinematic frames.
 
@@ -110,10 +120,10 @@ export const PROMPT_SLOTS = [
     id: 'imageUserTemplate',
     group: 'shot',
     label: 'Image prompt — user message',
-    description: 'The shot’s own material, as handed to the LLM. Lines whose placeholder is empty are dropped.',
+    description: 'The shot’s own material, as handed to the LLM. Lines whose placeholder is empty are dropped. {tags} expands to an instruction naming the asset tags this shot uses, so the writer keeps them instead of paraphrasing them away — it is empty for a shot with no tags.',
     default: DEFAULT_IMAGE_USER_TEMPLATE,
-    placeholders: ['{description}', '{setup}', '{notes}', '{dialogue}', '{name}', '{sceneName}'],
-    rows: 4
+    placeholders: ['{description}', '{setup}', '{notes}', '{dialogue}', '{name}', '{sceneName}', '{tags}'],
+    rows: 5
   },
   {
     id: 'videoSystemPrompt',
@@ -129,8 +139,17 @@ export const PROMPT_SLOTS = [
     label: 'Video prompt — user message',
     description: 'The shot’s own material for a motion prompt. Lines whose placeholder is empty are dropped.',
     default: DEFAULT_VIDEO_USER_TEMPLATE,
-    placeholders: ['{description}', '{setup}', '{notes}', '{dialogue}', '{name}', '{sceneName}'],
-    rows: 4
+    placeholders: ['{description}', '{setup}', '{notes}', '{dialogue}', '{name}', '{sceneName}', '{tags}'],
+    rows: 5
+  },
+
+  {
+    id: 'autoContextIntro',
+    group: 'shot',
+    label: 'Auto Prompt — “include all context” preamble',
+    description: 'Sent ahead of the project’s asset library and the neighbouring shots when Auto Prompt is run with Include all context ticked. The asset list and the neighbour shots themselves are generated from the project, so they can never go stale.',
+    default: DEFAULT_AUTO_CONTEXT_INTRO,
+    rows: 6
   },
 
   {

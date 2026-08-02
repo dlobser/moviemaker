@@ -14,6 +14,9 @@
 //             3 direct from Google but 8 through Higgsfield). Sources are noted
 //             per line; re-check before raising one, an over-count is a request
 //             the provider rejects after you have already paid for the tokens.
+// refTagStyle - set when the model expects the prompt to *point at* its own
+//             reference images by position ("@image1"). See REFERENCE TAGGING
+//             below; unset means the model only reads the images it is given.
 
 export const IMAGE_MODELS = [
   // --- Fal.ai ---
@@ -112,8 +115,15 @@ export const VIDEO_MODELS = [
   // Atlas publishes each model's ranges on its API tab. Seedance 2.0 documents
   // duration 4-15, Seedance 1.5 documents 4-12 — the sets below are a usable
   // subset of those ranges, not the whole integer span.
-  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas)', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas)', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  // Seedance 2.0's image count is a property of the *endpoint*, not the model:
+  // image-to-video animates one still (it is the first frame), while
+  // reference-to-video takes up to 9 and expects the prompt to point at each
+  // one by position. Picking i2v and wondering why only one image goes is the
+  // whole reason the two are listed separately.
+  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/text-to-video', label: 'Seedance 2.0 t2v (Atlas)', provider: 'atlas', priceNote: '$0.112 / s', refImages: 0, durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, durations: ['4', '5', '6', '8', '10', '12'] }
 ];
@@ -247,6 +257,7 @@ export function modelCapabilities(type, id) {
     label: model?.label || id,
     known: Boolean(model),
     maxRefImages: model ? model.refImages : 1, // unknown model: assume one input
+    refTagStyle: model?.refTagStyle || null,
     durations: type === 'video' ? (model?.durations || DEFAULT_VIDEO_DURATIONS) : null,
     sizes: model?.sizes || (type === 'image' ? IMAGE_ASPECT_RATIOS : VIDEO_RESOLUTIONS)
   };
@@ -255,6 +266,39 @@ export function modelCapabilities(type, id) {
 /** How many reference images this model will actually accept. */
 export function refImageCapacity(type, id) {
   return modelCapabilities(type, id).maxRefImages;
+}
+
+// --- REFERENCE TAGGING -----------------------------------------------------
+//
+// Most models read their reference images as an unlabelled pile and infer what
+// each one is for. Seedance 2.0 does not: it numbers the images you send by
+// position and the prompt has to name them — "@image1 as the main character" —
+// or the extra references are largely ignored. So a shot written as
+// "<Rex> crashes through <Lobby>" cannot be sent as prose to those models; the
+// tags have to become the pointers the model actually indexes on.
+//
+// The token is purely positional, which makes the send order in
+// composeGenerationPrompt load-bearing: renumber the images and every pointer
+// in the prompt silently addresses the wrong picture.
+
+const REF_TAG_FORMATS = {
+  // @image1 … @image9. Both cases appear in ByteDance's own material; lower
+  // case is what the English-language docs standardise on.
+  seedance: (index) => `@image${index + 1}`
+};
+
+/** Whether this model wants its references pointed at from inside the prompt. */
+export function usesRefTags(type, id) {
+  return Boolean(REF_TAG_FORMATS[modelCapabilities(type, id).refTagStyle]);
+}
+
+/**
+ * The token that addresses the image in slot `index` (0-based), or '' when the
+ * model has no such convention.
+ */
+export function refTagToken(type, id, index) {
+  const format = REF_TAG_FORMATS[modelCapabilities(type, id).refTagStyle];
+  return format ? format(index) : '';
 }
 
 /**

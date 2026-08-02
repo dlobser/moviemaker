@@ -56,12 +56,24 @@ import {
 import {
   ASSET_TYPES,
   assetInputImages,
+  assetPromptText,
+  buildAutoPromptContext,
   composeGenerationPrompt,
   defaultAssetPrompt,
+  droppedTags,
   extractTags,
   findAssetByTag,
-  normalizeTag
+  normalizeTag,
+  scanPromptTags,
+  tagPreservationRule
 } from './promptTags.js';
+import {
+  insertIntoPrompt,
+  remapDecorations,
+  removeDecoration,
+  undecorate
+} from './promptDecorations.js';
+import PromptEditor, { EffectivePrompt } from './PromptEditor.jsx';
 import { buildLlmImportPrompt, extractJsonDocument, normalizeImportedShotList } from './shotListImport.js';
 import { apiFetch, resolveAssetUrl, detectMode, isStatic } from './client.js';
 import { createEmptyEdit, migrateEdit } from './edit/model.js';
@@ -90,6 +102,8 @@ import {
 import ReferencePanel, { ReferenceStrip } from './ReferencePanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
 import CustomModelPath from './CustomModelPath.jsx';
+import MediaPickerDialog from './MediaPickerDialog.jsx';
+import { collectShotMedia } from './imagePicker.js';
 import DreamDialog from './DreamDialog.jsx';
 import {
   DEFAULT_DREAM_SYSTEM_PROMPT,
@@ -270,6 +284,8 @@ export default function App() {
   const [loadingStates, setLoadingStates] = useState({});
   const [toast, setToast] = useState(null);
   const [projectImagesSelector, setProjectImagesSelector] = useState(null); // null | { target: 'ref' }
+  // Picking a shot's active still or clip from anywhere in the project.
+  const [mediaPicker, setMediaPicker] = useState(null); // null | { shotId, kind }
   const [projectImagesList, setProjectImagesList] = useState([]);
 
   // --- MODALS FOR GENERATION PER SHOT ---
@@ -277,12 +293,32 @@ export default function App() {
   // { type: 'image'|'video', shotId: string, existingPromptId: string|null }
 
   const [genModalPrompt, setGenModalPrompt] = useState('');
-  const [genModalImageInput, setGenModalImageInput] = useState('');
   const [genModalInputImages, setGenModalInputImages] = useState([]);
   const [genModalDuration, setGenModalDuration] = useState('5');
   const [genModalModel, setGenModalModel] = useState('');
   const [genModalRes, setGenModalRes] = useState('');
   const [genModalExcludedImages, setGenModalExcludedImages] = useState([]);
+  // The project's pre/post prompt, per generation. They are wrapped around
+  // every prompt by default; turning one off here is how you get a shot out
+  // from under the film's global grade without editing the project settings.
+  const [genModalUsePre, setGenModalUsePre] = useState(true);
+  const [genModalUsePost, setGenModalUsePost] = useState(true);
+  // Ranges in genModalPrompt that were inserted rather than typed — snippets
+  // and inlined pre/post text. Shown in their own colour so the prompt says
+  // where it came from. Purely a composing aid: they live as long as the modal
+  // does and are never saved, since the text alone is what gets generated.
+  const [genModalDecorations, setGenModalDecorations] = useState([]);
+  // Where to put the caret once the next prompt change has rendered.
+  const [genModalCaret, setGenModalCaret] = useState(null);
+  // A hand-edited effective prompt. null means "compose it from the fields
+  // above"; a string means the user took the wheel and it is sent verbatim.
+  const [genModalOverride, setGenModalOverride] = useState(null);
+  const [genModalEffectiveOpen, setGenModalEffectiveOpen] = useState(false);
+  // --- Auto Prompt controls ---
+  const [genModalAutoInstructions, setGenModalAutoInstructions] = useState('');
+  const [genModalAutoContext, setGenModalAutoContext] = useState(false);
+  const [genModalAutoBare, setGenModalAutoBare] = useState(false);
+  const [genModalAutoOpen, setGenModalAutoOpen] = useState(false);
 
   // --- DOUBLE CLICK PREVIEW WITH ZOOM & PAN ---
   const [zoomImage, setZoomImage] = useState(null); // { path: string, name: string }
@@ -929,17 +965,28 @@ export default function App() {
 
     setGenerationModal({ type, shotId, existingPromptId });
     setGenModalPrompt('');
-    setGenModalImageInput('');
-    // Everything this shot is set to send — its own references first, then the
-    // ones it inherits from its scene and the project, minus anything held back.
-    // Trimmed to the model's capacity so the preview never promises more than
-    // will be uploaded.
-    setGenModalInputImages(shotReferencePaths(shot).slice(
-      0,
-      refImageCapacity(type, type === 'image' ? (shot.imageModel || imageModel) : (shot.videoModel || videoModel))
-    ));
+    const startingModel = type === 'image' ? (shot.imageModel || imageModel) : (shot.videoModel || videoModel);
+    // Image: everything this shot is set to send — its own references first,
+    // then the ones it inherits from its scene and the project, minus anything
+    // held back. Video: the shot's own still, which is what a video model has
+    // always been handed. Both are trimmed to the model's capacity so the
+    // preview never promises more than will be uploaded.
+    setGenModalInputImages((type === 'image'
+      ? shotReferencePaths(shot)
+      : (shot.selectedImage ? [shot.selectedImage] : [])
+    ).slice(0, refImageCapacity(type, startingModel)));
     setGenModalDuration(videoDuration);
     setGenModalExcludedImages([]);
+    setGenModalUsePre(true);
+    setGenModalUsePost(true);
+    setGenModalDecorations([]);
+    setGenModalCaret(null);
+    setGenModalOverride(null);
+    setGenModalEffectiveOpen(false);
+    setGenModalAutoInstructions('');
+    setGenModalAutoContext(false);
+    setGenModalAutoBare(false);
+    setGenModalAutoOpen(false);
 
     setGenModalAttachTags(type === 'image' ? attachTagsForImages : attachTagsForVideos);
 
@@ -969,17 +1016,21 @@ export default function App() {
         if (found.resolution) setGenModalRes(found.resolution);
         if (found.attachTaggedImages !== undefined) setGenModalAttachTags(found.attachTaggedImages !== false);
         setGenModalExcludedImages(found.excludedImagePaths || []);
-        if (type === 'image') {
-          setGenModalInputImages(found.primaryImagePaths || found.inputImagePaths || []);
-        } else {
-          if (found.duration) setGenModalDuration(found.duration);
-          setGenModalImageInput((found.primaryImagePaths || [])[0] ?? found.imageInput ?? '');
-        }
+        setGenModalUsePre(found.usePrePrompt !== false);
+        setGenModalUsePost(found.usePostPrompt !== false);
+        setGenModalOverride(typeof found.promptOverride === 'string' ? found.promptOverride : null);
+        if (type === 'video' && found.duration) setGenModalDuration(found.duration);
+        // Video groups saved before video took more than one image carry a lone
+        // `imageInput`; reading it as a one-element list reproduces them exactly.
+        setGenModalInputImages(
+          found.primaryImagePaths
+          || found.inputImagePaths
+          || (found.imageInput ? [found.imageInput] : [])
+        );
       }
     } else {
       const draftField = type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
       initialPromptText = shot[draftField] !== undefined && shot[draftField] !== null && shot[draftField] !== '' ? shot[draftField] : (shot.description || '');
-      setGenModalImageInput(shot.selectedImage || '');
     }
 
     setGenModalPrompt(initialPromptText);
@@ -995,46 +1046,130 @@ export default function App() {
     }
   };
 
-  const appendSnippetToModalPrompt = (snippetText) => {
-    setGenModalPrompt(prev => {
-      const trimmed = prev.trim();
-      const newVal = trimmed ? `${trimmed}, ${snippetText}` : snippetText;
-      // Update draft synchronously
-      if (generationModal) {
-        const { type, shotId, existingPromptId } = generationModal;
-        if (shotId && !existingPromptId) {
-          const field = type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
-          handleUpdateShotField(shotId, field, newVal);
-        }
-      }
-      return newVal;
+  // What "at the cursor" is measured against. Read straight off the element:
+  // a blurred textarea still remembers its selection, where React's onSelect
+  // does not fire for every way a caret can move.
+  const genModalInputRef = useRef(null);
+  const genModalSelection = useRef({ start: 0, end: 0 });
+  const modalCaret = () => {
+    const el = genModalInputRef.current;
+    return el ? { start: el.selectionStart, end: el.selectionEnd } : genModalSelection.current;
+  };
+
+  /** One place for "the prompt changed": text, decorations and the shot draft. */
+  const updateModalPrompt = (nextText, nextDecorations) => {
+    setGenModalDecorations(nextDecorations !== undefined
+      ? nextDecorations
+      : remapDecorations(genModalDecorations, genModalPrompt, nextText));
+    setGenModalPrompt(nextText);
+    updateDraftPrompt(nextText);
+  };
+
+  /**
+   * Drop text in at the caret and mark it as inserted.
+   *
+   * Inserting always used to append to the end, which made a snippet or a tag
+   * useless for anything but the tail of a prompt — you wrote the sentence, hit
+   * the chip, then cut and pasted it into place.
+   */
+  const insertIntoModalPrompt = (text, options) => {
+    const result = insertIntoPrompt(genModalPrompt, genModalDecorations, modalCaret(), text, options);
+    genModalSelection.current = { start: result.cursor, end: result.cursor };
+    updateModalPrompt(result.text, result.decorations);
+    // Hand the caret back so you can keep typing where the insert left off,
+    // rather than having to click into the field again after every chip.
+    setGenModalCaret({ pos: result.cursor, nonce: Date.now() });
+  };
+
+  const appendSnippetToModalPrompt = (snippetText, name) => {
+    insertIntoModalPrompt(snippetText, { kind: 'snippet', label: name || 'snippet', joiner: ', ' });
+  };
+
+  /**
+   * Fold a global pre/post prompt into this prompt so it can be edited here.
+   *
+   * It stops being applied globally for this generation at the same moment —
+   * otherwise clicking it to tweak a word would send it twice.
+   */
+  const inlineAffix = (side) => {
+    const text = generationModal?.type === 'image'
+      ? (side === 'pre' ? prePrompt : postPrompt)
+      : (side === 'pre' ? videoPrePrompt : videoPostPrompt);
+    if (!text) return;
+    const at = side === 'pre' ? 0 : genModalPrompt.length;
+    const result = insertIntoPrompt(genModalPrompt, genModalDecorations, { start: at, end: at }, text, {
+      kind: 'affix',
+      label: `${side === 'pre' ? 'pre' : 'post'}-prompt`,
+      joiner: ', '
     });
+    if (side === 'pre') setGenModalUsePre(false); else setGenModalUsePost(false);
+    updateModalPrompt(result.text, result.decorations);
   };
 
   // --- AUTO-GENERATE PROMPT FROM SHOT VIA LLM ---
   const handleAutoGeneratePromptInModal = async () => {
     const { shotId } = generationModal;
     const shot = shots.find(s => s.id === shotId);
-    if (!shot || !shot.description) {
+    const instructions = genModalAutoInstructions.trim();
+    // Without the shot template there is nothing to write *from* except the
+    // instructions, so those become the requirement instead of the description.
+    if (genModalAutoBare) {
+      if (!instructions) {
+        showToast('Instructions-only mode sends nothing else — write the instructions first.', 'warning');
+        return;
+      }
+    } else if (!shot || !shot.description) {
       showToast('Please add a visual description to the shot first.', 'warning');
       return;
     }
+    if (!shot) return;
 
     setLoadingStates(prev => ({ ...prev, modal_llm: true }));
     const isImage = generationModal.type === 'image';
-    const systemPrompt = isImage ? imageSystemPrompt : videoSystemPrompt;
+    const systemPrompt = genModalAutoBare ? '' : (isImage ? imageSystemPrompt : videoSystemPrompt);
     const sceneOfShot = scenes.find(s => (s.shots || []).some(sh => sh.id === shot.id));
-    const promptPayload = fillTemplate(
-      promptText(promptSettings, isImage ? 'imageUserTemplate' : 'videoUserTemplate'),
-      {
-        description: shot.description,
-        setup: shot.setup,
-        notes: shot.notes,
-        dialogue: shot.dialogue,
-        name: shot.name,
-        sceneName: sceneOfShot?.name || ''
-      }
-    );
+    // Whatever the writer is shown is what it can preserve, so the tags are
+    // collected from exactly the fields the template can send.
+    const shotText = [shot.description, shot.setup, shot.notes, shot.dialogue].filter(Boolean).join(' ');
+
+    const sections = [];
+
+    // Context first: the writer needs to know what exists before it is asked to
+    // write about it, and the tag list is only useful ahead of the request.
+    if (genModalAutoContext) {
+      const index = shots.findIndex(s => s.id === shot.id);
+      const context = buildAutoPromptContext({
+        assetLibrary,
+        previousShot: index > 0 ? shots[index - 1] : null,
+        nextShot: index >= 0 && index < shots.length - 1 ? shots[index + 1] : null
+      });
+      if (context) sections.push(`${promptText(promptSettings, 'autoContextIntro')}\n\n${context}`);
+    }
+
+    if (!genModalAutoBare) {
+      sections.push(fillTemplate(
+        promptText(promptSettings, isImage ? 'imageUserTemplate' : 'videoUserTemplate'),
+        {
+          description: shot.description,
+          setup: shot.setup,
+          notes: shot.notes,
+          dialogue: shot.dialogue,
+          name: shot.name,
+          sceneName: sceneOfShot?.name || '',
+          tags: tagPreservationRule(shotText)
+        }
+      ));
+    }
+
+    // Last, so they are the freshest thing in the window and read as the final
+    // word when they contradict the template.
+    if (instructions) {
+      sections.push(genModalAutoBare
+        ? instructions
+        : `=== EXTRA INSTRUCTIONS (these override anything above) ===\n${instructions}`);
+    }
+
+    const promptPayload = sections.filter(Boolean).join('\n\n');
 
     try {
       const res = await apiFetch(`/api/llm/generate`, {
@@ -1052,9 +1187,24 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Failed prompt generation');
       if (!data.text?.trim()) throw new Error('The model returned an empty prompt.');
 
-      setGenModalPrompt(data.text);
-      updateDraftPrompt(data.text);
-      showToast('Prompt generated via LLM!', 'success');
+      // A wholly new prompt keeps none of the old one's inserted blocks — the
+      // text they marked is gone.
+      updateModalPrompt(data.text, []);
+
+      // Instructions are not guarantees. A dropped tag is invisible until the
+      // generation comes back without the character in it, so say so now while
+      // the prompt is still on screen and editable.
+      // Only meaningful when the writer was actually shown the shot and asked
+      // to keep its tags; in instructions-only mode it never saw them.
+      const lost = genModalAutoBare ? [] : droppedTags(shotText, data.text);
+      if (lost.length > 0) {
+        showToast(
+          `Prompt written, but the writer dropped <${lost.join('>, <')}> — add ${lost.length === 1 ? 'it' : 'them'} back or its reference art will not be sent.`,
+          'warning'
+        );
+      } else {
+        showToast('Prompt generated via LLM!', 'success');
+      }
     } catch (err) {
       console.error(err);
       showToast(`Prompt failed: ${err.message}`, 'error');
@@ -1069,13 +1219,18 @@ export default function App() {
   // composed prompt already has the global pre/post text baked in, so matching
   // on it meant "+ Add Iteration" — which reloads the group and recomposes —
   // produced a different string every time and forked a fresh group.
+  // `!== false` throughout, so a group saved before a flag existed reads as the
+  // default it was generated under and keeps its own gallery.
   const imagePromptSignature = (group) => JSON.stringify([
     group.rawPrompt ?? group.prompt ?? '',
     group.model || '',
     group.resolution || '',
     group.primaryImagePaths || [],
     group.attachTaggedImages !== false,
-    group.excludedImagePaths || []
+    group.excludedImagePaths || [],
+    group.usePrePrompt !== false,
+    group.usePostPrompt !== false,
+    group.promptOverride ?? null
   ]);
 
   const videoPromptSignature = (group) => JSON.stringify([
@@ -1085,16 +1240,36 @@ export default function App() {
     group.duration || '',
     group.primaryImagePaths || [],
     group.attachTaggedImages !== false,
-    group.excludedImagePaths || []
+    group.excludedImagePaths || [],
+    group.usePrePrompt !== false,
+    group.usePostPrompt !== false,
+    group.promptOverride ?? null
   ]);
+
+  /**
+   * Let a hand-edited effective prompt stand in for the composed text.
+   *
+   * Deliberately the *last* step and deliberately text-only. The images were
+   * already decided by the tags and the thumbnails, and they stay decided:
+   * deleting "@image3" from the override unbinds that image from the prompt
+   * without unsending it, which is the honest reading — the picture really is
+   * still in the request. Taking it out is what the thumbnail's ✕ is for.
+   */
+  const applyPromptOverride = (composed, override) => (
+    typeof override === 'string'
+      ? { ...composed, prompt: override, overridden: true }
+      : { ...composed, overridden: false }
+  );
 
   // --- PROMPT COMPOSITION ---
   // The single place where a raw shot prompt becomes the string a model sees:
   // global pre/post prompt + <Tag> substitution + reference image resolution.
-  const buildPrompt = (type, rawPrompt, modelId, primaryImagePaths = [], attachTaggedImages = null, excludedImagePaths = []) => composeGenerationPrompt({
+  const buildPrompt = (type, rawPrompt, modelId, primaryImagePaths = [], attachTaggedImages = null, excludedImagePaths = [], wrap = {}) => applyPromptOverride(composeGenerationPrompt({
     prompt: rawPrompt,
-    prePrompt: type === 'image' ? prePrompt : videoPrePrompt,
-    postPrompt: type === 'image' ? postPrompt : videoPostPrompt,
+    // The pre/post prompt is on unless this particular generation turned it
+    // off, so every existing caller and every saved group behaves as before.
+    prePrompt: wrap.usePrePrompt === false ? '' : (type === 'image' ? prePrompt : videoPrePrompt),
+    postPrompt: wrap.usePostPrompt === false ? '' : (type === 'image' ? postPrompt : videoPostPrompt),
     assetLibrary,
     primaryImagePaths,
     attachTaggedImages: attachTaggedImages === null
@@ -1103,17 +1278,11 @@ export default function App() {
     excludedImagePaths,
     type,
     modelId
-  });
+  }), wrap.promptOverride);
 
   const handleDeselectSentImage = (imagePath, origin) => {
     if (origin === 'primary') {
-      if (generationModal?.type === 'image') {
-        setGenModalInputImages(prev => prev.filter(p => p !== imagePath));
-      } else {
-        if (genModalImageInput === imagePath) {
-          setGenModalImageInput('');
-        }
-      }
+      setGenModalInputImages(prev => prev.filter(p => p !== imagePath));
     }
     setGenModalExcludedImages(prev => [...prev, imagePath]);
   };
@@ -1136,11 +1305,12 @@ export default function App() {
       model: genModalModel,
       resolution: genModalRes,
       duration: genModalDuration,
-      primaryImagePaths: type === 'image'
-        ? genModalInputImages
-        : (genModalImageInput ? [genModalImageInput] : []),
+      primaryImagePaths: genModalInputImages,
       attachTaggedImages: genModalAttachTags,
-      excludedImagePaths: genModalExcludedImages
+      excludedImagePaths: genModalExcludedImages,
+      usePrePrompt: genModalUsePre,
+      usePostPrompt: genModalUsePost,
+      promptOverride: genModalOverride
     });
   };
 
@@ -1155,10 +1325,10 @@ export default function App() {
     // so a generation lands in the right gallery regardless of where it started.
     rawPrompt, model, resolution, duration,
     primaryImagePaths = [], attachTaggedImages = null,
-    excludedImagePaths = []
+    excludedImagePaths = [], usePrePrompt = true, usePostPrompt = true, promptOverride = null
   }) => {
     const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const composed = buildPrompt(type, rawPrompt, model, primaryImagePaths, attachTaggedImages, excludedImagePaths);
+    const composed = buildPrompt(type, rawPrompt, model, primaryImagePaths, attachTaggedImages, excludedImagePaths, { usePrePrompt, usePostPrompt, promptOverride });
 
     setBatchJobs(prev => [{
       id: jobId,
@@ -1186,13 +1356,16 @@ export default function App() {
       duration,
       primaryImagePaths,
       attachTaggedImages: composed.attachTaggedImages,
-      excludedImagePaths
+      excludedImagePaths,
+      usePrePrompt,
+      usePostPrompt,
+      promptOverride
     };
 
     if (type === 'image') {
       return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe);
     }
-    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths[0] || '', recipe);
+    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe);
   };
 
   const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}) => {
@@ -1293,10 +1466,15 @@ export default function App() {
     }
   };
 
-  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInput, recipe = {}) => {
+  // `imageInputs` is every reference the composition decided to send, in slot
+  // order. It used to be a single path, which was fine while every video model
+  // took one image and quietly wrong once Seedance 2.0's reference endpoint
+  // took nine — the prompt pointed at @image3 and only @image1 was ever sent.
+  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}) => {
     const { model, resolution: resOption, duration } = recipe;
+    const imageUrlsToSend = Array.isArray(imageInputs) ? imageInputs.filter(Boolean) : [imageInputs].filter(Boolean);
+    const imageInput = imageUrlsToSend[0] || '';
     try {
-      const imageUrlsToSend = imageInput ? [imageInput] : [];
       const res = await apiFetch(`/api/video/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1346,7 +1524,8 @@ export default function App() {
                   id: groupId,
                   ...recipe,
                   prompt: promptText,          // composed, for display
-                  imageInput,
+                  imageInput,                  // first slot, for older readers
+                  inputImagePaths: imageUrlsToSend,
                   outputs: [newOutput]
                 });
               }
@@ -2264,16 +2443,14 @@ export default function App() {
     }
   };
 
-  /** Insert <Tag> at the end of the generation modal prompt. */
+  /**
+   * Insert <Tag> at the caret in the generation modal prompt.
+   *
+   * No decoration: a tag is highlighted wherever it appears, whether it was
+   * typed or inserted, because it is the text itself that is special.
+   */
   const appendAssetTagToModalPrompt = (tag) => {
-    setGenModalPrompt(prev => {
-      const next = prev.trim() ? `${prev.trim()} <${tag}>` : `<${tag}>`;
-      if (generationModal && !generationModal.existingPromptId) {
-        const field = generationModal.type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
-        handleUpdateShotField(generationModal.shotId, field, next);
-      }
-      return next;
-    });
+    insertIntoModalPrompt(`<${tag}>`, { decorate: false, joiner: ' ' });
   };
 
   // --- PROJECTS -------------------------------------------------------------
@@ -3406,23 +3583,36 @@ export default function App() {
     }
   };
 
-  const openProjectImageSelector = async (target) => {
+  /**
+   * Re-read the project's assets folder.
+   *
+   * This is the catch-all image source — captured frames, hand-copied files,
+   * anything the named galleries never learned about. Split out from the
+   * selector below so the shot picker can refresh it without also opening a
+   * different dialog. Resolves either way; a failure just means the picker
+   * shows the sources it does know about.
+   */
+  const fetchProjectImages = async () => {
     setLoadingStates(prev => ({ ...prev, project_images: true }));
     try {
       const res = await apiFetch(`/api/project-images`);
-      if (res.ok) {
-        const list = await res.json();
-        setProjectImagesList(list);
-        setProjectImagesSelector({ target });
-      } else {
+      if (!res.ok) {
         showToast('Failed to load project images', 'error');
+        return false;
       }
+      setProjectImagesList(await res.json());
+      return true;
     } catch (err) {
       console.error(err);
       showToast('Error loading project images', 'error');
+      return false;
     } finally {
       setLoadingStates(prev => ({ ...prev, project_images: false }));
     }
+  };
+
+  const openProjectImageSelector = async (target) => {
+    if (await fetchProjectImages()) setProjectImagesSelector({ target });
   };
 
   const selectProjectImage = (image) => {
@@ -3667,6 +3857,27 @@ export default function App() {
       return;
     }
     showToast('Asset deleted');
+  };
+
+  /**
+   * Open the picker, and refresh the assets-folder listing while it loads.
+   *
+   * That listing is the catch-all source — captured frames, hand-copied files,
+   * anything the named galleries never learned about — so it has to be current
+   * rather than whatever was fetched the last time some other dialog needed it.
+   */
+  const openMediaPicker = (shotId, kind) => {
+    setMediaPicker({ shotId, kind });
+    if (kind === 'image') fetchProjectImages();
+  };
+
+  const handlePickShotMedia = (path) => {
+    if (!mediaPicker) return;
+    const { shotId, kind } = mediaPicker;
+    const field = kind === 'video' ? 'selectedVideo' : 'selectedImage';
+    handleUpdateShotField(shotId, field, path);
+    setMediaPicker(null);
+    showToast(`${kind === 'video' ? 'Clip' : 'Image'} set${path ? '' : ' — slot cleared'}.`, 'success');
   };
 
   const handleSetSelect = (galleryType, assetPath) => {
@@ -4572,21 +4783,20 @@ export default function App() {
                                 </button>
                               </>
                             ) : (
-                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
-                                <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>Double click iteration output to preview/set</span>
-                                <button
-                                  className="btn btn-secondary"
-                                  style={{ fontSize: '0.75rem', padding: '4px 8px' }}
-                                  onClick={() => {
-                                    setActiveShotId(shot.id);
-                                    setActiveOverlay('images');
-                                  }}
-                                >
-                                  Choose from Library...
-                                </button>
-                              </div>
+                              <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>
+                                Double click an iteration output to set it, or choose from the project below
+                              </span>
                             )}
                           </div>
+                          {/* Always offered, filled or not — swapping a still that
+                              is already set was previously impossible. */}
+                          <button
+                            className="btn btn-secondary"
+                            style={{ width: '100%', fontSize: '0.78rem' }}
+                            onClick={() => openMediaPicker(shot.id, 'image')}
+                          >
+                            <Layers size={13} /> {shot.selectedImage ? 'Replace from project…' : 'Choose from project…'}
+                          </button>
                           <button className="btn btn-primary" style={{ width: '100%' }} onClick={() => openGenerationModal('image', shot.id)}>
                             <ImageIcon size={14} /> Generate Image Variation
                           </button>
@@ -4624,21 +4834,18 @@ export default function App() {
                                 </button>
                               </>
                             ) : (
-                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
-                                <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>Select a video iteration to make active</span>
-                                <button
-                                  className="btn btn-secondary"
-                                  style={{ fontSize: '0.75rem', padding: '4px 8px' }}
-                                  onClick={() => {
-                                    setActiveShotId(shot.id);
-                                    setActiveOverlay('videos');
-                                  }}
-                                >
-                                  Choose from Library...
-                                </button>
-                              </div>
+                              <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>
+                                Select a video iteration to make active, or choose from the project below
+                              </span>
                             )}
                           </div>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ width: '100%', fontSize: '0.78rem' }}
+                            onClick={() => openMediaPicker(shot.id, 'video')}
+                          >
+                            <Layers size={13} /> {shot.selectedVideo ? 'Replace from project…' : 'Choose from project…'}
+                          </button>
                           <button className="btn btn-accent" style={{ width: '100%' }} onClick={() => openGenerationModal('video', shot.id)}>
                             <Film size={14} /> Generate Video Variation
                           </button>
@@ -4845,7 +5052,44 @@ export default function App() {
       </main>
 
       {/* --- A. GENERATION PROMPT MODAL (IMAGE / VIDEO) --- */}
-      {generationModal && (
+      {generationModal && (() => {
+        // Composed once for the whole modal: the prompt field, the image list
+        // and the counters all have to describe the same request.
+        const preview = buildPrompt(
+          generationModal.type,
+          genModalPrompt,
+          genModalModel,
+          genModalInputImages,
+          genModalAttachTags,
+          genModalExcludedImages,
+          { usePrePrompt: genModalUsePre, usePostPrompt: genModalUsePost, promptOverride: genModalOverride }
+        );
+        const modalPre = genModalUsePre
+          ? (generationModal.type === 'image' ? prePrompt : videoPrePrompt)
+          : '';
+        const modalPost = genModalUsePost
+          ? (generationModal.type === 'image' ? postPrompt : videoPostPrompt)
+          : '';
+        // <Tag> highlighting is derived from the text, not stored: a tag typed
+        // by hand and one dropped in by a chip are the same thing.
+        const tagMarks = scanPromptTags(genModalPrompt, assetLibrary).occurrences.map((occurrence, index) => {
+          const slot = occurrence.asset
+            ? preview.imageSources.findIndex(source => source.asset && source.asset.id === occurrence.asset.id)
+            : -1;
+          const pointer = preview.usesRefTags && slot >= 0 ? preview.imageSources[slot].token : '';
+          return {
+            id: `tag_${index}_${occurrence.start}`,
+            kind: occurrence.asset ? 'tag' : 'missing-tag',
+            start: occurrence.start,
+            end: occurrence.end,
+            removable: false,
+            label: occurrence.asset
+              ? `<${occurrence.asset.tag}> → ${pointer || assetPromptText(occurrence.asset)}`
+              : `<${occurrence.raw}> — no such asset`
+          };
+        });
+
+        return (
         <div className="modal-overlay">
           <div className="modal-window">
             <div className="modal-header">
@@ -4859,7 +5103,7 @@ export default function App() {
             </div>
 
             <div className="modal-body">
-              <div style={{ alignSelf: 'flex-end' }}>
+              <div className="auto-prompt-bar">
                 <button
                   type="button"
                   className="btn btn-accent"
@@ -4869,26 +5113,145 @@ export default function App() {
                   {loadingStates.modal_llm ? <RefreshCw className="spinner" size={14} /> : <Sparkles size={14} />}
                   Auto Prompt
                 </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: '6px 10px', fontSize: '0.75rem' }}
+                  onClick={() => setGenModalAutoOpen(open => !open)}
+                  title="Steer what Auto Prompt is told"
+                >
+                  {genModalAutoOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                  Auto Prompt options
+                  {(genModalAutoInstructions.trim() || genModalAutoContext || genModalAutoBare) && (
+                    <span className="auto-prompt-dot" title="Options are set" />
+                  )}
+                </button>
               </div>
 
+              {genModalAutoOpen && (
+                <div className="auto-prompt-panel">
+                  <label className="form-label" style={{ fontSize: '0.75rem' }}>Extra instructions for the prompt writer</label>
+                  <textarea
+                    className="input-field"
+                    style={{ minHeight: '64px', fontSize: '0.82rem' }}
+                    value={genModalAutoInstructions}
+                    onChange={(e) => setGenModalAutoInstructions(e.target.value)}
+                    placeholder="e.g. keep it under 40 words, shoot it from below, no dialogue, lean harder on <Rex>"
+                  />
+
+                  <label className="auto-prompt-check">
+                    <input
+                      type="checkbox"
+                      checked={genModalAutoContext}
+                      onChange={(e) => setGenModalAutoContext(e.target.checked)}
+                    />
+                    <span>
+                      <strong>Include all context</strong>
+                      <em>
+                        Sends every asset tag and its description, plus the shots either side of this one,
+                        so the writer can stay continuous and use tags instead of inventing descriptions.
+                      </em>
+                    </span>
+                  </label>
+
+                  <label className="auto-prompt-check">
+                    <input
+                      type="checkbox"
+                      checked={genModalAutoBare}
+                      onChange={(e) => setGenModalAutoBare(e.target.checked)}
+                    />
+                    <span>
+                      <strong>Instructions only</strong>
+                      <em>
+                        Drops the system prompt and the shot template — the model gets your instructions
+                        {genModalAutoContext ? ' and the context above' : ''}, nothing else.
+                      </em>
+                    </span>
+                  </label>
+                </div>
+              )}
+
               <div className="form-group">
-                <label className="form-label">Visual Model Prompt</label>
-                <textarea
-                  className="input-field"
-                  style={{ minHeight: '120px' }}
+                <label className="form-label">
+                  Prompt Sent to Model
+                  <span style={{ marginLeft: '8px', fontWeight: 'normal', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
+                    everything below goes to the model, colour-coded by where it came from
+                  </span>
+                </label>
+                <PromptEditor
                   value={genModalPrompt}
-                  onChange={(e) => {
-                    setGenModalPrompt(e.target.value);
-                    updateDraftPrompt(e.target.value);
+                  onChange={(next) => updateModalPrompt(next)}
+                  decorations={genModalDecorations}
+                  marks={tagMarks}
+                  prePrompt={modalPre}
+                  postPrompt={modalPost}
+                  usePre={genModalUsePre && Boolean(modalPre)}
+                  usePost={genModalUsePost && Boolean(modalPost)}
+                  onTogglePre={() => setGenModalUsePre(false)}
+                  onTogglePost={() => setGenModalUsePost(false)}
+                  onInlinePre={() => inlineAffix('pre')}
+                  onInlinePost={() => inlineAffix('post')}
+                  inputRef={genModalInputRef}
+                  caretRequest={genModalCaret}
+                  onSelectionChange={(selection) => { genModalSelection.current = selection; }}
+                  onUndecorate={(id) => setGenModalDecorations(prev => undecorate(prev, id))}
+                  onRemoveDecoration={(id) => {
+                    const result = removeDecoration(genModalPrompt, genModalDecorations, id);
+                    updateModalPrompt(result.text, result.decorations);
                   }}
                   placeholder="Cinematic visual setup description..."
+                  footer={(
+                    <div className="prompt-editor-footer">
+                      <span>{preview.prompt.length} chars</span>
+                      <span>
+                        {preview.inputImagePaths.length}/{preview.capacity} reference image{preview.capacity === 1 ? '' : 's'}
+                      </span>
+                      {genModalDecorations.some(d => d.kind === 'snippet') && (
+                        <span className="prompt-legend">
+                          <span className="prompt-legend-swatch" style={{ background: 'var(--mark-snippet)' }} /> snippet
+                        </span>
+                      )}
+                      {tagMarks.length > 0 && (
+                        <span className="prompt-legend">
+                          <span className="prompt-legend-swatch" style={{ background: 'var(--mark-tag)' }} />
+                          {preview.usesRefTags ? 'tag → @imageN' : 'tag → description'}
+                        </span>
+                      )}
+                      {/* Turned off pre/post is offered back rather than lost. */}
+                      {!genModalUsePre && (generationModal.type === 'image' ? prePrompt : videoPrePrompt) && (
+                        <button type="button" className="prompt-affix-restore" onClick={() => setGenModalUsePre(true)}>
+                          + pre-prompt
+                        </button>
+                      )}
+                      {!genModalUsePost && (generationModal.type === 'image' ? postPrompt : videoPostPrompt) && (
+                        <button type="button" className="prompt-affix-restore" onClick={() => setGenModalUsePost(true)}>
+                          + post-prompt
+                        </button>
+                      )}
+                    </div>
+                  )}
+                />
+
+                {/* The result of all of the above, always on screen. The field
+                    higher up holds <Sara>; this is the "@image2" the model
+                    actually receives, and the two cannot be the same box. */}
+                <EffectivePrompt
+                  text={preview.prompt}
+                  overridden={preview.overridden}
+                  expanded={genModalEffectiveOpen}
+                  onToggleExpanded={() => setGenModalEffectiveOpen(open => !open)}
+                  onEdit={(current) => setGenModalOverride(current)}
+                  onChange={(next) => setGenModalOverride(next)}
+                  onRevert={() => setGenModalOverride(null)}
+                  capacity={preview.capacity}
+                  imageCount={preview.inputImagePaths.length}
                 />
               </div>
 
               {/* Asset tags — click to insert <Tag> into the prompt */}
               {assetLibrary.length > 0 && (
                 <div className="form-group">
-                  <label className="form-label">Insert Asset Tag (adds &lt;Tag&gt; + its reference image)</label>
+                  <label className="form-label">Insert Asset Tag at the cursor (adds &lt;Tag&gt; + its reference image)</label>
                   <div className="snippet-chips-container">
                     {assetLibrary.map(asset => (
                       <button
@@ -4906,14 +5269,15 @@ export default function App() {
               )}
 
               <div className="form-group">
-                <label className="form-label">Concatenate Prompt Snippets (Click to Add)</label>
+                <label className="form-label">Insert Prompt Snippet at the cursor</label>
                 <div className="snippet-chips-container">
                   {promptSnippets.map(snip => (
                     <button
                       key={snip.id}
                       type="button"
                       className="snippet-chip"
-                      onClick={() => appendSnippetToModalPrompt(snip.text)}
+                      title={snip.text}
+                      onClick={() => appendSnippetToModalPrompt(snip.text, snip.name)}
                     >
                       + {snip.name}
                     </button>
@@ -4921,28 +5285,10 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Exactly what the model will receive, after pre/post + tags */}
-              {(() => {
-                const preview = buildPrompt(
-                  generationModal.type,
-                  genModalPrompt,
-                  genModalModel,
-                  generationModal.type === 'image' ? genModalInputImages : (genModalImageInput ? [genModalImageInput] : []),
-                  genModalAttachTags,
-                  genModalExcludedImages
-                );
-                return (
+              {/* Which images go with the request. The prompt itself is no
+                  longer previewed here — it is the field above, in place. */}
+              {(
                   <div className="form-group">
-                    <label className="form-label">
-                      Effective Prompt Sent to Model
-                      <span style={{ marginLeft: '8px', fontWeight: 'normal', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
-                        {preview.prompt.length} chars · {preview.inputImagePaths.length}/{preview.capacity} reference image{preview.capacity === 1 ? '' : 's'}
-                      </span>
-                    </label>
-                    <div style={{ background: 'rgba(0,0,0,0.28)', border: '1px solid var(--border-light)', borderRadius: '6px', padding: '10px', fontSize: '0.8rem', color: 'var(--text-muted)', whiteSpace: 'pre-wrap', maxHeight: '110px', overflowY: 'auto' }}>
-                      {preview.prompt || <em style={{ color: 'var(--text-dim)' }}>Empty — nothing will be generated.</em>}
-                    </div>
-
                     {preview.missingTags.length > 0 && (
                       <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px', alignItems: 'center' }}>
                         <AlertTriangle size={12} style={{ color: 'var(--accent)' }} />
@@ -4985,8 +5331,11 @@ export default function App() {
                             <div key={entry.path} style={{ width: '86px', textAlign: 'center', position: 'relative' }}>
                               <div style={{ position: 'relative', height: '58px', borderRadius: '4px', overflow: 'hidden', border: `2px solid ${entry.origin === 'primary' ? 'var(--success)' : 'var(--primary)'}`, background: '#000' }}>
                                 <AssetImage path={entry.path} alt={entry.label} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                                <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '0.6rem', fontWeight: 'bold', background: 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '0 4px' }}>
-                                  {index + 1}
+                                {/* On a pointer model this badge is not
+                                    decoration — it is the name the prompt
+                                    calls this image by. */}
+                                <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '0.6rem', fontWeight: 'bold', background: entry.token ? 'var(--primary)' : 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '0 4px' }}>
+                                  {entry.token || index + 1}
                                 </span>
                                 <button
                                   type="button"
@@ -5040,8 +5389,7 @@ export default function App() {
                       )}
                     </div>
                   </div>
-                );
-              })()}
+              )}
 
               <div className="control-grid">
                 <div className="form-group">
@@ -5157,11 +5505,15 @@ export default function App() {
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Input Context (Image-to-Video - Select Single)</label>
+                    <label className="form-label">
+                      Input Context ({genModalInputImages.length}/{refImageCapacity('video', genModalModel)})
+                    </label>
                     <span className="input-help" style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-dim)', marginBottom: '8px' }}>
-                      Choose an image to guide video generation, or click Add Reference to select a project asset. Leave unselected for Text-to-Video.
+                      {refImageCapacity('video', genModalModel) > 1
+                        ? 'Pick as many references as this model takes — order matters, slot 1 is the strongest. Leave empty for text-to-video.'
+                        : 'Choose an image to guide video generation, or click Add Reference to select a project asset. Leave unselected for Text-to-Video.'}
                     </span>
-                    
+
                     <div className="generation-reference-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '8px', marginTop: '4px' }}>
                       {(() => {
                         const activeShot = shots.find(s => s.id === generationModal.shotId);
@@ -5187,13 +5539,29 @@ export default function App() {
                         return (
                           <>
                             {allGridImages.map(img => {
-                              const isSelected = genModalImageInput === img.path;
+                              const isSelected = genModalInputImages.includes(img.path)
+                                && !genModalExcludedImages.includes(img.path);
                               return (
                                 <button
                                   key={img.id}
                                   type="button"
                                   className={`generation-reference-card ${isSelected ? 'selected' : ''}`}
-                                  onClick={() => setGenModalImageInput(isSelected ? '' : img.path)}
+                                  onClick={() => {
+                                    setGenModalExcludedImages(prev => prev.filter(p => p !== img.path));
+                                    setGenModalInputImages(prev => {
+                                      if (prev.includes(img.path)) return prev.filter(p => p !== img.path);
+                                      const capacity = refImageCapacity('video', genModalModel);
+                                      // One slot means picking a second one is a
+                                      // swap, not an error — that is what the
+                                      // single-select control always did.
+                                      if (capacity <= 1) return [img.path];
+                                      if (prev.length >= capacity) {
+                                        showToast(`This model accepts up to ${capacity} input image${capacity === 1 ? '' : 's'}.`, 'warning');
+                                        return prev;
+                                      }
+                                      return [...prev, img.path];
+                                    });
+                                  }}
                                   style={{ position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', border: '1px solid var(--border-color)', borderRadius: '6px', overflow: 'hidden', padding: 0, height: '110px', background: 'rgba(255,255,255,0.02)' }}
                                   title={img.name}
                                 >
@@ -5239,7 +5607,8 @@ export default function App() {
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* --- A0. FLOATING OVERLAY: STORYBOARD --- */}
       {activeOverlay === 'storyboard' && (() => {
@@ -6378,6 +6747,30 @@ export default function App() {
               </div>
             </div>
           </div>
+        );
+      })()}
+
+      {/* --- A4a. SHOT MEDIA PICKER --- */}
+      {mediaPicker && (() => {
+        const shot = shots.find(s => s.id === mediaPicker.shotId);
+        return (
+          <MediaPickerDialog
+            kind={mediaPicker.kind}
+            shotName={shot?.name || ''}
+            currentPath={mediaPicker.kind === 'video' ? shot?.selectedVideo : shot?.selectedImage}
+            groups={collectShotMedia({
+              kind: mediaPicker.kind,
+              shot,
+              imageGallery,
+              videoGallery,
+              referenceImages,
+              assetLibrary,
+              projectFiles: projectImagesList
+            })}
+            onPick={handlePickShotMedia}
+            onClear={() => handlePickShotMedia(null)}
+            onClose={() => setMediaPicker(null)}
+          />
         );
       })()}
 
