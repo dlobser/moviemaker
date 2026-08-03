@@ -23,6 +23,7 @@ import {
   sizeOptions
 } from './catalog.js';
 import { PROMPT_GROUPS, PROMPT_SLOTS, isPromptOverridden, promptDefault, promptText } from './prompts.js';
+import { ASSET_TYPES } from './promptTags.js';
 import CustomModelPath from './CustomModelPath.jsx';
 
 const TABS = [
@@ -63,6 +64,7 @@ export default function SettingsPanel({
   videoDuration, setVideoDuration,
   batchConcurrency, setBatchConcurrency,
   customModelCaps, setCustomModelCap,
+  assetTypeModels, setAssetTypeModel,
   attachTagsForImages, setAttachTagsForImages,
   attachTagsForVideos, setAttachTagsForVideos,
   atlasSafetyChecker, setAtlasSafetyChecker,
@@ -249,6 +251,30 @@ export default function SettingsPanel({
                     <select className="select-field" value={videoDuration} onChange={(e) => setVideoDuration(e.target.value)}>
                       {durationOptions(videoModel, videoDuration).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                     </select>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <h3>Asset-type image defaults</h3>
+                  <p className="settings-note">
+                    Which image model each asset *type* uses when the asset has no override of its
+                    own — characters on an identity-preserving model, environments on cheap t2i.
+                    Blank inherits the project default above.
+                  </p>
+                  <div className="control-grid">
+                    {ASSET_TYPES.map(assetType => (
+                      <div className="form-group" key={assetType.id}>
+                        <label className="form-label">{assetType.label}</label>
+                        <select
+                          className="select-field"
+                          value={assetTypeModels?.[assetType.id] || ''}
+                          onChange={(e) => setAssetTypeModel(assetType.id, e.target.value || null)}
+                        >
+                          <option value="">Project default</option>
+                          <ModelOptions models={IMAGE_MODELS} unit="img" />
+                        </select>
+                      </div>
+                    ))}
                   </div>
                 </section>
 

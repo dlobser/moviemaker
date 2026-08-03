@@ -104,6 +104,11 @@ Tags must be a single word (letters, digits, _ or -), and every tag used in a
 prompt must exist in the "assets" array.
 Valid asset "type" values: ${assetTypeList}.
 
+Scenes may optionally carry the same "imageModel" / "imageResolution" /
+"videoModel" / "videoResolution" / "videoDuration" fields shown on shots —
+they become defaults for every shot in that scene that does not set its own.
+Omit any you have no opinion on; never emit them as empty strings.
+
 Assets already defined in this project (reuse these tags, do not redefine them):
 ${existingAssets}
 
@@ -260,6 +265,13 @@ export function normalizeImportedShotList(raw) {
       id: sceneId,
       name: asString(rawScene?.name, `Scene ${sceneIndex + 1}`),
       number: Number(rawScene?.number) || sceneIndex + 1,
+      // Optional scene-level generation defaults (resolveModelSettings reads
+      // them between shot overrides and project defaults). Absent = inherit.
+      imageModel: asString(rawScene?.imageModel) || null,
+      imageResolution: asString(rawScene?.imageResolution) || null,
+      videoModel: asString(rawScene?.videoModel) || null,
+      videoResolution: asString(rawScene?.videoResolution) || null,
+      videoDuration: rawScene?.videoDuration != null && rawScene.videoDuration !== '' ? String(rawScene.videoDuration) : null,
       sceneConcatenatedVideo: null,
       shots: rawShots.map((rawShot, shotIndex) => {
         const shot = rawShot && typeof rawShot === 'object' ? rawShot : {};

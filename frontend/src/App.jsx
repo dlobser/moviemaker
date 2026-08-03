@@ -105,6 +105,7 @@ import {
 import ReferencePanel, { ReferenceStrip } from './ReferencePanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
 import CustomModelPath from './CustomModelPath.jsx';
+import { resolveModelSettings } from './modelSettings.js';
 import MediaPickerDialog from './MediaPickerDialog.jsx';
 import { collectShotMedia } from './imagePicker.js';
 import DreamDialog from './DreamDialog.jsx';
@@ -132,6 +133,44 @@ import { Menu, MenuItem, MenuLabel, MenuSeparator } from './MenuBar.jsx';
 import './reference.css';
 import './menu.css';
 import './settings.css';
+
+/**
+ * A compact model pill: the resolved model + where it came from, and (when
+ * editable) a hidden <select> over the whole pill so clicking it overrides or
+ * clears the level it sits on. Clearing means inherit, never "no model".
+ */
+function ModelPill({ type, resolved, value, onChange, title }) {
+  const models = type === 'image' ? IMAGE_MODELS : VIDEO_MODELS;
+  const label = (type === 'image' ? getImageModel(resolved.model) : getVideoModel(resolved.model))?.label || resolved.model || '—';
+  return (
+    <span
+      className="model-pill"
+      title={title || `${type === 'image' ? 'Image' : 'Video'} model: ${resolved.model || 'none'} (from ${resolved.source})`}
+      style={{
+        position: 'relative', display: 'inline-flex', alignItems: 'center', gap: '4px',
+        padding: '1px 8px', borderRadius: '999px', fontSize: '0.68rem', cursor: onChange ? 'pointer' : 'default',
+        background: resolved.source === 'project' ? 'rgba(100,116,139,0.15)' : 'rgba(139,92,246,0.18)',
+        border: '1px solid rgba(139,92,246,0.25)', color: 'var(--text-dim)', maxWidth: '220px', whiteSpace: 'nowrap'
+      }}
+    >
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        {type === 'image' ? '🖼' : '🎬'} {label}
+      </span>
+      <em style={{ fontStyle: 'normal', opacity: 0.7 }}>· {resolved.source}</em>
+      {onChange && (
+        <select
+          value={value || ''}
+          onChange={(e) => onChange(e.target.value || null)}
+          style={{ position: 'absolute', inset: 0, opacity: 0, width: '100%', cursor: 'pointer' }}
+          title=""
+        >
+          <option value="">Inherit ({resolved.source === 'shot' || resolved.source === 'scene' ? 'clear override' : label})</option>
+          <ModelOptions models={models} unit={type === 'image' ? 'img' : 'video'} />
+        </select>
+      )}
+    </span>
+  );
+}
 
 /** Render a model <select>'s options grouped by provider, with pricing inline. */
 function ModelOptions({ models, unit }) {
@@ -224,6 +263,11 @@ export default function App() {
   // reads these through a registry so every capacity check sees them.
   const [customModelCaps, setCustomModelCaps] = useState({});
   useEffect(() => { setCustomModelOverrides(customModelCaps); }, [customModelCaps]);
+
+  // Per-asset-type image model defaults, e.g. characters on an
+  // identity-preserving model while environments use cheap t2i. Read by
+  // resolveModelSettings between an asset's own override and the project default.
+  const [assetTypeModels, setAssetTypeModels] = useState({});
 
   // --- PROMPTS ---
   // Every editable prompt in one bag, keyed by the slot ids in prompts.js. A
@@ -535,6 +579,7 @@ export default function App() {
     setAttachTagsForVideos(state.attachTagsForVideos === true);
     setAtlasSafetyChecker(state.atlasSafetyChecker !== false);
     setCustomModelCaps(state.customModelCaps && typeof state.customModelCaps === 'object' ? state.customModelCaps : {});
+    setAssetTypeModels(state.assetTypeModels && typeof state.assetTypeModels === 'object' ? state.assetTypeModels : {});
     // Only the fields a dream saved are stored, so unset ones follow the
     // project's current models rather than a pinned stale one.
     setDreamSettings(createDreamSettings(state.dreamSettings || {}));
@@ -594,6 +639,7 @@ export default function App() {
       attachTagsForVideos,
       atlasSafetyChecker,
       customModelCaps,
+      assetTypeModels,
       dreamSettings: compactDreamSettings(dreamSettings),
       // Only the slots that differ from their defaults are written, so a future
       // change to a default still reaches projects that never edited it.
@@ -678,7 +724,7 @@ export default function App() {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, customModelCaps, promptSettings, concatenatedVideo, edit, dreamSettings]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, customModelCaps, assetTypeModels, promptSettings, concatenatedVideo, edit, dreamSettings]);
 
   // --- UNDO / REDO ----------------------------------------------------------
 
@@ -862,6 +908,13 @@ export default function App() {
     showToast('Scene deleted.', 'success');
   };
 
+  /** Write one field on a scene (null clears it back to inherit). */
+  const handleUpdateSceneField = (sceneId, field, value) => {
+    const updated = scenes.map(s => (s.id === sceneId ? { ...s, [field]: value } : s));
+    setScenes(updated);
+    saveProjectState(updated);
+  };
+
   const handleRenameScene = (sceneId, newName) => {
     const updated = scenes.map(s => {
       if (s.id === sceneId) {
@@ -969,6 +1022,29 @@ export default function App() {
     saveProjectState(updated);
   };
 
+  // --- MODEL SETTINGS RESOLUTION ---
+  // Every "which model does this generation use?" question funnels through
+  // resolveModelSettings so shot overrides, scene defaults, asset-type
+  // defaults and project defaults agree everywhere (modal, batch, asset gen).
+  const projectModelDefaults = {
+    imageModel, imageResolution, videoModel, videoResolution, videoDuration, assetTypeModels
+  };
+
+  const sceneOfShot = (shotId) => scenes.find(sc => (sc.shots || []).some(s => s.id === shotId)) || null;
+
+  const resolveShotModelSettings = (type, shot) => resolveModelSettings({
+    type,
+    project: projectModelDefaults,
+    scene: shot ? sceneOfShot(shot.id) : null,
+    shot
+  });
+
+  const resolveAssetModelSettings = (asset) => resolveModelSettings({
+    type: 'image',
+    project: projectModelDefaults,
+    asset
+  });
+
   // --- OPEN GENERATION MODALS ---
   const openGenerationModal = (type, shotId, existingPromptId = null) => {
     const shot = shots.find(s => s.id === shotId);
@@ -976,7 +1052,8 @@ export default function App() {
 
     setGenerationModal({ type, shotId, existingPromptId });
     setGenModalPrompt('');
-    const startingModel = type === 'image' ? (shot.imageModel || imageModel) : (shot.videoModel || videoModel);
+    const resolved = resolveShotModelSettings(type, shot);
+    const startingModel = resolved.model;
     // Image: everything this shot is set to send — its own references first,
     // then the ones it inherits from its scene and the project, minus anything
     // held back. Video: the shot's own still, which is what a video model has
@@ -1001,15 +1078,10 @@ export default function App() {
 
     setGenModalAttachTags(type === 'image' ? attachTagsForImages : attachTagsForVideos);
 
-    // Per-shot overrides (set by shot list import) win over project defaults.
-    if (type === 'image') {
-      setGenModalModel(shot.imageModel || imageModel);
-      setGenModalRes(shot.imageResolution || imageResolution);
-    } else {
-      setGenModalModel(shot.videoModel || videoModel);
-      setGenModalRes(shot.videoResolution || videoResolution);
-      setGenModalDuration(shot.videoDuration || videoDuration);
-    }
+    // Shot overrides > scene defaults > project defaults, via the resolver.
+    setGenModalModel(resolved.model);
+    setGenModalRes(resolved.resolution);
+    if (type === 'video') setGenModalDuration(resolved.duration || videoDuration);
 
     let initialPromptText = '';
     if (existingPromptId) {
@@ -1681,10 +1753,9 @@ export default function App() {
 
         const { shot } = candidates[index];
         const isImage = type === 'image';
-        const model = isImage ? (shot.imageModel || imageModel) : (shot.videoModel || videoModel);
-        const resolution = isImage
-          ? (shot.imageResolution || imageResolution)
-          : (shot.videoResolution || videoResolution);
+        const resolved = resolveShotModelSettings(type, shot);
+        const model = resolved.model;
+        const resolution = resolved.resolution;
 
         // Video batches animate the shot's own selected still. That image is
         // the primary input and must never be displaced by a tagged asset.
@@ -1704,7 +1775,7 @@ export default function App() {
           rawPrompt: resolveShotPrompt(shot, type),
           model,
           resolution,
-          duration: shot.videoDuration || videoDuration,
+          duration: resolved.duration || videoDuration,
           primaryImagePaths,
           attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
         });
@@ -2058,7 +2129,7 @@ export default function App() {
   };
 
   /** The model the asset editor will generate with, and how many refs it takes. */
-  const assetEditorModel = (draft) => (draft?.imageModel || imageModel);
+  const assetEditorModel = (draft) => resolveAssetModelSettings(draft || {}).model;
   const assetRefCapacity = (draft) => refImageCapacity('image', assetEditorModel(draft));
 
   /**
@@ -2098,7 +2169,7 @@ export default function App() {
    */
   const buildAssetPrompt = (draft) => {
     const others = assetLibrary.filter(a => a.id !== draft.id);
-    const modelId = draft.imageModel || imageModel;
+    const modelId = assetEditorModel(draft);
     // Only images still in the asset's pool can be sent — one deleted from the
     // grid must not keep riding along invisibly in the saved selection.
     const pool = draft.images || [];
@@ -2162,8 +2233,9 @@ export default function App() {
 
   /** Generate one reference image for a saved asset. Resolves, never rejects. */
   const generateAssetImage = async (asset, promptOverride = null) => {
-    const model = asset.imageModel || imageModel;
-    const resolution = asset.imageResolution || imageResolution;
+    const resolvedAsset = resolveAssetModelSettings(asset);
+    const model = resolvedAsset.model;
+    const resolution = resolvedAsset.resolution || imageResolution;
     const composed = promptOverride
       ? buildAssetPrompt({ ...asset, imagePrompt: promptOverride })
       : buildAssetPrompt(asset);
@@ -4603,6 +4675,23 @@ export default function App() {
                   />
                 </label>
 
+                {/* Scene-level model defaults: shots inherit these unless they
+                    carry their own override. */}
+                <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                  <ModelPill
+                    type="image"
+                    resolved={resolveModelSettings({ type: 'image', project: projectModelDefaults, scene: activeScene })}
+                    value={activeScene.imageModel}
+                    onChange={(v) => handleUpdateSceneField(activeScene.id, 'imageModel', v)}
+                  />
+                  <ModelPill
+                    type="video"
+                    resolved={resolveModelSettings({ type: 'video', project: projectModelDefaults, scene: activeScene })}
+                    value={activeScene.videoModel}
+                    onChange={(v) => handleUpdateSceneField(activeScene.id, 'videoModel', v)}
+                  />
+                </div>
+
                 {/* References the whole scene carries, and whether each is
                     actually sent. Shots inherit these unless they opt out. */}
                 <ReferenceStrip
@@ -4857,10 +4946,27 @@ export default function App() {
                           were previously invisible here — you could attach one and
                           never see it again outside the generation modal. Each tick
                           persists, so a batch run sends exactly this set. */}
+                      {/* Which models this shot resolves to and why; click to
+                          override on the shot, pick Inherit to clear. */}
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '10px' }}>
+                        <ModelPill
+                          type="image"
+                          resolved={resolveShotModelSettings('image', shot)}
+                          value={shot.imageModel}
+                          onChange={(v) => handleUpdateShotField(shot.id, 'imageModel', v)}
+                        />
+                        <ModelPill
+                          type="video"
+                          resolved={resolveShotModelSettings('video', shot)}
+                          value={shot.videoModel}
+                          onChange={(v) => handleUpdateShotField(shot.id, 'videoModel', v)}
+                        />
+                      </div>
+
                       <div style={{ marginTop: '12px' }}>
                         <ReferenceStrip
                           entries={shotReferenceEntries(shot)}
-                          capacity={refImageCapacity('image', shot.imageModel || imageModel)}
+                          capacity={refImageCapacity('image', resolveShotModelSettings('image', shot).model)}
                           onToggleEntry={(entry) => toggleShotReferenceEntry(shot, entry)}
                           onOpenPanel={() => { setActiveShotId(shot.id); setReferencePanelOpen(true); }}
                         />
@@ -5202,6 +5308,13 @@ export default function App() {
               <h2 style={{ fontSize: '1.25rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {generationModal.type === 'image' ? <ImageIcon size={20} /> : <Film size={20} />}
                 Generate {generationModal.type === 'image' ? 'Image' : 'Video'} Variation for {shots.find(s => s.id === generationModal.shotId)?.name}
+                {(() => {
+                  const shot = shots.find(s => s.id === generationModal.shotId);
+                  if (!shot) return null;
+                  const resolved = resolveShotModelSettings(generationModal.type, shot);
+                  // Read-only provenance: the dropdown below is the override.
+                  return <ModelPill type={generationModal.type} resolved={resolved} />;
+                })()}
               </h2>
               <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setGenerationModal(null)}>
                 <X size={16} />
@@ -6334,7 +6447,7 @@ export default function App() {
 
               {/* Generate reference art — same iterate-and-pick loop as a shot */}
               {(() => {
-                const modelId = assetEditor.imageModel || imageModel;
+                const modelId = assetEditorModel(assetEditor);
                 const preview = buildAssetPrompt(assetEditor);
                 const capacity = refImageCapacity('image', modelId);
                 const picked = assetInputImages(assetEditor).filter(p => (assetEditor.images || []).includes(p));
@@ -7393,6 +7506,14 @@ export default function App() {
               return rest;
             }
             return { ...prev, [id]: { ...prev[id], refImages } };
+          })}
+          assetTypeModels={assetTypeModels}
+          setAssetTypeModel={(typeId, model) => setAssetTypeModels(prev => {
+            if (!model) {
+              const { [typeId]: _, ...rest } = prev;
+              return rest;
+            }
+            return { ...prev, [typeId]: model };
           })}
           attachTagsForImages={attachTagsForImages} setAttachTagsForImages={setAttachTagsForImages}
           attachTagsForVideos={attachTagsForVideos} setAttachTagsForVideos={setAttachTagsForVideos}
