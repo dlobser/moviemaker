@@ -1390,13 +1390,25 @@ export default function App() {
       promptOverride
     };
 
+    // A snapshot of every tagged asset as it looked at generation time, kept
+    // *beside* the recipe (never inside it — the signature must not fork
+    // groups over metadata). This is what dirty-shot detection compares the
+    // asset's current state against.
+    const meta = {
+      taggedAssetIds: composed.taggedAssets.map(a => a.id),
+      assetStamps: Object.fromEntries(composed.taggedAssets.map(a => [
+        a.id, { updatedAt: a.updatedAt || null, primaryImage: assetPrimaryImage(a) }
+      ])),
+      createdAt: new Date().toISOString()
+    };
+
     if (type === 'image') {
-      return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe);
+      return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta);
     }
-    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe);
+    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta);
   };
 
-  const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}) => {
+  const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}, meta = null) => {
     const { model, resolution: resOption } = recipe;
     try {
       const res = await apiFetch(`/api/image/generate`, {
@@ -1442,8 +1454,10 @@ export default function App() {
               const matchIndex = updatedPrompts.findIndex(p => imagePromptSignature(p) === signature);
 
               if (matchIndex >= 0) {
+                // The latest output defines the group's currency: refresh the
+                // asset snapshot so dirtiness is judged against this run.
                 updatedPrompts = updatedPrompts.map((p, i) => (
-                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
+                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput], ...(meta ? { meta } : {}) } : p
                 ));
                 groupId = updatedPrompts[matchIndex].id;
               } else {
@@ -1453,6 +1467,7 @@ export default function App() {
                   ...recipe,
                   prompt: promptText,          // composed, for display
                   inputImagePaths,             // what actually went to the model
+                  ...(meta ? { meta } : {}),
                   outputs: [newOutput]
                 });
               }
@@ -1498,7 +1513,7 @@ export default function App() {
   // order. It used to be a single path, which was fine while every video model
   // took one image and quietly wrong once Seedance 2.0's reference endpoint
   // took nine — the prompt pointed at @image3 and only @image1 was ever sent.
-  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}) => {
+  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}, meta = null) => {
     const { model, resolution: resOption, duration } = recipe;
     const imageUrlsToSend = Array.isArray(imageInputs) ? imageInputs.filter(Boolean) : [imageInputs].filter(Boolean);
     const imageInput = imageUrlsToSend[0] || '';
@@ -1542,8 +1557,10 @@ export default function App() {
               const matchIndex = updatedPrompts.findIndex(p => videoPromptSignature(p) === signature);
 
               if (matchIndex >= 0) {
+                // Latest output defines the group's currency — refresh the
+                // asset snapshot alongside it.
                 updatedPrompts = updatedPrompts.map((p, i) => (
-                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
+                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput], ...(meta ? { meta } : {}) } : p
                 ));
                 groupId = updatedPrompts[matchIndex].id;
               } else {
@@ -1554,6 +1571,7 @@ export default function App() {
                   prompt: promptText,          // composed, for display
                   imageInput,                  // first slot, for older readers
                   inputImagePaths: imageUrlsToSend,
+                  ...(meta ? { meta } : {}),
                   outputs: [newOutput]
                 });
               }
@@ -2110,15 +2128,26 @@ export default function App() {
     });
   };
 
+  /**
+   * Stamp an asset as edited in a way *shots can see* — tag, name, description
+   * or primary image. The stamp is what dirty-shot detection (Phase C) compares
+   * against each generation's recorded snapshot, so it must NOT move on edits
+   * that only affect the asset's own artwork generation (inputImages, models,
+   * promptWrap): those would flag every shot for changes no shot can observe.
+   */
+  const touchAsset = (asset) => ({ ...asset, updatedAt: new Date().toISOString() });
+
   /** Attach a freshly generated image to an asset, in the library and the open editor. */
   const attachImageToAsset = (assetId, imagePath) => {
     setAssetLibrary(prev => prev.map(asset => {
       if (asset.id !== assetId) return asset;
-      return {
+      const next = {
         ...asset,
         images: [...(asset.images || []), imagePath],
         primaryImage: asset.primaryImage || imagePath
       };
+      // Only a change to the *effective* primary is visible to shots.
+      return assetPrimaryImage(next) !== assetPrimaryImage(asset) ? touchAsset(next) : next;
     }));
     // Keep the editor in sync if it is still open on this asset.
     setAssetEditor(prev => {
@@ -2349,10 +2378,13 @@ export default function App() {
           const { description, imagePrompt } = await writeAssetPromptWithLlm(asset);
           promptOverride = imagePrompt;
           const filledDescription = asset.description?.trim() ? asset.description : (description || asset.description);
+          const descriptionChanged = (filledDescription || '') !== (asset.description || '');
           asset = { ...asset, imagePrompt, description: filledDescription };
-          setAssetLibrary(prev => prev.map(a => (
-            a.id === asset.id ? { ...a, imagePrompt, description: filledDescription } : a
-          )));
+          setAssetLibrary(prev => prev.map(a => {
+            if (a.id !== asset.id) return a;
+            const next = { ...a, imagePrompt, description: filledDescription };
+            return descriptionChanged ? touchAsset(next) : next;
+          }));
         } catch (err) {
           console.error(err);
           showToast(`<${asset.tag}>: prompt failed (${err.message}) — using the auto-built one.`, 'warning');
@@ -2413,6 +2445,16 @@ export default function App() {
       imageResolution: assetEditor.imageResolution || null,
       promptWrap: assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset')
     };
+
+    // Bump updatedAt only when a shot-visible field moved; otherwise carry the
+    // old stamp so saving cosmetic settings never dirties every shot.
+    const previous = assetLibrary.find(a => a.id === record.id) || null;
+    const shotVisibleChange = !previous
+      || previous.tag !== record.tag
+      || (previous.name || '') !== record.name
+      || (previous.description || '') !== record.description
+      || assetPrimaryImage(previous) !== assetPrimaryImage(record);
+    record.updatedAt = shotVisibleChange ? new Date().toISOString() : (previous?.updatedAt || null);
 
     setAssetLibrary(prev => (
       prev.some(a => a.id === record.id) ? prev.map(a => (a.id === record.id ? record : a)) : [...prev, record]
@@ -2780,13 +2822,13 @@ export default function App() {
             })
             .map(asset => {
               const images = (asset.images || []).map(p => mapping.get(p)).filter(Boolean);
-              return {
+              return touchAsset({
                 ...asset,
                 id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
                 images,
                 primaryImage: mapping.get(asset.primaryImage) || images[0] || null,
                 inputImages: assetInputImages(asset).map(p => mapping.get(p)).filter(Boolean)
-              };
+              });
             });
           return [...prev, ...additions];
         });
@@ -2824,11 +2866,13 @@ export default function App() {
       // Skip tags this project already defines rather than creating duplicates.
       let skipped = 0;
       setAssetLibrary(prev => {
-        const additions = incoming.filter(asset => {
-          const clash = prev.some(existing => normalizeTag(existing.tag) === normalizeTag(asset.tag));
-          if (clash) skipped += 1;
-          return !clash;
-        });
+        const additions = incoming
+          .filter(asset => {
+            const clash = prev.some(existing => normalizeTag(existing.tag) === normalizeTag(asset.tag));
+            if (clash) skipped += 1;
+            return !clash;
+          })
+          .map(touchAsset);
         return [...prev, ...additions];
       });
 
@@ -2985,7 +3029,7 @@ export default function App() {
           const existingIndex = merged.findIndex(a => normalizeTag(a.tag) === normalizeTag(incoming.tag));
           if (existingIndex >= 0) {
             const existing = merged[existingIndex];
-            merged[existingIndex] = {
+            const next = {
               ...existing,
               type: incoming.type || existing.type,
               name: incoming.name || existing.name,
@@ -2994,8 +3038,12 @@ export default function App() {
               primaryImage: existing.primaryImage || incoming.primaryImage,
               inputImages: assetInputImages(existing).length ? assetInputImages(existing) : assetInputImages(incoming)
             };
+            const shotVisibleChange = (existing.name || '') !== (next.name || '')
+              || (existing.description || '') !== (next.description || '')
+              || assetPrimaryImage(existing) !== assetPrimaryImage(next);
+            merged[existingIndex] = shotVisibleChange ? touchAsset(next) : next;
           } else {
-            merged.push(incoming);
+            merged.push(touchAsset(incoming));
           }
         });
         return merged;
@@ -3063,7 +3111,8 @@ export default function App() {
         imagePrompt: '',
         imageModel: null,
         imageResolution: null,
-        applyGlobalPrompts: false
+        applyGlobalPrompts: false,
+        updatedAt: new Date().toISOString()
       }));
     if (additions.length === 0) return;
     setAssetLibrary(prev => [...prev, ...additions]);
