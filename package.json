@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "npm --prefix frontend run dev",
     "build": "npm --prefix frontend run build",
-    "test": "node --test renderGraph.test.js frontend/src/catalog.test.js frontend/src/promptTags.test.js frontend/src/promptDecorations.test.js frontend/src/references.test.js frontend/src/shotListImport.test.js frontend/src/dream.test.js frontend/src/history.test.js frontend/src/imagePicker.test.js frontend/src/edit/timing.test.js frontend/src/edit/reconcile.test.js frontend/src/shared/providers/providers.test.js frontend/src/modelSettings.test.js frontend/src/refResolver.test.js",
+    "test": "node --test renderGraph.test.js frontend/src/catalog.test.js frontend/src/promptTags.test.js frontend/src/promptDecorations.test.js frontend/src/references.test.js frontend/src/shotListImport.test.js frontend/src/dream.test.js frontend/src/history.test.js frontend/src/imagePicker.test.js frontend/src/edit/timing.test.js frontend/src/edit/reconcile.test.js frontend/src/shared/providers/providers.test.js frontend/src/modelSettings.test.js frontend/src/refResolver.test.js frontend/src/scriptGen.test.js",
     "build:static": "npm --prefix frontend run build -- --mode production"
   },
   "keywords": [],

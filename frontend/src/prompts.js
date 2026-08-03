@@ -64,6 +64,12 @@ Existing description: {description}
  * and is deliberately not editable, since getting those wrong produces an
  * import that silently fails to parse.
  */
+// The system prompt for in-app script generation: the reply must be machine
+// readable, because nobody is sitting in a chat window to clean it up.
+export const JSON_ONLY_SYSTEM = 'You output a single valid JSON document and nothing else. '
+  + 'No prose, no titles, no explanations, no markdown code fences — the reply must start with { and end with }. '
+  + 'If you cannot comply, reply with {"error": "<one sentence why>"}.';
+
 export const DEFAULT_IMPORT_INTRO = `You are a professional storyboard supervisor. Convert the material below into a single JSON document that MovieMaker Studio can import directly.
 
 === OUTPUT RULES ===

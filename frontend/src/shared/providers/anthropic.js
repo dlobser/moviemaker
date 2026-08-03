@@ -2,7 +2,7 @@
 
 import { assetToInlineImage, requireText } from './llmShared.js';
 
-export async function generateText({ prompt, systemPrompt, model, imagePaths = [] }, ctx) {
+export async function generateText({ prompt, systemPrompt, model, imagePaths = [], maxTokens }, ctx) {
   const apiKey = ctx.credentials.claudeKey;
   if (!apiKey) throw new Error('Claude API key is not configured.');
 
@@ -23,7 +23,10 @@ export async function generateText({ prompt, systemPrompt, model, imagePaths = [
     headers,
     body: JSON.stringify({
       model: model || 'claude-sonnet-5',
-      max_tokens: 1024,
+      // 1024 was enough for one-line prompt writing but silently truncated a
+      // full script JSON mid-array. Anthropic requires the field, so pick a
+      // ceiling generous enough for a whole shot list.
+      max_tokens: Number.isFinite(maxTokens) ? maxTokens : 8192,
       ...(system ? { system } : {}),
       messages: [{
         role: 'user',

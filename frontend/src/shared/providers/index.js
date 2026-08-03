@@ -70,9 +70,9 @@ export async function generateVideo({ provider, providerFamily, videoModel, prom
   throw new Error(`Unsupported video provider: ${provider}`);
 }
 
-/** Returns the model's text reply. */
-export async function generateText({ provider, prompt, systemPrompt, model, imagePaths = [] }, ctx) {
-  const req = { prompt, systemPrompt, model, imagePaths };
+/** Returns the model's text reply. `maxTokens` is honoured where the provider requires an explicit ceiling. */
+export async function generateText({ provider, prompt, systemPrompt, model, imagePaths = [], maxTokens }, ctx) {
+  const req = { prompt, systemPrompt, model, imagePaths, maxTokens };
   if (provider === 'gemini') return google.generateText(req, ctx);
   if (provider === 'chatgpt') return openai.generateText(req, ctx);
   if (provider === 'claude') return anthropic.generateText(req, ctx);

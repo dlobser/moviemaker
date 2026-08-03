@@ -35,7 +35,8 @@ import {
   Moon,
   ClipboardPaste,
   Undo2,
-  Redo2
+  Redo2,
+  FileText
 } from 'lucide-react';
 import {
   IMAGE_MODELS,
@@ -107,6 +108,7 @@ import ReferencePanel, { ReferenceStrip } from './ReferencePanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
 import CustomModelPath from './CustomModelPath.jsx';
 import { resolveModelSettings } from './modelSettings.js';
+import { generateShotListFromIdea } from './scriptGen.js';
 import MediaPickerDialog from './MediaPickerDialog.jsx';
 import { collectShotMedia } from './imagePicker.js';
 import DreamDialog from './DreamDialog.jsx';
@@ -335,6 +337,12 @@ export default function App() {
   // Pasting an LLM's reply straight in, as an alternative to saving it to a file
   // first. Same document, same normaliser — only the way it arrives differs.
   const [pasteImport, setPasteImport] = useState(null); // null | { text, mode }
+
+  // Idea → Script: in-app script generation replacing the clipboard round-trip.
+  const [scriptGenOpen, setScriptGenOpen] = useState(false);
+  const [scriptGenIdea, setScriptGenIdea] = useState('');
+  const [scriptGenBusy, setScriptGenBusy] = useState(false);
+  const [scriptGenPreview, setScriptGenPreview] = useState(null); // result of generateShotListFromIdea
 
   // --- UI STATES ---
   const [activeShotId, setActiveShotId] = useState(null);
@@ -1198,27 +1206,25 @@ export default function App() {
   };
 
   // --- AUTO-GENERATE PROMPT FROM SHOT VIA LLM ---
-  const handleAutoGeneratePromptInModal = async () => {
-    const { shotId } = generationModal;
-    const shot = shots.find(s => s.id === shotId);
-    const instructions = genModalAutoInstructions.trim();
+
+  /**
+   * Write one shot's image or video prompt via the LLM.
+   *
+   * Stage-shaped — shot in, `{ ok, text?, error?, lostTags }` out, no UI
+   * coupling — so the modal button, the "write all prompts" batch and the
+   * pipeline orchestrator all share one implementation. Resolves, never
+   * rejects.
+   */
+  const writeShotPrompt = async (shot, type, { instructions = '', bare = false, withContext = false } = {}) => {
+    const isImage = type === 'image';
     // Without the shot template there is nothing to write *from* except the
     // instructions, so those become the requirement instead of the description.
-    if (genModalAutoBare) {
-      if (!instructions) {
-        showToast('Instructions-only mode sends nothing else — write the instructions first.', 'warning');
-        return;
-      }
-    } else if (!shot || !shot.description) {
-      showToast('Please add a visual description to the shot first.', 'warning');
-      return;
-    }
-    if (!shot) return;
+    if (bare && !instructions) return { ok: false, error: 'Instructions-only mode sends nothing else — write the instructions first.', lostTags: [] };
+    if (!bare && !shot?.description) return { ok: false, error: 'No visual description to write from.', lostTags: [] };
+    if (!shot) return { ok: false, error: 'Shot not found.', lostTags: [] };
 
-    setLoadingStates(prev => ({ ...prev, modal_llm: true }));
-    const isImage = generationModal.type === 'image';
-    const systemPrompt = genModalAutoBare ? '' : (isImage ? imageSystemPrompt : videoSystemPrompt);
-    const sceneOfShot = scenes.find(s => (s.shots || []).some(sh => sh.id === shot.id));
+    const systemPrompt = bare ? '' : (isImage ? imageSystemPrompt : videoSystemPrompt);
+    const shotScene = sceneOfShot(shot.id);
     // Whatever the writer is shown is what it can preserve, so the tags are
     // collected from exactly the fields the template can send.
     const shotText = [shot.description, shot.setup, shot.notes, shot.dialogue].filter(Boolean).join(' ');
@@ -1227,7 +1233,7 @@ export default function App() {
 
     // Context first: the writer needs to know what exists before it is asked to
     // write about it, and the tag list is only useful ahead of the request.
-    if (genModalAutoContext) {
+    if (withContext) {
       const index = shots.findIndex(s => s.id === shot.id);
       const context = buildAutoPromptContext({
         assetLibrary,
@@ -1237,7 +1243,7 @@ export default function App() {
       if (context) sections.push(`${promptText(promptSettings, 'autoContextIntro')}\n\n${context}`);
     }
 
-    if (!genModalAutoBare) {
+    if (!bare) {
       sections.push(fillTemplate(
         promptText(promptSettings, isImage ? 'imageUserTemplate' : 'videoUserTemplate'),
         {
@@ -1246,7 +1252,7 @@ export default function App() {
           notes: shot.notes,
           dialogue: shot.dialogue,
           name: shot.name,
-          sceneName: sceneOfShot?.name || '',
+          sceneName: shotScene?.name || '',
           tags: tagPreservationRule(shotText)
         }
       ));
@@ -1255,12 +1261,10 @@ export default function App() {
     // Last, so they are the freshest thing in the window and read as the final
     // word when they contradict the template.
     if (instructions) {
-      sections.push(genModalAutoBare
+      sections.push(bare
         ? instructions
         : `=== EXTRA INSTRUCTIONS (these override anything above) ===\n${instructions}`);
     }
-
-    const promptPayload = sections.filter(Boolean).join('\n\n');
 
     try {
       const res = await apiFetch(`/api/llm/generate`, {
@@ -1268,39 +1272,54 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: activeLlm,
-          prompt: promptPayload,
+          prompt: sections.filter(Boolean).join('\n\n'),
           systemPrompt,
           model: llmModel
         })
       });
-
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed prompt generation');
       if (!data.text?.trim()) throw new Error('The model returned an empty prompt.');
 
-      // A wholly new prompt keeps none of the old one's inserted blocks — the
-      // text they marked is gone.
-      updateModalPrompt(data.text, []);
-
-      // Instructions are not guarantees. A dropped tag is invisible until the
-      // generation comes back without the character in it, so say so now while
-      // the prompt is still on screen and editable.
-      // Only meaningful when the writer was actually shown the shot and asked
-      // to keep its tags; in instructions-only mode it never saw them.
-      const lost = genModalAutoBare ? [] : droppedTags(shotText, data.text);
-      if (lost.length > 0) {
-        showToast(
-          `Prompt written, but the writer dropped <${lost.join('>, <')}> — add ${lost.length === 1 ? 'it' : 'them'} back or its reference art will not be sent.`,
-          'warning'
-        );
-      } else {
-        showToast('Prompt generated via LLM!', 'success');
-      }
+      // A dropped tag is invisible until the generation comes back without the
+      // character in it — report them. Only meaningful when the writer was
+      // shown the shot; in instructions-only mode it never saw the tags.
+      return { ok: true, text: data.text, lostTags: bare ? [] : droppedTags(shotText, data.text) };
     } catch (err) {
       console.error(err);
-      showToast(`Prompt failed: ${err.message}`, 'error');
-    } finally {
-      setLoadingStates(prev => ({ ...prev, modal_llm: false }));
+      return { ok: false, error: err.message, lostTags: [] };
+    }
+  };
+
+  const handleAutoGeneratePromptInModal = async () => {
+    const { shotId } = generationModal;
+    const shot = shots.find(s => s.id === shotId);
+
+    setLoadingStates(prev => ({ ...prev, modal_llm: true }));
+    const result = await writeShotPrompt(shot, generationModal.type, {
+      instructions: genModalAutoInstructions.trim(),
+      bare: genModalAutoBare,
+      withContext: genModalAutoContext
+    });
+    setLoadingStates(prev => ({ ...prev, modal_llm: false }));
+
+    if (!result.ok) {
+      const preflight = result.error.includes('write the instructions') || result.error.includes('No visual description');
+      showToast(preflight ? result.error : `Prompt failed: ${result.error}`, preflight ? 'warning' : 'error');
+      return;
+    }
+
+    // A wholly new prompt keeps none of the old one's inserted blocks — the
+    // text they marked is gone.
+    updateModalPrompt(result.text, []);
+
+    if (result.lostTags.length > 0) {
+      showToast(
+        `Prompt written, but the writer dropped <${result.lostTags.join('>, <')}> — add ${result.lostTags.length === 1 ? 'it' : 'them'} back or its reference art will not be sent.`,
+        'warning'
+      );
+    } else {
+      showToast('Prompt generated via LLM!', 'success');
     }
   };
 
@@ -1821,6 +1840,73 @@ export default function App() {
   const handleCancelBatch = () => {
     cancelBatchRef.current = true;
     showToast('Batch will stop after the in-flight generations finish.', 'warning');
+  };
+
+  // --- WRITE ALL PROMPTS (LLM batch) ---------------------------------------
+
+  /** Shots with a description but no draft prompt of this type — the natural
+      candidate predicate, so LLM-scripted projects that already carry drafts
+      skip this stage entirely. */
+  const shotsMissingPrompts = (type, scope = 'all') => shotsForScope(scope).filter(({ shot }) => {
+    const field = type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
+    return !String(shot[field] || '').trim() && String(shot.description || '').trim();
+  });
+
+  /**
+   * Fill every empty draft prompt via the LLM. Stage-shaped like the
+   * generation batches, but with a small fixed pool — LLM providers
+   * rate-limit harder than image hosts.
+   */
+  const handleWriteAllPrompts = async (type, scope = 'all') => {
+    const candidates = shotsMissingPrompts(type, scope);
+    if (candidates.length === 0) {
+      showToast(`Every shot with a description already has a ${type} prompt.`, 'info');
+      return;
+    }
+
+    cancelBatchRef.current = false;
+    setBatchRunner({ total: candidates.length, done: 0, type: 'prompt', label: `${type} prompts × ${candidates.length}` });
+    showToast(`Writing ${candidates.length} ${type} prompt${candidates.length === 1 ? '' : 's'}…`, 'info');
+
+    let cursor = 0;
+    let completed = 0;
+    let failed = 0;
+    const lostTagShots = [];
+
+    const worker = async () => {
+      while (true) {
+        if (cancelBatchRef.current) return;
+        const index = cursor;
+        cursor += 1;
+        if (index >= candidates.length) return;
+
+        const { shot } = candidates[index];
+        const result = await writeShotPrompt(shot, type, { withContext: true });
+        if (result.ok) {
+          handleUpdateShotField(shot.id, type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt', result.text);
+          if (result.lostTags.length > 0) lostTagShots.push(`${shot.name} (<${result.lostTags.join('>, <')}>)`);
+          completed += 1;
+        } else {
+          failed += 1;
+        }
+        setBatchRunner(prev => (prev ? { ...prev, done: completed + failed } : prev));
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(2, candidates.length) }, worker));
+
+    setBatchRunner(null);
+    if (cancelBatchRef.current) {
+      showToast(`Stopped. ${completed} written, ${failed} failed.`, 'warning');
+    } else if (failed > 0) {
+      showToast(`Prompts written: ${completed}; failed: ${failed}.`, 'warning');
+    } else {
+      showToast(`All ${completed} ${type} prompt${completed === 1 ? '' : 's'} written.`, 'success');
+    }
+    if (lostTagShots.length > 0) {
+      showToast(`The writer dropped tags on: ${lostTagShots.join('; ')} — check those prompts.`, 'warning');
+    }
+    cancelBatchRef.current = false;
   };
 
   // --- DREAM MODE -----------------------------------------------------------
@@ -2992,6 +3078,40 @@ export default function App() {
   };
 
   // --- SHOT LIST IMPORT / LLM PROMPT ---------------------------------------
+
+  // --- IDEA → SCRIPT (in-app) ----------------------------------------------
+
+  const handleGenerateScript = async () => {
+    setScriptGenBusy(true);
+    setScriptGenPreview(null);
+    try {
+      const result = await generateShotListFromIdea({
+        idea: scriptGenIdea,
+        assetLibrary,
+        llm: { provider: activeLlm, model: llmModel },
+        apiFetch,
+        intro: promptText(promptSettings, 'importIntro')
+      });
+      setScriptGenPreview(result);
+    } catch (err) {
+      console.error(err);
+      showToast(`Script generation failed: ${err.message}`, 'error');
+    } finally {
+      setScriptGenBusy(false);
+    }
+  };
+
+  /** Commit the previewed document through the same path a pasted reply takes. */
+  const handleApplyGeneratedScript = (mode) => {
+    if (!scriptGenPreview?.raw) return;
+    try {
+      applyImportedDocument(scriptGenPreview.raw, mode);
+      setScriptGenOpen(false);
+      setScriptGenPreview(null);
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
+  };
 
   const handleCopyLlmPrompt = async () => {
     const text = buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource, intro: promptText(promptSettings, 'importIntro') });
@@ -4519,6 +4639,32 @@ export default function App() {
                 onClick={() => setAssetBatchDialog({ onlyMissing: true, useLlm: true, rewriteExisting: false })}
               >
                 Batch asset references…
+              </MenuItem>
+
+              <MenuSeparator />
+              <MenuItem
+                icon={Sparkles}
+                disabled={Boolean(batchRunner)}
+                onClick={() => handleWriteAllPrompts('image', 'all')}
+                title="LLM-writes an image prompt for every shot that has a description but no draft prompt yet"
+              >
+                Write all image prompts
+              </MenuItem>
+              <MenuItem
+                icon={Sparkles}
+                disabled={Boolean(batchRunner)}
+                onClick={() => handleWriteAllPrompts('video', 'all')}
+                title="LLM-writes a video prompt for every shot that has a description but no draft prompt yet"
+              >
+                Write all video prompts
+              </MenuItem>
+              <MenuItem
+                icon={FileText}
+                disabled={Boolean(batchRunner)}
+                onClick={() => setScriptGenOpen(true)}
+                title="Describe the film in a few sentences; the LLM writes the scenes, shots and assets"
+              >
+                Idea → Script…
               </MenuItem>
 
               <MenuSeparator />
@@ -7124,6 +7270,112 @@ export default function App() {
           onClose={() => setDreamOpen(false)}
         />
       )}
+
+      {/* --- A4b2. IDEA → SCRIPT --- */}
+      {scriptGenOpen && (() => {
+        const previewCounts = scriptGenPreview && {
+          scenes: scriptGenPreview.scenes.length,
+          shots: scriptGenPreview.scenes.reduce((sum, s) => sum + s.shots.length, 0),
+          assets: scriptGenPreview.assets.length
+        };
+        const existingTagSet = new Set(assetLibrary.map(a => normalizeTag(a.tag)));
+        const newTags = scriptGenPreview
+          ? scriptGenPreview.assets.filter(a => !existingTagSet.has(normalizeTag(a.tag))).map(a => a.tag)
+          : [];
+        return (
+          <div className="modal-overlay" onClick={() => setScriptGenOpen(false)}>
+            <div className="modal-window" style={{ maxWidth: '720px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <FileText size={20} /> Idea → Script
+                </h2>
+                <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setScriptGenOpen(false)}>
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div className="form-group">
+                  <label className="form-label">
+                    Idea, logline, treatment or full script
+                    <span style={{ marginLeft: '8px', fontWeight: 'normal', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
+                      the LLM writes the scenes, shots and assets; nothing is applied until you review it
+                    </span>
+                  </label>
+                  <textarea
+                    className="input-field"
+                    style={{ minHeight: '140px' }}
+                    value={scriptGenIdea}
+                    onChange={(e) => setScriptGenIdea(e.target.value)}
+                    placeholder="Two paragraphs are plenty. e.g. A retired mechanic discovers his junkyard robot has been rebuilding itself at night…"
+                  />
+                </div>
+
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">LLM</label>
+                    <select className="select-field" value={activeLlm} onChange={(e) => setActiveLlm(e.target.value)}>
+                      {LLM_PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+                    </select>
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">Model</label>
+                    <select className="select-field" value={llmModel} onChange={(e) => setLlmModel(e.target.value)}>
+                      {llmModelsList.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                    </select>
+                  </div>
+                  <button
+                    className="btn btn-primary"
+                    disabled={scriptGenBusy || !scriptGenIdea.trim()}
+                    onClick={handleGenerateScript}
+                  >
+                    {scriptGenBusy ? <><RefreshCw className="spinner" size={14} /> Writing…</> : <><Sparkles size={14} /> Generate script</>}
+                  </button>
+                  <button
+                    className="btn btn-secondary"
+                    title="Fallback: copy the full import prompt to use in any chat model, then paste the reply via Import > Paste"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(buildLlmImportPrompt({
+                          assetLibrary, sourceMaterial: scriptGenIdea, intro: promptText(promptSettings, 'importIntro')
+                        }));
+                        showToast('Import prompt copied — paste it into any chat model.', 'success');
+                      } catch { showToast('Clipboard blocked by the browser.', 'error'); }
+                    }}
+                  >
+                    <Copy size={14} /> Copy prompt instead
+                  </button>
+                </div>
+
+                {scriptGenPreview && (
+                  <div className="glass-panel" style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <strong style={{ fontSize: '0.9rem' }}>
+                      Parsed: {previewCounts.scenes} scene{previewCounts.scenes === 1 ? '' : 's'} · {previewCounts.shots} shot{previewCounts.shots === 1 ? '' : 's'} · {previewCounts.assets} asset{previewCounts.assets === 1 ? '' : 's'}
+                    </strong>
+                    <span style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                      {newTags.length > 0
+                        ? <>New tags: &lt;{newTags.join('>, <')}&gt;{scriptGenPreview.assets.length > newTags.length ? ` — ${scriptGenPreview.assets.length - newTags.length} reuse existing assets` : ''}</>
+                        : 'All tags reuse existing assets.'}
+                    </span>
+                    {scriptGenPreview.warnings.length > 0 && (
+                      <span style={{ fontSize: '0.78rem', color: 'var(--warning, #f59e0b)' }}>
+                        ⚠ {scriptGenPreview.warnings.join(' · ')}
+                      </span>
+                    )}
+                    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                      <button className="btn btn-primary" onClick={() => handleApplyGeneratedScript('replace')}>
+                        Replace project with this script
+                      </button>
+                      <button className="btn btn-secondary" onClick={() => handleApplyGeneratedScript('append')}>
+                        Append to project
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* --- A4c. PASTE SHOT LIST --- */}
       {pasteImport && (() => {
