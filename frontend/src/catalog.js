@@ -128,10 +128,15 @@ export const VIDEO_MODELS = [
   // reference-to-video takes up to 9 and expects the prompt to point at each
   // one by position. Picking i2v and wondering why only one image goes is the
   // whole reason the two are listed separately.
-  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  //
+  // `refAudio` is the same idea for sound: Seedance 2.0 will take up to three
+  // clips (mp3/wav, 15s combined) and sing, speak or cut to them, addressed
+  // from the prompt as @audio1..@audio3. Atlas will not take audio inline the
+  // way it takes images — see registerAtlasAsset in providers/atlas.js.
+  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refAudio: 3, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refAudio: 3, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/text-to-video', label: 'Seedance 2.0 t2v (Atlas)', provider: 'atlas', priceNote: '$0.112 / s', refImages: 0, durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, refMode: 'required', durations: ['4', '5', '6', '8', '10', '12'] }
 ];
@@ -274,11 +279,18 @@ export function modelCapabilities(type, id) {
   const maxRefImages = model
     ? model.refImages
     : (Number.isFinite(override?.refImages) ? override.refImages : 1); // unknown model: assume one input
+  // Audio references are rare enough that silence is the right default: a
+  // model only takes them if the catalog says so, or the project declares it
+  // for a hand-entered path.
+  const maxRefAudio = model
+    ? (model.refAudio || 0)
+    : (Number.isFinite(override?.refAudio) ? override.refAudio : 0);
   return {
     id,
     label: model?.label || id,
     known: Boolean(model),
     maxRefImages,
+    maxRefAudio,
     refTagStyle: model?.refTagStyle || null,
     promptLimit: model?.promptLimit ?? null,
     refMode: model?.refMode ?? (maxRefImages > 0 ? 'optional' : 'none'),
@@ -291,6 +303,11 @@ export function modelCapabilities(type, id) {
 /** How many reference images this model will actually accept. */
 export function refImageCapacity(type, id) {
   return modelCapabilities(type, id).maxRefImages;
+}
+
+/** How many reference audio clips this model will accept — 0 for most. */
+export function refAudioCapacity(type, id) {
+  return modelCapabilities(type, id).maxRefAudio;
 }
 
 // --- REFERENCE TAGGING -----------------------------------------------------

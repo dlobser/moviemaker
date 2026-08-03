@@ -98,6 +98,17 @@ test('a model with recorded lengths offers exactly those', () => {
   );
 });
 
+// Audio references default to none rather than to one, because a model that
+// silently ignores an attached clip is indistinguishable from one that used it
+// badly — and the shot would be billed either way.
+test('only the models that document reference audio report any', () => {
+  assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0/reference-to-video').maxRefAudio, 3);
+  assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0/image-to-video').maxRefAudio, 3);
+  assert.equal(modelCapabilities('video', 'fal-ai/kling-video').maxRefAudio, 0);
+  assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0/text-to-video').maxRefAudio, 0);
+  assert.equal(modelCapabilities('video', 'atlas:something/brand/new').maxRefAudio, 0);
+});
+
 test('a model with nothing recorded keeps the studio defaults', () => {
   assert.deepEqual(durationOptions('fal-ai/kling-video', '5').map(o => o.value), DEFAULT_VIDEO_DURATIONS);
   assert.deepEqual(durationOptions('atlas:something/brand/new', '5').map(o => o.value), DEFAULT_VIDEO_DURATIONS);

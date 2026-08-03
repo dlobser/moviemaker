@@ -159,6 +159,47 @@ test('Atlas ref2v never falls back to a body without the reference array', () =>
   bodies.forEach(body => assert.equal('image' in body, false));
 });
 
+// Reference audio is worth the same care as reference images: a body accepted
+// without it produces a silent video at full price, looking like the model
+// simply ignored the prompt.
+test('every Atlas candidate carries the reference audio it was given', () => {
+  const bodies = buildAtlasVideoBodies('bytedance/seedance-2.0/reference-to-video', {
+    prompt: 'she sings @audio1', resolution: '1280x720', duration: '5',
+    imageDataUrls: ['data:a'], audioAssetRefs: ['asset://1', 'asset://2']
+  });
+  assert.equal(bodies.length, 3);
+  bodies.forEach(body => assert.deepEqual(body.reference_audio, ['asset://1', 'asset://2']));
+});
+
+test('a lone audio clip is offered as both an array and a bare string', () => {
+  const bodies = buildAtlasVideoBodies('bytedance/seedance-2.0/image-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '5',
+    imageDataUrls: ['data:a'], audioAssetRefs: ['asset://1']
+  });
+  assert.equal(bodies.length, 6);
+  assert.deepEqual(bodies[0].reference_audio, ['asset://1']);
+  assert.equal(bodies[3].reference_audio, 'asset://1');
+  bodies.forEach(body => assert.ok(body.reference_audio));
+});
+
+test('no audio means the body ladder is untouched', () => {
+  const bodies = buildAtlasVideoBodies('bytedance/seedance-2.0/image-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '5', imageDataUrls: ['data:a']
+  });
+  assert.equal(bodies.length, 3);
+  bodies.forEach(body => assert.equal('reference_audio' in body, false));
+});
+
+test('a model that cannot take audio refuses rather than dropping it', async () => {
+  await assert.rejects(
+    () => generateVideo(
+      { provider: 'fal-ai/kling-video', prompt: 'x', audioUrls: ['assets/vo.mp3'] },
+      { credentials: {} }
+    ),
+    /does not take reference audio/
+  );
+});
+
 // --- DALL-E ----------------------------------------------------------------
 
 test('DALL-E size mapping', () => {

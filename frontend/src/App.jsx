@@ -52,6 +52,7 @@ import {
   parseModelId,
   durationOptions,
   modelCapabilities,
+  refAudioCapacity,
   refImageCapacity,
   setCustomModelOverrides,
   sizeOptions
@@ -59,6 +60,7 @@ import {
 import {
   ASSET_TYPES,
   assetInputImages,
+  assetPrimaryImage,
   assetPromptText,
   buildAutoPromptContext,
   composeGenerationPrompt,
@@ -350,6 +352,7 @@ export default function App() {
   const [newProjectDraft, setNewProjectDraft] = useState(null); // { directory, name }
   const [runtimeMode, setRuntimeMode] = useState(null); // 'server' | 'static'
   const [needsFolderPermission, setNeedsFolderPermission] = useState(false);
+  const [folderNoticeDismissed, setFolderNoticeDismissed] = useState(false);
 
   // --- SHOT LIST IMPORT ---
   const [importReport, setImportReport] = useState(null); // { added, warnings[] }
@@ -462,6 +465,7 @@ export default function App() {
 
   // refs
   const audioInputRefs = useRef({});
+  const audioRefInputRefs = useRef({});
 
   // Helper: Toast Alert
   const showToast = (message, type = 'info') => {
@@ -480,8 +484,11 @@ export default function App() {
         // the browser may still want a click before granting access again.
         const restored = await projectFs.restoreActiveProject();
         if (restored?.needsPermission) {
+          // Not a gate: the app opens as normal and a banner offers the click.
+          // Reading the folder is what has to wait, so the state load does too.
           setNeedsFolderPermission(true);
           await fetchConfig();
+          await fetchProject();
           return;
         }
       }
@@ -718,8 +725,9 @@ export default function App() {
 
   // Auto-Save Project State
   const saveProjectState = async (updatedScenes = scenes, extra = {}) => {
-    // Nothing to write to yet in the hosted build until a folder is picked.
-    if (isStatic() && !projectFs.getActiveHandle()) return;
+    // Nothing to write to yet in the hosted build until a folder is picked —
+    // and a folder we have not been re-granted access to would only throw.
+    if (isStatic() && (!projectFs.getActiveHandle() || needsFolderPermission)) return;
     try {
       await apiFetch(`/api/state`, {
         method: 'POST',
@@ -926,6 +934,7 @@ export default function App() {
           selectedVideo: null,
           referenceImages: [],
           lipSyncAudio: null,
+          audioRefs: [],
           imagePrompts: [],
           videoPrompts: [],
           draftImagePrompt: '',
@@ -999,6 +1008,7 @@ export default function App() {
       selectedVideo: null,
       referenceImages: [],
       lipSyncAudio: null,
+      audioRefs: [],
       imagePrompts: [], 
       videoPrompts: [],
       draftImagePrompt: '',
@@ -1525,6 +1535,21 @@ export default function App() {
       return { ok: false, error };
     }
 
+    // Reference audio belongs to the shot rather than to a prompt recipe: it is
+    // part of what the shot sounds like, so every video generation of that shot
+    // carries it. Only a video job can, and only some models will.
+    const audioRefs = type === 'video'
+      ? ((shots.find(s => s.id === shotId) || {}).audioRefs || []).filter(Boolean)
+      : [];
+    if (audioRefs.length > (caps.maxRefAudio || 0)) {
+      const error = caps.maxRefAudio
+        ? `${caps.label} takes at most ${caps.maxRefAudio} reference audio clip${caps.maxRefAudio === 1 ? '' : 's'}, and this shot has ${audioRefs.length}.`
+        : `${caps.label} does not take reference audio, and this shot has ${audioRefs.length}. Remove them, or point the shot at a Seedance 2.0 model.`;
+      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error } : j)));
+      showToast(error, 'error');
+      return { ok: false, error };
+    }
+
     // What the group is keyed on: exactly what the user chose, so reopening it
     // reproduces this generation byte for byte.
     const recipe = {
@@ -1555,7 +1580,7 @@ export default function App() {
     if (type === 'image') {
       return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta);
     }
-    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta);
+    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta, audioRefs);
   };
 
   const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}, meta = null) => {
@@ -1663,7 +1688,7 @@ export default function App() {
   // order. It used to be a single path, which was fine while every video model
   // took one image and quietly wrong once Seedance 2.0's reference endpoint
   // took nine — the prompt pointed at @image3 and only @image1 was ever sent.
-  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}, meta = null) => {
+  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}, meta = null, audioInputs = []) => {
     const { model, resolution: resOption, duration } = recipe;
     const imageUrlsToSend = Array.isArray(imageInputs) ? imageInputs.filter(Boolean) : [imageInputs].filter(Boolean);
     const imageInput = imageUrlsToSend[0] || '';
@@ -1677,6 +1702,7 @@ export default function App() {
           videoModel: model,
           prompt: promptText,
           imageUrls: imageUrlsToSend,
+          audioUrls: audioInputs,
           resolution: resOption,
           duration: duration
         })
@@ -2094,6 +2120,7 @@ export default function App() {
       selectedVideo: null,
       referenceImages: [],
       lipSyncAudio: null,
+      audioRefs: [],
       imagePrompts: [],
       videoPrompts: [],
       draftImagePrompt: '',
@@ -2892,6 +2919,13 @@ export default function App() {
 
   /** Static build: adopt a folder from the picker or the recents list. */
   const adoptStaticProject = async (handle = null) => {
+    // Whatever is on screen right now and has never been written anywhere.
+    // Since the app opens without a folder, this is the normal way a project
+    // starts: poke around, make something, then say where it lives.
+    const unsavedWork = !projectFs.getActiveHandle() && (
+      scenes.length > 0 || imageGallery.length > 0 || videoGallery.length > 0 || assetLibrary.length > 0
+    );
+
     setLoadingStates(prev => ({ ...prev, project: true }));
     try {
       const result = handle
@@ -2900,11 +2934,28 @@ export default function App() {
 
       projectFs.clearAssetUrlCache(); // old blob: URLs point at the previous folder
       const state = await projectFs.readProjectState();
-      applyLoadedState(state || {});
-      if (!state) await projectFs.writeProjectState(buildStatePayload([]));
+
+      if (!state) {
+        // An empty folder becomes the home of what is already open, rather
+        // than resetting it — otherwise picking a folder late would throw away
+        // the very work that made you pick one.
+        await projectFs.writeProjectState(buildStatePayload());
+      } else if (unsavedWork && !window.confirm(
+        `"${result.name}" already holds a project. Opening it replaces what you have on screen, ` +
+        `which has never been saved. Open it anyway?`
+      )) {
+        // Backing out has to un-adopt the folder as well, or autosave would
+        // quietly write the scratch work over the project we just declined.
+        await projectFs.clearActiveProject();
+        showToast('Kept what you had. Pick an empty folder to save it into.', 'info');
+        return;
+      } else {
+        applyLoadedState(state);
+      }
 
       await fetchProject();
       setNeedsFolderPermission(false);
+      setFolderNoticeDismissed(false);
       setActiveOverlay(null);
       showToast(`Project folder "${result.name}" ready.`, 'success');
     } catch (err) {
@@ -2920,9 +2971,16 @@ export default function App() {
   const handleReconnectFolder = async () => {
     try {
       if (await projectFs.reconnectProject()) {
+        const state = await projectFs.readProjectState();
+        // Nothing was saved while the folder was out of reach, so anything on
+        // screen would vanish under the project we are about to load.
+        if (state && scenes.length > 0 && !window.confirm(
+          `Loading "${projectFs.getActiveName()}" replaces what you have on screen, which has not been saved. Continue?`
+        )) return;
+
         setNeedsFolderPermission(false);
         projectFs.clearAssetUrlCache();
-        applyLoadedState((await projectFs.readProjectState()) || {});
+        if (state) applyLoadedState(state);
         await fetchProject();
         showToast('Project folder reconnected.', 'success');
       } else {
@@ -3053,6 +3111,7 @@ export default function App() {
       add(shot.selectedImage);
       add(shot.selectedVideo);
       add(shot.lipSyncAudio);
+      (shot.audioRefs || []).forEach(add);
       [...(shot.imagePrompts || []), ...(shot.videoPrompts || [])].forEach(group => {
         (group.outputs || []).forEach(out => add(out.path));
         (group.inputImagePaths || []).forEach(add);
@@ -4029,6 +4088,7 @@ export default function App() {
       selectedVideo: null,
       referenceImages: [],
       lipSyncAudio: null,
+      audioRefs: [],
       imagePrompts: [],
       videoPrompts: [],
       draftImagePrompt: '',
@@ -4164,6 +4224,63 @@ export default function App() {
       showToast(`Upload failed: ${err.message}`, 'error');
     } finally {
       setLoadingStates(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  /**
+   * Attach reference audio to a shot.
+   *
+   * Deliberately not the same field as `lipSyncAudio`: that one is a track to
+   * sync an *already generated* video against, while these are inputs the model
+   * generates *from* — Seedance 2.0 will sing to them, speak to them or cut to
+   * their beat, addressed from the prompt as @audio1..@audio3.
+   */
+  const handleAudioRefUpload = async (shotId, e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length) return;
+
+    const shot = shots.find(s => s.id === shotId);
+    const capacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
+    const room = capacity - (shot?.audioRefs || []).length;
+    if (room <= 0) {
+      showToast(`This shot already has the ${capacity} reference clip${capacity === 1 ? '' : 's'} the model accepts.`, 'warning');
+      return;
+    }
+    if (files.length > room) {
+      showToast(`Only the first ${room} of ${files.length} will fit — the model takes ${capacity}.`, 'warning');
+    }
+
+    const key = `audioref_${shotId}`;
+    setLoadingStates(prev => ({ ...prev, [key]: true }));
+    try {
+      const paths = [];
+      for (const file of files.slice(0, room)) {
+        const formData = new FormData();
+        formData.append('file', file);
+        const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Upload failed');
+        paths.push(data.filePath);
+      }
+      handleUpdateShotField(shotId, 'audioRefs', [...(shot?.audioRefs || []), ...paths]);
+      showToast(`${paths.length} audio reference${paths.length === 1 ? '' : 's'} attached.`, 'success');
+    } catch (err) {
+      console.error(err);
+      showToast(`Upload failed: ${err.message}`, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  // Removal renumbers everything after it, so a prompt pointing at @audio2
+  // starts addressing a different clip. Worth saying out loud.
+  const handleRemoveAudioRef = (shotId, path) => {
+    const shot = shots.find(s => s.id === shotId);
+    const remaining = (shot?.audioRefs || []).filter(p => p !== path);
+    handleUpdateShotField(shotId, 'audioRefs', remaining);
+    if (remaining.length > 0) {
+      showToast('Removed — the clips after it have shifted up a slot, so check any @audio pointers in the prompt.', 'info');
     }
   };
 
@@ -4779,14 +4896,20 @@ export default function App() {
   const activeScene = scenes.find(s => s.id === activeSceneId) || scenes[0];
   const activeSceneShots = activeScene ? (activeScene.shots || []) : [];
 
-  // Hosted build, no usable folder yet: everything else is pointless until the
-  // user grants access, so gate the whole app behind one clear choice.
-  const showStartupGate = runtimeMode === 'static'
-    && (needsFolderPermission || project.needsFolder || !projectFs.isFileSystemAccessSupported());
+  // Hosted build, no usable folder yet. This used to gate the whole app behind
+  // a folder picker on first paint, which meant you had to commit to a place on
+  // disk before you could even look around. Nothing here needs a folder until
+  // something is written, so it is a banner now — the picker comes when the
+  // work does.
+  const folderNotice = runtimeMode !== 'static' || folderNoticeDismissed ? null
+    : !projectFs.isFileSystemAccessSupported() ? 'unsupported'
+    : needsFolderPermission ? 'reconnect'
+    : project.needsFolder ? 'none'
+    : null;
 
   // The editor is a separate view, not an overlay: it unmounts the creation UI
   // entirely so the two never have to share layout or keyboard shortcuts.
-  if (view === 'edit' && !showStartupGate) {
+  if (view === 'edit') {
     return (
       <EditView
         scenes={scenes}
@@ -4796,72 +4919,6 @@ export default function App() {
         onToast={showToast}
         onClose={() => setView('create')}
       />
-    );
-  }
-
-  if (showStartupGate) {
-    const unsupported = !projectFs.isFileSystemAccessSupported();
-    return (
-      <div className="app-container">
-        {toast && (
-          <div className="toast"><Sparkles size={16} /><span>{toast.message}</span></div>
-        )}
-        <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}>
-          <div className="glass-panel" style={{ padding: '32px', maxWidth: '560px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <div className="header-logo">MM</div>
-              <div>
-                <h1 style={{ fontSize: '1.5rem' }}>MovieMaker Studio</h1>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>Hosted build — your files stay on your machine</span>
-              </div>
-            </div>
-
-            {unsupported ? (
-              <>
-                <div style={{ display: 'flex', gap: '8px', color: 'var(--accent)', fontSize: '0.9rem' }}>
-                  <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: '2px' }} />
-                  <span>This browser can't open local folders.</span>
-                </div>
-                <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                  MovieMaker stores your projects as real files on your own disk, which needs the File System
-                  Access API — currently Chrome, Edge and other Chromium browsers. Firefox and Safari don't
-                  implement it. Open this page in Chrome or Edge to continue.
-                </p>
-              </>
-            ) : needsFolderPermission ? (
-              <>
-                <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                  Welcome back. Your browser needs one click to re-grant access to
-                  {' '}<strong style={{ color: 'var(--text-main)' }}>{projectFs.getActiveName()}</strong>.
-                </p>
-                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                  <button className="btn btn-primary" onClick={handleReconnectFolder}>
-                    <FolderOpen size={16} /> Reconnect "{projectFs.getActiveName()}"
-                  </button>
-                  <button className="btn btn-secondary" onClick={() => adoptStaticProject()}>
-                    Choose a different folder…
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                  Pick a folder to work in. The project file and every generated image and video are written
-                  straight into it — nothing is uploaded to this site, and there's no server involved.
-                  An empty folder starts a new project; a folder you've used before reopens it.
-                </p>
-                <button className="btn btn-primary" style={{ alignSelf: 'flex-start' }} disabled={loadingStates.project} onClick={() => adoptStaticProject()}>
-                  {loadingStates.project ? <RefreshCw className="spinner" size={16} /> : <FolderOpen size={16} />} Choose Project Folder…
-                </button>
-                <span style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
-                  You'll also need API keys — add them under Settings once you're in. They're stored in this
-                  browser only.
-                </span>
-              </>
-            )}
-          </div>
-        </div>
-      </div>
     );
   }
 
@@ -4883,8 +4940,10 @@ export default function App() {
             <h1>MovieMaker Studio</h1>
             <button
               onClick={() => setActiveOverlay(activeOverlay === 'projects' ? null : 'projects')}
-              title={project.path || 'No project file — using the loose project_state.json'}
-              style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.75rem', color: project.isLegacy ? 'var(--accent)' : 'var(--text-dim)', fontFamily: 'inherit' }}
+              title={project.needsFolder
+                ? 'No folder chosen yet — nothing is being saved. Click to pick one.'
+                : project.path || 'No project file — using the loose project_state.json'}
+              style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.75rem', color: project.isLegacy || project.needsFolder ? 'var(--accent)' : 'var(--text-dim)', fontFamily: 'inherit' }}
             >
               <FolderOpen size={11} />
               <span style={{ maxWidth: '320px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -5204,6 +5263,65 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* Hosted build, folder not settled yet. Informational, never blocking:
+          look around all you like, the picker is one click away when you have
+          something worth keeping. */}
+      {folderNotice && (
+        <div
+          className="glass-panel"
+          style={{
+            margin: '12px 24px 0', padding: '10px 14px', display: 'flex', alignItems: 'center',
+            gap: '12px', flexWrap: 'wrap', background: 'rgba(139,92,246,0.08)',
+            border: '1px solid var(--border-light)'
+          }}
+        >
+          <AlertTriangle size={15} style={{ flexShrink: 0, color: 'var(--accent)' }} />
+          <span style={{ flex: 1, minWidth: '260px', fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            {folderNotice === 'unsupported' ? (
+              <>
+                This browser can't open local folders, so nothing can be saved. MovieMaker keeps projects as
+                real files on your disk via the File System Access API — Chrome, Edge and other Chromium
+                browsers. Open this page there when you're ready to work for real.
+              </>
+            ) : folderNotice === 'reconnect' ? (
+              <>
+                <strong style={{ color: 'var(--text-main)' }}>{projectFs.getActiveName()}</strong> is waiting —
+                your browser needs one click to re-grant access before it loads and saves again.
+              </>
+            ) : (
+              <>
+                Nothing is being saved yet. Choose a folder when you're ready — the project file and every
+                generated image and video are written straight into it, with nothing uploaded to this site.
+              </>
+            )}
+          </span>
+          {folderNotice === 'reconnect' && (
+            <button className="btn btn-primary" style={{ fontSize: '0.78rem', padding: '5px 12px' }} onClick={handleReconnectFolder}>
+              <FolderOpen size={13} /> Reconnect
+            </button>
+          )}
+          {folderNotice !== 'unsupported' && (
+            <button
+              className={folderNotice === 'reconnect' ? 'btn btn-secondary' : 'btn btn-primary'}
+              style={{ fontSize: '0.78rem', padding: '5px 12px' }}
+              disabled={loadingStates.project}
+              onClick={() => adoptStaticProject()}
+            >
+              {loadingStates.project ? <RefreshCw className="spinner" size={13} /> : <FolderOpen size={13} />}
+              {folderNotice === 'reconnect' ? 'Different folder…' : 'Choose project folder…'}
+            </button>
+          )}
+          <button
+            className="btn btn-secondary"
+            title="Hide this — the project name in the header always says where you stand"
+            style={{ padding: '5px', borderRadius: '50%' }}
+            onClick={() => setFolderNoticeDismissed(true)}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
 
       {/* SINGLE COLUMN TIMELINE */}
       <main className="main-grid">
@@ -5624,6 +5742,70 @@ export default function App() {
                           onOpenPanel={() => { setActiveShotId(shot.id); setReferencePanelOpen(true); }}
                         />
                       </div>
+
+                      {/* Reference audio, shown only where the shot's video model
+                          takes it. Slots are positional and the prompt names them,
+                          so each clip wears its own @audioN. */}
+                      {(() => {
+                        const audioCapacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
+                        if (audioCapacity === 0) return null;
+                        const clips = shot.audioRefs || [];
+                        return (
+                          <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                              Audio refs {clips.length}/{audioCapacity}
+                            </span>
+                            {clips.map((path, audioIndex) => (
+                              <span
+                                key={path}
+                                title={pathBaseName(path)}
+                                style={{
+                                  display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.7rem',
+                                  padding: '3px 6px', borderRadius: 'var(--radius-sm)',
+                                  border: '1px solid var(--border-light)', background: 'var(--bg-card)'
+                                }}
+                              >
+                                <Music size={10} style={{ color: 'var(--accent)' }} />
+                                <code style={{ color: 'var(--accent)' }}>@audio{audioIndex + 1}</code>
+                                <span style={{ maxWidth: '130px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
+                                  {pathBaseName(path)}
+                                </span>
+                                <button
+                                  className="btn btn-danger"
+                                  style={{ padding: '1px 3px' }}
+                                  onClick={() => handleRemoveAudioRef(shot.id, path)}
+                                >
+                                  <X size={9} />
+                                </button>
+                              </span>
+                            ))}
+                            <input
+                              type="file"
+                              accept="audio/*"
+                              multiple
+                              ref={el => audioRefInputRefs.current[shot.id] = el}
+                              onChange={(e) => handleAudioRefUpload(shot.id, e)}
+                              style={{ display: 'none' }}
+                            />
+                            <button
+                              className="btn btn-secondary"
+                              style={{ padding: '2px 8px', fontSize: '0.68rem' }}
+                              disabled={clips.length >= audioCapacity || loadingStates[`audioref_${shot.id}`]}
+                              onClick={() => audioRefInputRefs.current[shot.id]?.click()}
+                              title={clips.length >= audioCapacity
+                                ? `${audioCapacity} is all this model takes`
+                                : 'mp3 or wav, 15 seconds across all clips'}
+                            >
+                              {loadingStates[`audioref_${shot.id}`] ? <RefreshCw className="spinner" size={10} /> : <Plus size={10} />} Add audio
+                            </button>
+                            {clips.length > 0 && (
+                              <span style={{ fontSize: '0.66rem', color: 'var(--text-dim)' }}>
+                                Point the prompt at them by name, e.g. "she sings @audio1".
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       {/* Active Previews and Generate Actions Grid */}
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginTop: '12px', marginBottom: '12px' }}>

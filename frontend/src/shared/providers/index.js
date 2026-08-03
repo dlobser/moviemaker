@@ -49,13 +49,24 @@ export async function generateImage({ provider, providerFamily, prompt, resoluti
  *
  * `imageUrls` keeps its historical name (it carries project-relative asset
  * paths, not URLs) because it is part of the /api/video/generate shape.
+ * `audioUrls` is the same idea for reference audio, which only Seedance 2.0
+ * currently accepts.
  */
-export async function generateVideo({ provider, providerFamily, videoModel, prompt, imageUrls = [], resolution, duration }, ctx) {
+export async function generateVideo({ provider, providerFamily, videoModel, prompt, imageUrls = [], audioUrls = [], resolution, duration }, ctx) {
   const { family, path: modelPath } = resolveRouting(provider, providerFamily);
   const inputImagePaths = (imageUrls || []).filter(Boolean);
-  const req = { modelPath, prompt, resolution, duration, inputImagePaths };
+  const inputAudioPaths = (audioUrls || []).filter(Boolean);
+  const req = { modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths };
 
   if (family === 'atlas') return atlas.generateVideo(req, ctx);
+  // Everywhere else, audio references would be dropped without a word. Say so
+  // instead: the shot asked for something this model cannot do.
+  if (inputAudioPaths.length > 0) {
+    throw new Error(
+      `${modelPath} does not take reference audio — only Seedance 2.0 on Atlas does. ` +
+      `Remove the audio reference from this shot, or switch the shot's video model.`
+    );
+  }
   if (routesToHiggsfield(family, modelPath)) return higgsfield.generateVideo(req, ctx);
   if (modelPath === 'runway') return runway.generateVideo(req, ctx);
   if (modelPath === 'kling') return kling.generateVideo(req, ctx);

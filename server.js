@@ -722,10 +722,22 @@ app.post('/api/video/generate', async (req, res) => {
   }
 });
 
+// What Fal storage should serve a file as. It used to be png-or-jpeg, which
+// was harmless while only stills were uploaded — but audio and video go
+// through here too now, and a host that reads the Content-Type (Atlas does,
+// when it fetches a registered asset) will refuse an mp3 labelled as a jpeg.
+const FAL_UPLOAD_MIME = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp', '.gif': 'image/gif',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.m4v': 'video/x-m4v',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac', '.ogg': 'audio/ogg', '.flac': 'audio/flac'
+};
+
 // Helper: Upload file to Fal.media so external models can access it
 async function uploadToFalMedia(filePath, falKey) {
   const fileBuffer = fs.readFileSync(filePath);
-  const mimeType = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
+  const mimeType = FAL_UPLOAD_MIME[path.extname(filePath).toLowerCase()] || 'image/jpeg';
 
   // Ask Fal.ai for an upload URL
   const initRes = await fetch('https://rest.fal.ai/storage/upload/initiate', {

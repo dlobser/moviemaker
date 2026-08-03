@@ -48,6 +48,16 @@ async function idbGet(key) {
   });
 }
 
+async function idbDelete(key) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 async function idbSet(key, value) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
@@ -96,6 +106,16 @@ export async function restoreActiveProject() {
   if (!stored) return null;
   activeHandle = stored;
   return { name: stored.name, needsPermission: !(await hasPermission(stored)) };
+}
+
+/**
+ * Forget the active folder — back to the folderless state the app now opens in.
+ * Used when adopting a folder is picked but then abandoned, so autosave cannot
+ * write into somewhere the user just backed out of. Recents are left alone.
+ */
+export async function clearActiveProject() {
+  activeHandle = null;
+  await idbDelete(ACTIVE_KEY);
 }
 
 /** Re-grant permission to the restored folder. Must run inside a click handler. */

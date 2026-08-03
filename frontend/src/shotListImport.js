@@ -297,6 +297,7 @@ export function normalizeImportedShotList(raw) {
           selectedImage: asString(shot.selectedImage) || null,
           selectedVideo: asString(shot.selectedVideo) || null,
           lipSyncAudio: asString(shot.lipSyncAudio) || null,
+          audioRefs: Array.isArray(shot.audioRefs) ? shot.audioRefs.map(asString).filter(Boolean) : [],
           // Preserve generated history when re-importing a full project export.
           imagePrompts: Array.isArray(shot.imagePrompts) ? shot.imagePrompts : [],
           videoPrompts: Array.isArray(shot.videoPrompts) ? shot.videoPrompts : []

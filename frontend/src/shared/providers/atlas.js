@@ -9,6 +9,7 @@
 import { describeFalError } from './fal.js';
 
 const ATLAS_BASE = 'https://api.atlascloud.ai/api/v1/model';
+const ATLAS_ASSETS = 'https://console.atlascloud.ai/api/v1/sd/assets';
 
 /**
  * Submit to Atlas, then poll to completion.
@@ -60,6 +61,63 @@ export async function callAtlasModel(endpoint, candidates, ctx) {
   throw new Error('Atlas Cloud generation timed out.');
 }
 
+// --- the asset library -----------------------------------------------------
+//
+// Images go into a generation request inline as data: URLs. Audio and video do
+// not: Atlas requires them registered in its Asset Library first, from a URL it
+// can fetch, and the request then points at `asset://<id>`.
+//
+// "A URL it can fetch" is the awkward part, because the studio's audio is a
+// file on your own disk. Fal storage is already the studio's uploader for
+// exactly this problem (image-to-video on Fal needs it too), so a Fal key is
+// what makes Atlas audio references possible — the clip is uploaded there and
+// Atlas reads it from that address.
+
+/**
+ * Register one local asset with Atlas and wait for it to be usable.
+ * Returns the `asset://<id>` reference a generation request wants.
+ */
+export async function registerAtlasAsset(assetPath, type, ctx) {
+  if (!ctx.credentials.falKey) {
+    throw new Error(
+      `Atlas will not accept ${type.toLowerCase()} inline — it has to be registered in the Atlas Asset Library ` +
+      `from a public URL first. The studio hosts it on Fal storage to do that, so a Fal.ai key is required ` +
+      `alongside your Atlas key. Add one in Settings, or drop the audio reference from this shot.`
+    );
+  }
+  const apiKey = ctx.credentials.atlasKey;
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  const publicUrl = await ctx.uploadPublicUrl(assetPath);
+
+  const created = await ctx.fetch(ATLAS_ASSETS, {
+    method: 'POST', headers, body: JSON.stringify({ type, url: publicUrl })
+  }, 'Atlas Cloud');
+  const createdBody = await created.text();
+  if (!created.ok) {
+    throw new Error(`Atlas asset registration failed (${created.status}): ${describeFalError(createdBody)}`);
+  }
+  const asset = JSON.parse(createdBody)?.data || JSON.parse(createdBody) || {};
+  const assetId = asset.id;
+  if (!assetId) throw new Error('Atlas registered the asset but returned no id.');
+
+  // Atlas transcodes before an asset is usable. Sending asset://<id> too early
+  // is refused, so this waits rather than letting the generation fail.
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const poll = await ctx.fetch(`${ATLAS_ASSETS}/${assetId}`, {
+      headers: { Authorization: `Bearer ${apiKey}` }
+    }, 'Atlas Cloud');
+    if (!poll.ok) throw new Error(`Atlas asset status check failed: ${poll.status}`);
+    const body = await poll.json();
+    const status = String((body?.data || body)?.status || '').toLowerCase();
+    if (status === 'active') return `asset://${assetId}`;
+    if (status === 'failed' || status === 'error') {
+      throw new Error(`Atlas could not process ${assetPath.split('/').pop()} — it rejected the file.`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  throw new Error(`Atlas is still processing ${assetPath.split('/').pop()} after two minutes.`);
+}
+
 // --- request shaping (pure) ------------------------------------------------
 
 /** Atlas wants pixels as "W*H"; the studio speaks in aspect ratios. */
@@ -92,7 +150,7 @@ export function buildAtlasImageBodies(modelPath, { prompt, resolution, imageData
   ];
 }
 
-export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration, imageDataUrls = [] }) {
+export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration, imageDataUrls = [], audioAssetRefs = [] }) {
   const aspect = resolution === '720x1280' ? '9:16' : '16:9';
   const core = { model: modelPath, prompt, duration: Number(duration) || 5 };
 
@@ -118,7 +176,17 @@ export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration,
     candidates.push({ ...core, aspect_ratio: aspect });              // Seedance 1.5 / OpenAPI naming
     candidates.push(core);                                           // last resort: the common fields
   }
-  return candidates;
+
+  if (audioAssetRefs.length === 0) return candidates;
+
+  // Atlas documents `reference_audio` singular while the model takes up to
+  // three clips, so both shapes are tried. Every candidate carries the audio:
+  // dropping it would produce a silent video that cost full price and looked
+  // like the model simply ignoring the prompt.
+  const shapes = audioAssetRefs.length === 1
+    ? [{ reference_audio: audioAssetRefs }, { reference_audio: audioAssetRefs[0] }]
+    : [{ reference_audio: audioAssetRefs }];
+  return shapes.flatMap(shape => candidates.map(body => ({ ...body, ...shape })));
 }
 
 // --- generation ------------------------------------------------------------
@@ -130,10 +198,16 @@ export async function generateImage({ modelPath, prompt, resolution, inputImageP
   return ctx.saveRemote(url, 'img', '.png');
 }
 
-export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths }, ctx) {
+export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths = [] }, ctx) {
   // Atlas takes frames inline, so unlike Fal there is no upload step.
   const imageDataUrls = await Promise.all(inputImagePaths.map(ctx.readAssetDataUrl));
-  const bodies = buildAtlasVideoBodies(modelPath, { prompt, resolution, duration, imageDataUrls });
+  // Audio does need one, and it is slow (upload, register, transcode), so it
+  // runs before a single generation credit is spent.
+  const audioAssetRefs = [];
+  for (const audioPath of inputAudioPaths) {
+    audioAssetRefs.push(await registerAtlasAsset(audioPath, 'Audio', ctx));
+  }
+  const bodies = buildAtlasVideoBodies(modelPath, { prompt, resolution, duration, imageDataUrls, audioAssetRefs });
   const url = await callAtlasModel('generateVideo', bodies, ctx);
   return ctx.saveRemote(url, 'vid', '.mp4');
 }
