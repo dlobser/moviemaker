@@ -92,6 +92,7 @@ import {
   assignReferences,
   enabledReferencePaths,
   migrateReferenceState,
+  normalizeAssignment,
   normalizeReference,
   pruneAssignments,
   resolveSceneReferences,
@@ -2142,7 +2143,8 @@ export default function App() {
           providerFamily: parseModelId(model).family || getImageModel(model)?.provider || null,
           prompt: composed.prompt,
           resolution,
-          inputImagePaths: composed.inputImagePaths
+          inputImagePaths: composed.inputImagePaths,
+          safetyChecker: atlasSafetyChecker
         })
       });
       const data = await res.json();
@@ -2874,7 +2876,7 @@ export default function App() {
    * flat settings). Throws with a readable message if the document is unusable.
    */
   const applyImportedDocument = (parsed, mode = 'replace', { restoreGalleries = false } = {}) => {
-    const { project, assets, promptSnippets: importedSnippets, scenes: importedScenes, warnings } =
+    const { project, assets, promptSnippets: importedSnippets, scenes: importedScenes, warnings, idMap, legacyShotRefs } =
       normalizeImportedShotList(parsed);
 
     // Project-level settings.
@@ -2913,10 +2915,38 @@ export default function App() {
     if (restoreGalleries) {
       setImageGallery(parsed.imageGallery || []);
       setVideoGallery(parsed.videoGallery || []);
-      setReferenceImages(parsed.referenceImages || []);
+      const restoredRefs = (parsed.referenceImages || []).map(normalizeReference);
+      setReferenceImages(restoredRefs);
+      // Assignments in the export point at the exporter's scene/shot ids; the
+      // normaliser mints fresh ids, so remap every edge target through its
+      // idMap. Legacy pre-v2 exports carried per-shot refId arrays instead —
+      // those become shot-scope edges here, because the schema migration only
+      // runs at project load and can never see an imported document.
+      const knownRefIds = new Set(restoredRefs.map(r => r.id));
+      let restoredEdges = (parsed.refAssignments || [])
+        .map(normalizeAssignment)
+        .filter(edge => edge && knownRefIds.has(edge.refId))
+        .map(edge => (edge.scope === 'project' ? edge : { ...edge, targetId: idMap[edge.targetId] || edge.targetId }));
+      legacyShotRefs.forEach(({ shotId, refIds }) => {
+        const usable = refIds.filter(id => knownRefIds.has(id));
+        if (usable.length > 0) restoredEdges = assignReferences(restoredEdges, usable, [{ scope: 'shot', targetId: shotId }]);
+      });
+      setRefAssignments(restoredEdges);
       setConcatenatedVideo(parsed.concatenatedVideo || null);
       // A shot list on its own carries no edit; a full state export does.
       if (parsed.edit) setEdit(migrateEdit(parsed.edit));
+    } else if (legacyShotRefs.length > 0) {
+      // Shot-list import into an existing project: legacy per-shot refIds can
+      // only mean references already on this project's board.
+      setRefAssignments(prev => {
+        const known = new Set(referenceImages.map(r => r.id));
+        let next = prev;
+        legacyShotRefs.forEach(({ shotId, refIds }) => {
+          const usable = refIds.filter(id => known.has(id));
+          if (usable.length > 0) next = assignReferences(next, usable, [{ scope: 'shot', targetId: shotId }]);
+        });
+        return next;
+      });
     }
 
     // Assets merge by tag: an imported asset never clobbers reference images

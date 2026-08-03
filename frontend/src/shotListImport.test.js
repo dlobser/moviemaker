@@ -46,6 +46,24 @@ test('malformed JSON still surfaces the parser message', () => {
   assert.throws(() => extractJsonDocument('{"scenes": [,]}'), SyntaxError);
 });
 
+test('exported ids map to the minted ones so assignments can follow', () => {
+  const result = normalizeImportedShotList({
+    scenes: [{ id: 'scene_old', name: 'Act 1', shots: [{ id: 'shot_old', name: '1.1' }] }]
+  });
+  assert.equal(result.idMap['scene_old'], result.scenes[0].id);
+  assert.equal(result.idMap['shot_old'], result.scenes[0].shots[0].id);
+});
+
+test('legacy per-shot referenceImages surface as edges-to-be, not as the dead field', () => {
+  const result = normalizeImportedShotList({
+    scenes: [{ name: 'Act 1', shots: [{ name: '1.1', referenceImages: ['ref_a', 'ref_b'] }] }]
+  });
+  assert.equal(result.scenes[0].shots[0].referenceImages, undefined);
+  assert.deepEqual(result.legacyShotRefs, [
+    { shotId: result.scenes[0].shots[0].id, refIds: ['ref_a', 'ref_b'] }
+  ]);
+});
+
 test('the extractor feeds the normaliser unchanged', () => {
   const pasted = '```json\n' + JSON.stringify({
     project: { prePrompt: 'cinematic film still,' },

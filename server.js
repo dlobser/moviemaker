@@ -611,14 +611,13 @@ app.post('/api/llm/generate', async (req, res) => {
       if (!apiKey) throw new Error('Claude API key is not configured.');
 
       const url = 'https://api.anthropic.com/v1/messages';
-      const targetModel = model || 'claude-3-5-sonnet-latest';
+      const targetModel = model || 'claude-sonnet-5';
       const response = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'dangerously-allow-html': 'true'
+          'anthropic-version': '2023-06-01'
         },
         body: JSON.stringify({
           model: targetModel,

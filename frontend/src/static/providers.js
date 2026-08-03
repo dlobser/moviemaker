@@ -597,7 +597,14 @@ export async function generateImage({ provider, providerFamily, prompt, resoluti
     return downloadToProject(data.data[0].url, 'img', '.png', credentials);
   }
 
-  // Everything else routes through Fal.
+  // Everything else routes through Fal — but only ids that actually declare a
+  // Fal host, matching the server's guard. An unknown id must fail loudly, not
+  // bill a mis-routed Fal request.
+  const routesToFal = family
+    ? family === 'fal-ai'
+    : (modelPath === 'fal-ai' || modelPath.startsWith('fal-ai'));
+  if (!routesToFal) throw new Error(`Unsupported image provider: ${provider}`);
+
   const modelId = modelPath === 'fal-ai' ? 'fal-ai/flux/schnell' : modelPath;
   let imageSize = 'landscape_16_9';
   if (resolution === '9:16') imageSize = 'portrait_16_9';

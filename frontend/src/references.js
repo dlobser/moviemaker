@@ -144,7 +144,7 @@ export function migrateReferenceState(state = {}) {
   return { references, assignments, scenes };
 }
 
-function normalizeAssignment(edge) {
+export function normalizeAssignment(edge) {
   if (!edge || !edge.refId || !REFERENCE_SCOPES.includes(edge.scope)) return null;
   if (edge.scope !== 'project' && !edge.targetId) return null;
   return {

@@ -237,21 +237,38 @@ export function normalizeImportedShotList(raw) {
     throw new Error('No "scenes" (or legacy "shots") array found in the imported file.');
   }
 
+  // Every imported scene and shot gets a fresh id, so anything in the document
+  // that pointed at the old ids (reference assignments, above all) needs a map
+  // from exported id → minted id to survive the round trip.
+  const idMap = {};
+  // Pre-v2 exports kept per-shot reference ids as `shot.referenceImages`.
+  // Writing that legacy field back onto shots can never migrate (the schema
+  // migration only runs at load, and the project is already stamped v2), so
+  // the importer surfaces them here for the caller to turn into edges.
+  const legacyShotRefs = [];
+
   const scenes = sceneSource.map((rawScene, sceneIndex) => {
     const rawShots = Array.isArray(rawScene?.shots) ? rawScene.shots : [];
     if (rawShots.length === 0) {
       warnings.push(`Scene "${rawScene?.name || sceneIndex + 1}" has no shots.`);
     }
 
+    const sceneId = makeId('scene');
+    if (rawScene?.id) idMap[rawScene.id] = sceneId;
+
     return {
-      id: makeId('scene'),
+      id: sceneId,
       name: asString(rawScene?.name, `Scene ${sceneIndex + 1}`),
       number: Number(rawScene?.number) || sceneIndex + 1,
       sceneConcatenatedVideo: null,
       shots: rawShots.map((rawShot, shotIndex) => {
         const shot = rawShot && typeof rawShot === 'object' ? rawShot : {};
+        const shotId = makeId('shot');
+        if (shot.id) idMap[shot.id] = shotId;
+        const legacyRefIds = Array.isArray(shot.referenceImages) ? shot.referenceImages.filter(Boolean) : [];
+        if (legacyRefIds.length > 0) legacyShotRefs.push({ shotId, refIds: legacyRefIds });
         return {
-          id: makeId('shot'),
+          id: shotId,
           name: asString(shot.name, `Shot ${shotIndex + 1}`),
           setup: asString(shot.setup),
           description: asString(shot.description),
@@ -267,7 +284,6 @@ export function normalizeImportedShotList(raw) {
           videoDuration: shot.videoDuration != null ? String(shot.videoDuration) : null,
           selectedImage: asString(shot.selectedImage) || null,
           selectedVideo: asString(shot.selectedVideo) || null,
-          referenceImages: Array.isArray(shot.referenceImages) ? shot.referenceImages : [],
           lipSyncAudio: asString(shot.lipSyncAudio) || null,
           // Preserve generated history when re-importing a full project export.
           imagePrompts: Array.isArray(shot.imagePrompts) ? shot.imagePrompts : [],
@@ -277,5 +293,5 @@ export function normalizeImportedShotList(raw) {
     };
   });
 
-  return { project, assets, promptSnippets, scenes, warnings };
+  return { project, assets, promptSnippets, scenes, warnings, idMap, legacyShotRefs };
 }
