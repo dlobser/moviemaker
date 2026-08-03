@@ -62,6 +62,7 @@ export default function SettingsPanel({
   videoModel, setVideoModel, videoResolution, setVideoResolution,
   videoDuration, setVideoDuration,
   batchConcurrency, setBatchConcurrency,
+  customModelCaps, setCustomModelCap,
   attachTagsForImages, setAttachTagsForImages,
   attachTagsForVideos, setAttachTagsForVideos,
   atlasSafetyChecker, setAtlasSafetyChecker,
@@ -206,6 +207,8 @@ export default function SettingsPanel({
                       value={imageModel}
                       onChange={setImageModel}
                       placeholder="e.g. fal-ai/flux-lora"
+                      refImagesOverride={customModelCaps?.[imageModel]?.refImages}
+                      onRefImagesOverride={setCustomModelCap ? (n) => setCustomModelCap(imageModel, n) : undefined}
                     />
                   )}
                 </section>
@@ -237,6 +240,8 @@ export default function SettingsPanel({
                       value={videoModel}
                       onChange={setVideoModel}
                       placeholder="e.g. bytedance/seedance-2.0/image-to-video"
+                      refImagesOverride={customModelCaps?.[videoModel]?.refImages}
+                      onRefImagesOverride={setCustomModelCap ? (n) => setCustomModelCap(videoModel, n) : undefined}
                     />
                   )}
                   <div className="form-group" style={{ maxWidth: '220px' }}>

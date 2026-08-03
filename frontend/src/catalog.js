@@ -17,13 +17,21 @@
 // refTagStyle - set when the model expects the prompt to *point at* its own
 //             reference images by position ("@image1"). See REFERENCE TAGGING
 //             below; unset means the model only reads the images it is given.
+// refMode   - 'required' when the model cannot run without an input image
+//             (img2img editors, i2v-only video endpoints). Unset means
+//             'optional' when refImages > 0 and 'none' when it is 0.
+// refKinds  - which reference-board kinds are worth sending to this model
+//             (e.g. a character-identity model only reads faces). Unset = all.
+// promptLimit - documented character ceiling on the prompt. Only *verified*
+//             numbers belong here (DALL-E 3: 4000, per OpenAI's API docs).
+//             Never guess one — the studio warns on overflow, it never trims.
 
 export const IMAGE_MODELS = [
   // --- Fal.ai ---
   { id: 'fal-ai/flux/schnell', label: 'Flux Schnell (fast)', provider: 'fal-ai', price: 0.003, refImages: 0 },
   { id: 'fal-ai/flux/dev', label: 'Flux Dev (high quality)', provider: 'fal-ai', price: 0.025, refImages: 0 },
-  { id: 'fal-ai/flux/schnell/redux', label: 'Flux Schnell Redux (img2img)', provider: 'fal-ai', price: 0.008, refImages: 1 },
-  { id: 'fal-ai/flux/dev/redux', label: 'Flux Dev Redux (img2img)', provider: 'fal-ai', price: 0.03, refImages: 1 },
+  { id: 'fal-ai/flux/schnell/redux', label: 'Flux Schnell Redux (img2img)', provider: 'fal-ai', price: 0.008, refImages: 1, refMode: 'required' },
+  { id: 'fal-ai/flux/dev/redux', label: 'Flux Dev Redux (img2img)', provider: 'fal-ai', price: 0.03, refImages: 1, refMode: 'required' },
   { id: 'fal-ai/stable-diffusion-v35-large', label: 'SD 3.5 Large', provider: 'fal-ai', price: 0.035, refImages: 0 },
   { id: 'fal-ai/stable-diffusion-v35-medium', label: 'SD 3.5 Medium', provider: 'fal-ai', price: 0.015, refImages: 0 },
 
@@ -32,7 +40,7 @@ export const IMAGE_MODELS = [
   { id: 'google-gemini-image', label: 'Gemini 2.5 Flash Image (Nano Banana)', provider: 'google', priceNote: 'per Google AI Studio rates', refImages: 3 },
 
   // --- OpenAI (direct) ---
-  { id: 'chatgpt', label: 'DALL-E 3', provider: 'openai', price: 0.04, priceNote: 'standard 1024px', refImages: 0 },
+  { id: 'chatgpt', label: 'DALL-E 3', provider: 'openai', price: 0.04, priceNote: 'standard 1024px', refImages: 0, promptLimit: 4000 },
 
   // --- Higgsfield ---
   // Endpoint paths are POSTed directly to https://platform.higgsfield.ai/{id}.
@@ -42,8 +50,8 @@ export const IMAGE_MODELS = [
   // https://cloud.higgsfield.ai for the authoritative number before a big batch.
   { id: 'higgsfield-ai/soul/standard', label: 'Higgsfield Soul (flagship t2i)', provider: 'higgsfield', priceNote: '~$0.09-0.12 / image (credits)', refImages: 0 },
   { id: 'higgsfield-ai/soul/turbo', label: 'Higgsfield Soul Turbo', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
-  { id: 'higgsfield-ai/soul/image-to-image', label: 'Higgsfield Soul Image-to-Image', provider: 'higgsfield', priceNote: '~$0.09 / run (credits)', refImages: 1 },
-  { id: 'higgsfield-ai/soul-id', label: 'Higgsfield Soul ID (character consistency)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 4 },
+  { id: 'higgsfield-ai/soul/image-to-image', label: 'Higgsfield Soul Image-to-Image', provider: 'higgsfield', priceNote: '~$0.09 / run (credits)', refImages: 1, refMode: 'required' },
+  { id: 'higgsfield-ai/soul-id', label: 'Higgsfield Soul ID (character consistency)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 4, refKinds: ['character'] },
   { id: 'reve/text-to-image', label: 'Reve Text-to-Image', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
   // Counts below follow higgsfield-ai/cli MODELS.md ("At most N image_references
   // are allowed"): nano_banana_2 14, nano_banana 8, openai 16, seedream_v4_5 14,
@@ -96,13 +104,13 @@ export const VIDEO_MODELS = [
   { id: 'higgsfield-ai/dop/standard', label: 'Higgsfield DoP (standard)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
   { id: 'higgsfield-ai/dop/turbo', label: 'Higgsfield DoP (turbo)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
   { id: 'higgsfield-ai/cinema-studio', label: 'Higgsfield Cinema Studio', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'bytedance/seedance/v1/pro/image-to-video', label: 'Seedance 1 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
+  { id: 'bytedance/seedance/v1/pro/image-to-video', label: 'Seedance 1 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
   { id: 'bytedance/seedance/v1/pro/text-to-video', label: 'Seedance 1 Pro t2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
-  { id: 'bytedance/seedance/v1.5/pro/image-to-video', label: 'Seedance 1.5 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'kling-video/v2.1/pro/image-to-video', label: 'Kling 2.1 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'kling-video/v2.5/pro/image-to-video', label: 'Kling 2.5 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'kling-video/v2.6/pro/image-to-video', label: 'Kling 2.6 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'kling-video/o1/image-to-video', label: 'Kling O1 i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
+  { id: 'bytedance/seedance/v1.5/pro/image-to-video', label: 'Seedance 1.5 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'kling-video/v2.1/pro/image-to-video', label: 'Kling 2.1 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'kling-video/v2.5/pro/image-to-video', label: 'Kling 2.5 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'kling-video/v2.6/pro/image-to-video', label: 'Kling 2.6 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'kling-video/o1/image-to-video', label: 'Kling O1 i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
   { id: 'google/veo/3.1', label: 'Google Veo 3.1 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
   { id: 'google/veo/3', label: 'Google Veo 3 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
   { id: 'openai/sora-2', label: 'Sora 2 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
@@ -120,12 +128,12 @@ export const VIDEO_MODELS = [
   // reference-to-video takes up to 9 and expects the prompt to point at each
   // one by position. Picking i2v and wondering why only one image goes is the
   // whole reason the two are listed separately.
-  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/text-to-video', label: 'Seedance 2.0 t2v (Atlas)', provider: 'atlas', priceNote: '$0.112 / s', refImages: 0, durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, durations: ['4', '5', '6', '8', '10', '12'] }
+  { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, refMode: 'required', durations: ['4', '5', '6', '8', '10', '12'] }
 ];
 
 export const IMAGE_ASPECT_RATIOS = [
@@ -245,6 +253,16 @@ export function isKnownVideoModel(id) {
 
 export const DEFAULT_VIDEO_DURATIONS = ['5', '10'];
 
+// Per-project overrides for *custom* model paths, keyed by the id as typed.
+// The catalog cannot know how many references a hand-entered Higgsfield path
+// accepts, and defaulting to 1 silently starves multi-reference models — so
+// the project can say. App.jsx keeps this in sync with project settings.
+let customModelOverrides = {};
+
+export function setCustomModelOverrides(map) {
+  customModelOverrides = map && typeof map === 'object' ? map : {};
+}
+
 /**
  * Everything the UI needs to know about a model, with defaults filled in.
  * `known` is false for a custom path, which is the cue to keep the fallbacks
@@ -252,12 +270,19 @@ export const DEFAULT_VIDEO_DURATIONS = ['5', '10'];
  */
 export function modelCapabilities(type, id) {
   const model = type === 'image' ? getImageModel(id) : getVideoModel(id);
+  const override = model ? null : customModelOverrides[id];
+  const maxRefImages = model
+    ? model.refImages
+    : (Number.isFinite(override?.refImages) ? override.refImages : 1); // unknown model: assume one input
   return {
     id,
     label: model?.label || id,
     known: Boolean(model),
-    maxRefImages: model ? model.refImages : 1, // unknown model: assume one input
+    maxRefImages,
     refTagStyle: model?.refTagStyle || null,
+    promptLimit: model?.promptLimit ?? null,
+    refMode: model?.refMode ?? (maxRefImages > 0 ? 'optional' : 'none'),
+    refKinds: model?.refKinds ?? null,
     durations: type === 'video' ? (model?.durations || DEFAULT_VIDEO_DURATIONS) : null,
     sizes: model?.sizes || (type === 'image' ? IMAGE_ASPECT_RATIOS : VIDEO_RESOLUTIONS)
   };

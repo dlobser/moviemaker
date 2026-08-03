@@ -50,7 +50,9 @@ import {
   groupedModelOptions,
   parseModelId,
   durationOptions,
+  modelCapabilities,
   refImageCapacity,
+  setCustomModelOverrides,
   sizeOptions
 } from './catalog.js';
 import {
@@ -216,6 +218,12 @@ export default function App() {
   const [atlasSafetyChecker, setAtlasSafetyChecker] = useState(true);
   const [attachTagsForVideos, setAttachTagsForVideos] = useState(false);
   const [genModalAttachTags, setGenModalAttachTags] = useState(true);
+
+  // Per-project capability overrides for custom model paths, keyed by the id
+  // as typed: { 'higgsfield:vendor/model': { refImages: 8 } }. The catalog
+  // reads these through a registry so every capacity check sees them.
+  const [customModelCaps, setCustomModelCaps] = useState({});
+  useEffect(() => { setCustomModelOverrides(customModelCaps); }, [customModelCaps]);
 
   // --- PROMPTS ---
   // Every editable prompt in one bag, keyed by the slot ids in prompts.js. A
@@ -526,6 +534,7 @@ export default function App() {
     setAttachTagsForImages(state.attachTagsForImages !== false);
     setAttachTagsForVideos(state.attachTagsForVideos === true);
     setAtlasSafetyChecker(state.atlasSafetyChecker !== false);
+    setCustomModelCaps(state.customModelCaps && typeof state.customModelCaps === 'object' ? state.customModelCaps : {});
     // Only the fields a dream saved are stored, so unset ones follow the
     // project's current models rather than a pinned stale one.
     setDreamSettings(createDreamSettings(state.dreamSettings || {}));
@@ -584,6 +593,7 @@ export default function App() {
       attachTagsForImages,
       attachTagsForVideos,
       atlasSafetyChecker,
+      customModelCaps,
       dreamSettings: compactDreamSettings(dreamSettings),
       // Only the slots that differ from their defaults are written, so a future
       // change to a default still reaches projects that never edited it.
@@ -668,7 +678,7 @@ export default function App() {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, promptSettings, concatenatedVideo, edit, dreamSettings]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, customModelCaps, promptSettings, concatenatedVideo, edit, dreamSettings]);
 
   // --- UNDO / REDO ----------------------------------------------------------
 
@@ -1346,6 +1356,23 @@ export default function App() {
 
     if (composed.missingTags.length > 0) {
       showToast(`Unknown asset tag${composed.missingTags.length === 1 ? '' : 's'}: <${composed.missingTags.join('>, <')}> — sent as literal text.`, 'warning');
+    }
+
+    const caps = modelCapabilities(type, model);
+
+    // Warn, never silently truncate: an over-limit prompt is still sent, and
+    // whatever the provider does with it happens in the open.
+    if (composed.promptOverflow) {
+      showToast(`Prompt is ${composed.promptOverflow.length} characters — ${caps.label} documents a limit of ${composed.promptOverflow.limit}. Sent anyway; expect the provider to reject or truncate it.`, 'warning');
+    }
+
+    // A model that cannot run without an input image fails here, locally,
+    // before any request is billed.
+    if (caps.refMode === 'required' && composed.inputImagePaths.length === 0) {
+      const error = `${caps.label} requires at least one input reference image. Please add a reference image to this shot first.`;
+      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error } : j)));
+      showToast(error, 'error');
+      return { ok: false, error };
     }
 
     // What the group is keyed on: exactly what the user chose, so reopening it
@@ -5233,6 +5260,12 @@ export default function App() {
                   footer={(
                     <div className="prompt-editor-footer">
                       <span>{preview.prompt.length} chars</span>
+                      {preview.promptOverflow && (
+                        <span style={{ color: 'var(--warning, #f59e0b)', fontWeight: 600 }}
+                          title={`This model documents a ${preview.promptOverflow.limit}-character prompt limit; the composed prompt is ${preview.promptOverflow.length}. It will be sent as-is — expect the provider to reject or truncate it.`}>
+                          ⚠ over the {preview.promptOverflow.limit}-char limit
+                        </span>
+                      )}
                       <span>
                         {preview.inputImagePaths.length}/{preview.capacity} reference image{preview.capacity === 1 ? '' : 's'}
                       </span>
@@ -7303,6 +7336,15 @@ export default function App() {
           videoResolution={videoResolution} setVideoResolution={setVideoResolution}
           videoDuration={videoDuration} setVideoDuration={setVideoDuration}
           batchConcurrency={batchConcurrency} setBatchConcurrency={setBatchConcurrency}
+          customModelCaps={customModelCaps}
+          setCustomModelCap={(id, refImages) => setCustomModelCaps(prev => {
+            if (!id) return prev;
+            if (refImages === null || refImages === undefined) {
+              const { [id]: _, ...rest } = prev;
+              return rest;
+            }
+            return { ...prev, [id]: { ...prev[id], refImages } };
+          })}
           attachTagsForImages={attachTagsForImages} setAttachTagsForImages={setAttachTagsForImages}
           attachTagsForVideos={attachTagsForVideos} setAttachTagsForVideos={setAttachTagsForVideos}
           atlasSafetyChecker={atlasSafetyChecker} setAtlasSafetyChecker={setAtlasSafetyChecker}

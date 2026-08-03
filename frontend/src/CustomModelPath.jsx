@@ -17,7 +17,7 @@ const HINTS = {
   auto: 'Guessed from the path: known vendor prefixes go to Higgsfield, anything else to Fal.ai. Pick a host if that guess is wrong.'
 };
 
-export default function CustomModelPath({ label, value, onChange, placeholder, disabled }) {
+export default function CustomModelPath({ label, value, onChange, placeholder, disabled, refImagesOverride, onRefImagesOverride }) {
   const { family, path } = parseModelId(value);
 
   return (
@@ -48,6 +48,27 @@ export default function CustomModelPath({ label, value, onChange, placeholder, d
       <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
         {HINTS[family || 'auto']}
       </span>
+      {onRefImagesOverride && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px' }}>
+          <label className="form-label" style={{ margin: 0 }}>Reference images it accepts</label>
+          <input
+            type="number"
+            className="input-field"
+            style={{ width: '80px' }}
+            min={0}
+            max={16}
+            value={Number.isFinite(refImagesOverride) ? refImagesOverride : ''}
+            placeholder="1"
+            disabled={disabled}
+            onChange={(e) => {
+              const n = e.target.value === '' ? null : Math.max(0, Math.min(16, Number(e.target.value)));
+              onRefImagesOverride(Number.isFinite(n) ? n : null);
+            }}
+            title="The catalog cannot know a custom path's input-image ceiling; without this it assumes 1 and a multi-reference model silently loses the rest."
+          />
+          <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>blank = assume 1</span>
+        </div>
+      )}
     </div>
   );
 }

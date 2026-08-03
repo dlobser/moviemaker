@@ -144,3 +144,38 @@ test('an unknown model is marked as such rather than faking knowledge', () => {
 test('image models carry no duration axis at all', () => {
   assert.equal(modelCapabilities('image', 'fal-ai/flux/schnell').durations, null);
 });
+
+// --- Phase 1: capability profiles ------------------------------------------
+
+test('refMode defaults from refImages when unset', () => {
+  assert.equal(modelCapabilities('image', 'fal-ai/flux/schnell').refMode, 'none');
+  assert.equal(modelCapabilities('image', 'google/nano-banana').refMode, 'optional');
+  assert.equal(modelCapabilities('image', 'fal-ai/flux/dev/redux').refMode, 'required');
+  assert.equal(modelCapabilities('video', 'kling-video/v2.5/pro/image-to-video').refMode, 'required');
+  // Unknown paths assume one optional input, as before.
+  assert.equal(modelCapabilities('image', 'some/unknown/path').refMode, 'optional');
+});
+
+test('promptLimit is only reported where documented', () => {
+  assert.equal(modelCapabilities('image', 'chatgpt').promptLimit, 4000);
+  assert.equal(modelCapabilities('image', 'fal-ai/flux/schnell').promptLimit, null);
+});
+
+test('refKinds is null (all kinds) unless a model narrows it', () => {
+  assert.equal(modelCapabilities('image', 'fal-ai/flux/dev').refKinds, null);
+  assert.deepEqual(modelCapabilities('image', 'higgsfield-ai/soul-id').refKinds, ['character']);
+});
+
+test('custom-path overrides lift the one-input assumption, catalog models ignore them', async () => {
+  const { setCustomModelOverrides } = await import('./catalog.js');
+  try {
+    setCustomModelOverrides({ 'higgsfield:vendor/multi-ref': { refImages: 8 } });
+    assert.equal(refImageCapacity('image', 'higgsfield:vendor/multi-ref'), 8);
+    assert.equal(refImageCapacity('image', 'vendor/other-path'), 1);
+    // A known catalog id never reads the override table.
+    setCustomModelOverrides({ 'google/nano-banana': { refImages: 99 } });
+    assert.equal(refImageCapacity('image', 'google/nano-banana'), 8);
+  } finally {
+    setCustomModelOverrides({});
+  }
+});

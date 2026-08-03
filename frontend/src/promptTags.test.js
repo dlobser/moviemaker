@@ -296,3 +296,22 @@ test('nothing to say produces nothing, not a heading', () => {
   assert.equal(buildAutoPromptContext({}), '');
   assert.equal(buildAutoPromptContext({ assetLibrary: [], previousShot: { name: 'S1' } }), '');
 });
+
+// --- Phase 1: prompt overflow reporting ------------------------------------
+
+test('a prompt over the documented limit is reported, never trimmed', () => {
+  const long = 'x'.repeat(4200);
+  const composed = composeGenerationPrompt({ prompt: long, assetLibrary: [], type: 'image', modelId: 'chatgpt' });
+  assert.equal(composed.prompt.length, 4200, 'the prompt is sent whole');
+  assert.deepEqual(composed.promptOverflow, { limit: 4000, length: 4200 });
+});
+
+test('no known limit means no overflow report however long the prompt', () => {
+  const composed = composeGenerationPrompt({ prompt: 'y'.repeat(9000), assetLibrary: [], type: 'image', modelId: 'fal-ai/flux/schnell' });
+  assert.equal(composed.promptOverflow, null);
+});
+
+test('a prompt within the limit reports nothing', () => {
+  const composed = composeGenerationPrompt({ prompt: 'short', assetLibrary: [], type: 'image', modelId: 'chatgpt' });
+  assert.equal(composed.promptOverflow, null);
+});

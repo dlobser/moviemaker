@@ -6,7 +6,7 @@
 //     description: 'grizzled 60s mechanic, oil-stained overalls...',
 //     images: ['assets/ref_123.png'], primaryImage: 'assets/ref_123.png' }
 
-import { refImageCapacity, refTagToken, usesRefTags } from './catalog.js';
+import { modelCapabilities, refImageCapacity, refTagToken, usesRefTags } from './catalog.js';
 import { assetTemplateText, fillTemplate } from './prompts.js';
 
 export const ASSET_TYPES = [
@@ -381,8 +381,17 @@ export function composeGenerationPrompt({
 
   const finalPrompt = joinFragments([prePrompt, resolvedText, postPrompt]);
 
+  // A composed prompt over the model's documented ceiling is reported, never
+  // trimmed: the provider's own behaviour (reject or truncate) is visible and
+  // the fix — shorten the prompt — belongs to the user.
+  const { promptLimit } = modelCapabilities(type, modelId);
+  const promptOverflow = promptLimit && finalPrompt.length > promptLimit
+    ? { limit: promptLimit, length: finalPrompt.length }
+    : null;
+
   return {
     prompt: finalPrompt,
+    promptOverflow,
     inputImagePaths: kept.map(entry => entry.path),
     imageSources: kept,
     droppedImageSources: dropped,
