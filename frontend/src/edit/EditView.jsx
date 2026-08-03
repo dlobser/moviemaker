@@ -33,6 +33,7 @@ import { probeMissing } from './durations.js';
 import { diffShots, reconcile } from './reconcile.js';
 import { buildRenderPlan, missingSources } from './renderPlan.js';
 import { PreviewEngine } from './PreviewEngine.js';
+import { createTimeStore } from './timeStore.js';
 import Timeline from './Timeline.jsx';
 import './edit.css';
 
@@ -44,7 +45,13 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
   const engineRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  const [playhead, setPlayhead] = useState(0);
+  // Continuous time never touches React state: the engine writes this store
+  // every frame and the playhead marker / clock subscribe to it directly, so
+  // playback and scrubbing cause zero Timeline re-renders.
+  const timeStoreRef = useRef(null);
+  if (!timeStoreRef.current) timeStoreRef.current = createTimeStore(0);
+  const timeStore = timeStoreRef.current;
+
   const [playing, setPlaying] = useState(false);
   const [selection, setSelection] = useState(null);
   const [zoom, setZoom] = useState(16);
@@ -132,7 +139,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     const engine = new PreviewEngine({
       canvas: canvasRef.current,
       resolveUrl: resolveAssetUrl,
-      onTime: setPlayhead,
+      onTime: (time) => timeStore.set(time),
       onStateChange: ({ playing: next }) => setPlaying(next)
     });
     engineRef.current = engine;
@@ -152,10 +159,10 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     if (import.meta.env.DEV) window.__mmEdit = { edit, scenes, ctx };
   }, [edit, scenes, ctx]);
 
+  // engine.seek clamps and its onTime callback writes the store.
   const seek = useCallback((time) => {
     engineRef.current?.seek(time);
-    setPlayhead(Math.max(0, Math.min(time, timeline.duration)));
-  }, [timeline.duration]);
+  }, []);
 
   const togglePlay = useCallback(() => { engineRef.current?.toggle(); }, []);
 
@@ -216,10 +223,11 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
   }, [selection, ctx, setEdit]);
 
   const handleSplit = useCallback(() => {
-    const entry = timeline.video.find(v => playhead > v.start && playhead < v.end);
+    const at = timeStore.get();
+    const entry = timeline.video.find(v => at > v.start && at < v.end);
     if (!entry) return;
-    setEdit(previous => splitClipAtTime(previous, entry.clip.id, playhead, ctx));
-  }, [timeline.video, playhead, ctx, setEdit]);
+    setEdit(previous => splitClipAtTime(previous, entry.clip.id, at, ctx));
+  }, [timeline.video, timeStore, ctx, setEdit]);
 
   const applyReconcile = (options) => {
     setEdit(previous => reconcile(previous, scenes, ctx, options));
@@ -251,10 +259,11 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'upload failed');
 
+      const at = timeStore.get();
       const track = createAudioTrack(file.name.replace(/\.[^.]+$/, ''));
       const clip = createAudioClip(
         { kind: 'asset', path: data.filePath, name: file.name, stream: 'audio' },
-        { start: playhead }
+        { start: at }
       );
       setEdit(previous => addAudioClip(
         { ...previous, audio: [...(previous.audio || []), track] },
@@ -262,7 +271,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
         clip
       ));
       setSelection({ kind: 'audio', id: clip.id });
-      onToast?.(`Added ${file.name} at ${formatTime(playhead)}.`);
+      onToast?.(`Added ${file.name} at ${formatTime(at)}.`);
     } catch (error) {
       onToast?.(`Could not import audio: ${error.message}`, 'error');
     }
@@ -330,12 +339,14 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
 
   // --- keyboard -------------------------------------------------------------
 
+  // Reading the store instead of closing over playhead state is what stops
+  // this listener re-registering every frame during playback.
   useEffect(() => {
     const onKey = (event) => {
       if (event.target.matches?.('input, textarea, select')) return;
       if (event.key === ' ') { event.preventDefault(); togglePlay(); }
-      else if (event.key === 'ArrowLeft') seek(playhead - (event.shiftKey ? 1 : 1 / 24));
-      else if (event.key === 'ArrowRight') seek(playhead + (event.shiftKey ? 1 : 1 / 24));
+      else if (event.key === 'ArrowLeft') seek(timeStore.get() - (event.shiftKey ? 1 : 1 / 24));
+      else if (event.key === 'ArrowRight') seek(timeStore.get() + (event.shiftKey ? 1 : 1 / 24));
       else if (event.key === 'Home') seek(0);
       else if (event.key === 'Delete' || event.key === 'Backspace') handleDelete();
       else if (event.key === 's' || event.key === 'S') handleSplit();
@@ -343,7 +354,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [playhead, seek, togglePlay, handleDelete, handleSplit, onClose]);
+  }, [timeStore, seek, togglePlay, handleDelete, handleSplit, onClose]);
 
   const { width, height, fps } = edit.settings;
 
@@ -500,9 +511,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
           {playing ? <Pause size={14} /> : <Play size={14} />}
           {playing ? 'Pause' : 'Play'}
         </button>
-        <span className="edit-clock">
-          <strong>{formatTime(playhead)}</strong> / {formatTime(timeline.duration)}
-        </span>
+        <TransportClock store={timeStore} duration={timeline.duration} />
 
         <div className="edit-spacer" />
 
@@ -518,11 +527,12 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
       <Timeline
         timeline={timeline}
         pixelsPerSecond={zoom}
-        playhead={playhead}
+        timeStore={timeStore}
         selection={selection}
         smart={edit.smart}
         onSelect={setSelection}
         onSeek={seek}
+        onScrubStart={() => engineRef.current?.pause()}
         onMoveClip={handleMoveClip}
         onTrimClip={handleTrimClip}
         onMoveAudioClip={handleMoveAudioClip}
@@ -748,6 +758,36 @@ function FadeFields({ audio, onChange }) {
 }
 
 // --- helpers ----------------------------------------------------------------
+
+/**
+ * The transport clock, off the React render path: subscribes to the time
+ * store and writes textContent directly, throttled to ~10Hz — plenty for a
+ * hundredths readout, and none of it re-renders anything else.
+ */
+function TransportClock({ store, duration }) {
+  const ref = useRef(null);
+
+  useEffect(() => {
+    let last = 0;
+    const write = (time) => {
+      if (ref.current) ref.current.textContent = formatTime(time);
+    };
+    write(store.get());
+    const unsubscribe = store.subscribe((time) => {
+      const now = performance.now();
+      if (now - last < 100) return;
+      last = now;
+      write(time);
+    });
+    return unsubscribe;
+  }, [store]);
+
+  return (
+    <span className="edit-clock">
+      <strong ref={ref}>{formatTime(store.get())}</strong> / {formatTime(duration)}
+    </span>
+  );
+}
 
 /** Place any lip-sync audio the shots carry, on its own track. */
 function withDerivedAudio(edit, scenes) {

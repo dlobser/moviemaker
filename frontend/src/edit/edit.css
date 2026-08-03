@@ -237,7 +237,13 @@
   height: 24px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border-light);
-  cursor: pointer;
+  /* Ruler-drag is the scrub gesture. */
+  cursor: ew-resize;
+}
+
+.edit-timeline.mode-scrub .edit-track,
+.edit-timeline.mode-scrub .edit-ruler {
+  cursor: ew-resize;
 }
 
 .edit-ruler-tick {

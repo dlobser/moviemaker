@@ -26,11 +26,12 @@ const SNAP_PIXELS = 7;
 export default function Timeline({
   timeline,
   pixelsPerSecond,
-  playhead,
+  timeStore,
   selection,
   smart,
   onSelect,
   onSeek,
+  onScrubStart,
   onMoveClip,
   onTrimClip,
   onMoveAudioClip,
@@ -41,6 +42,10 @@ export default function Timeline({
   const trackRef = useRef(null);
   const dragRef = useRef(null);
   const [dragging, setDragging] = useState(null);
+  // Scrub coalescing: the latest pointer time, flushed at most once per rAF —
+  // genuinely latest-wins, however fast the pointer moves.
+  const scrubTimeRef = useRef(0);
+  const scrubFrameRef = useRef(null);
 
   const width = Math.max(320, timeline.duration * pixelsPerSecond + TRACK_PADDING * 2);
   const ticks = useMemo(
@@ -54,9 +59,11 @@ export default function Timeline({
     return Math.max(0, (clientX - bounds.left - TRACK_PADDING) / pixelsPerSecond);
   }, [pixelsPerSecond]);
 
-  /** Edges worth snapping to: every other clip's boundaries, zero, playhead. */
+  /** Edges worth snapping to: every other clip's boundaries, zero, playhead.
+      The playhead is read from the store at call time — closing over it as a
+      prop re-registered the drag listeners mid-gesture every frame. */
   const snapTargets = useCallback((exceptId) => {
-    const targets = [0, playhead];
+    const targets = [0, timeStore.get()];
     for (const entry of timeline.video) {
       if (entry.clip.id === exceptId) continue;
       targets.push(entry.start, entry.end);
@@ -68,7 +75,7 @@ export default function Timeline({
       }
     }
     return targets;
-  }, [timeline.video, timeline.audio, playhead]);
+  }, [timeline.video, timeline.audio, timeStore]);
 
   const snap = useCallback((value, exceptId) => {
     const tolerance = SNAP_PIXELS / pixelsPerSecond;
@@ -112,6 +119,21 @@ export default function Timeline({
       const drag = dragRef.current;
       if (!drag) return;
       const pointerTime = timeAt(event.clientX);
+
+      if (drag.mode === 'scrub') {
+        // Park the latest pointer time and flush once per frame: the rAF
+        // callback reads the ref, so a fast drag coalesces to latest-wins
+        // rather than queueing a seek per pointermove.
+        scrubTimeRef.current = pointerTime;
+        if (scrubFrameRef.current === null) {
+          scrubFrameRef.current = requestAnimationFrame(() => {
+            scrubFrameRef.current = null;
+            onSeek(scrubTimeRef.current);
+          });
+        }
+        return;
+      }
+
       const move = drag.kind === 'audio' ? onMoveAudioClip : onMoveClip;
       const trim = drag.kind === 'audio' ? onTrimAudioClip : onTrimClip;
 
@@ -134,6 +156,10 @@ export default function Timeline({
     const onUp = () => {
       dragRef.current = null;
       setDragging(null);
+      if (scrubFrameRef.current !== null) {
+        cancelAnimationFrame(scrubFrameRef.current);
+        scrubFrameRef.current = null;
+      }
     };
 
     window.addEventListener('pointermove', onMove);
@@ -144,11 +170,24 @@ export default function Timeline({
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
     };
-  }, [dragging, timeAt, snap, onMoveClip, onTrimClip, onMoveAudioClip, onTrimAudioClip]);
+  }, [dragging, timeAt, snap, onSeek, onMoveClip, onTrimClip, onMoveAudioClip, onTrimAudioClip]);
 
-  const seekFromEvent = (event) => {
+  /**
+   * Ruler-drag scrubbing — the standard NLE gesture. Down seeks immediately
+   * and arms the same window listeners the clip drags use; the picture then
+   * follows the pointer until release. Scrubbing pauses playback (arrow-key
+   * stepping deliberately does not).
+   */
+  const startScrub = (event) => {
     if (dragRef.current) return;
+    event.preventDefault();
+    dragRef.current = { mode: 'scrub' };
+    setDragging({ mode: 'scrub' });
+    onScrubStart?.();
     onSeek(timeAt(event.clientX));
+    try {
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+    } catch { /* not capturable; window listeners still cover it */ }
   };
 
   const overrideFor = (clipId) => (
@@ -158,7 +197,7 @@ export default function Timeline({
   return (
     <div className={`edit-timeline ${dragging ? `is-dragging mode-${dragging.mode}` : ''}`}>
       <div className="edit-scroll" style={{ width }}>
-        <div className="edit-ruler" onPointerDown={seekFromEvent}>
+        <div className="edit-ruler" onPointerDown={startScrub}>
           {ticks.map(tick => (
             <span
               key={tick.time}
@@ -178,7 +217,7 @@ export default function Timeline({
           className="edit-track"
           ref={trackRef}
           onPointerDown={(event) => {
-            if (event.target === event.currentTarget) seekFromEvent(event);
+            if (event.target === event.currentTarget) startScrub(event);
           }}
         >
           {timeline.video.map(entry => (
@@ -221,7 +260,7 @@ export default function Timeline({
             <div
               className="edit-track is-audio"
               onPointerDown={(event) => {
-                if (event.target === event.currentTarget) seekFromEvent(event);
+                if (event.target === event.currentTarget) startScrub(event);
               }}
             >
               {trackEntry.clips.map(entry => (
@@ -240,13 +279,33 @@ export default function Timeline({
           </React.Fragment>
         ))}
 
-        <div
-          className="edit-playhead"
-          style={{ left: TRACK_PADDING + playhead * pixelsPerSecond }}
-        />
+        <PlayheadMarker store={timeStore} pixelsPerSecond={pixelsPerSecond} />
       </div>
     </div>
   );
+}
+
+/**
+ * The playhead line, off the React render path: subscribes to the time store
+ * and writes a transform directly, quantized to whole pixels so a sub-pixel
+ * time change costs nothing.
+ */
+function PlayheadMarker({ store, pixelsPerSecond }) {
+  const ref = useRef(null);
+
+  useEffect(() => {
+    let lastPx = null;
+    const write = (time) => {
+      const px = Math.round(TRACK_PADDING + time * pixelsPerSecond);
+      if (px === lastPx || !ref.current) return;
+      lastPx = px;
+      ref.current.style.transform = `translateX(${px}px)`;
+    };
+    write(store.get());
+    return store.subscribe(write);
+  }, [store, pixelsPerSecond]);
+
+  return <div ref={ref} className="edit-playhead" style={{ left: 0 }} />;
 }
 
 function TrackHead({ track, index, anySolo, onField, onRemove }) {
@@ -289,7 +348,10 @@ function TrackHead({ track, index, anySolo, onField, onRemove }) {
   );
 }
 
-function Clip({ entry, kind, pixelsPerSecond, selected, overrideStart, dragging, onStartDrag }) {
+// Memoized: during playback and scrubbing its props are now stable (time
+// updates no longer render the Timeline at all), and during a drag only the
+// dragged clip's props change.
+const Clip = React.memo(function Clip({ entry, kind, pixelsPerSecond, selected, overrideStart, dragging, onStartDrag }) {
   const width = Math.max(4, entry.length * pixelsPerSecond);
   const start = overrideStart === null || overrideStart === undefined ? entry.start : overrideStart;
   const isAudio = kind === 'audio';
@@ -346,7 +408,7 @@ function Clip({ entry, kind, pixelsPerSecond, selected, overrideStart, dragging,
       )}
     </div>
   );
-}
+});
 
 /** Round tick spacing to something readable at the current zoom. */
 function buildTicks(duration, pixelsPerSecond) {
