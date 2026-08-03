@@ -8,6 +8,8 @@
 
 import { modelCapabilities, refImageCapacity, refTagToken, usesRefTags } from './catalog.js';
 import { assetTemplateText, fillTemplate } from './prompts.js';
+import { resolveShotReferences } from './references.js';
+import { collectAssetReferences, orderEntriesByRole } from './refResolver.js';
 
 export const ASSET_TYPES = [
   { id: 'character', label: 'Character' },
@@ -320,16 +322,30 @@ export function composeGenerationPrompt({
   attachTaggedImages = true,
   excludedImagePaths = [],
   type = 'image',
-  modelId = ''
+  modelId = '',
+  // Reference-board wiring (Phase 4). All optional; with every one absent the
+  // composition is byte-identical to what it always produced — that is the
+  // compat gate the existing tests hold.
+  references = [],
+  assignments = [],
+  shot = null,
+  scene = null,
+  autoAttachRefs = true
 }) {
   const scan = scanPromptTags(prompt, assetLibrary);
+  const boardWired = Boolean(shot || (references && references.length) || (assignments && assignments.length));
+  const { refKinds } = modelCapabilities(type, modelId);
+  // A shot's per-reference opt-outs apply to everything the board contributes,
+  // whichever path it arrives by.
+  const refExclusions = new Set(shot?.refExclusions || []);
 
   // 1. Decide the images and their order, before a word of the prompt is
   //    written — on a pointer model the slot number *is* the reference.
   const ordered = [];
   const byPath = new Map();
-  const push = (imagePath, origin, label, asset) => {
+  const push = (imagePath, origin, label, asset, refId = null) => {
     if (!imagePath || (Array.isArray(excludedImagePaths) && excludedImagePaths.includes(imagePath))) return;
+    if (refId && refExclusions.has(refId)) return;
     const existing = byPath.get(imagePath);
     if (existing) {
       // The same file picked by hand *and* pulled in by a tag is one image, but
@@ -341,14 +357,51 @@ export function composeGenerationPrompt({
       }
       return;
     }
-    const entry = { path: imagePath, origin, label, asset: asset || null };
+    const entry = { path: imagePath, origin, label, asset: asset || null, refId };
     byPath.set(imagePath, entry);
     ordered.push(entry);
   };
 
+  // Explicit beats automatic: hand-picked paths, then shot-pinned edges, then
+  // inherited scene/project edges, then whatever a <Tag> drags in.
   primaryImagePaths.forEach(p => push(p, 'primary', type === 'video' ? 'Shot image' : 'Selected reference'));
+
+  if (boardWired && shot) {
+    const entries = resolveShotReferences({ shot, scene, references, assignments })
+      .filter(entry => entry.enabled && entry.ref.path);
+    const pinned = entries.filter(entry => entry.scope === 'shot');
+    const inherited = entries.filter(entry => entry.scope !== 'shot');
+    orderEntriesByRole(pinned, refKinds).forEach(entry => (
+      push(entry.ref.path, 'pinned', entry.ref.name || 'Pinned reference', null, entry.ref.id)
+    ));
+    orderEntriesByRole(inherited, refKinds).forEach(entry => (
+      push(entry.ref.path, 'inherited', entry.ref.name || `${entry.scope} reference`, null, entry.ref.id)
+    ));
+  }
+
   if (attachTaggedImages) {
-    taggedImagePaths(scan.assets).forEach(({ path, asset }) => push(path, 'tag', `<${asset.tag}>`, asset));
+    if (boardWired && autoAttachRefs) {
+      // Round-robin by rank across tagged assets: every asset lands its
+      // primary before any asset spends spare capacity on a second image —
+      // the same fairness rule the one-image-per-asset behaviour existed for,
+      // now extended to the model's real slot count.
+      const perAsset = scan.assets.map(asset => ({
+        asset,
+        candidates: collectAssetReferences({ asset, references, refKinds })
+          .filter(candidate => !candidate.refId || !refExclusions.has(candidate.refId))
+      }));
+      const maxRank = perAsset.reduce((max, { candidates }) => Math.max(max, candidates.length), 0);
+      for (let rank = 0; rank < maxRank; rank++) {
+        perAsset.forEach(({ asset, candidates }) => {
+          const candidate = candidates[rank];
+          if (!candidate) return;
+          const label = candidate.reason === 'primary' ? `<${asset.tag}>` : `<${asset.tag}> · ${candidate.reason}`;
+          push(candidate.path, 'auto-tag', label, asset, candidate.refId || null);
+        });
+      }
+    } else {
+      taggedImagePaths(scan.assets).forEach(({ path, asset }) => push(path, 'tag', `<${asset.tag}>`, asset));
+    }
   }
 
   const capacity = refImageCapacity(type, modelId);

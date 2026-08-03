@@ -67,6 +67,7 @@ export default function SettingsPanel({
   assetTypeModels, setAssetTypeModel,
   attachTagsForImages, setAttachTagsForImages,
   attachTagsForVideos, setAttachTagsForVideos,
+  autoAttachRefs, setAutoAttachRefs,
   atlasSafetyChecker, setAtlasSafetyChecker,
   theme, onToggleTheme,
   promptSettings, setPromptSetting, resetPromptSetting,
@@ -319,6 +320,10 @@ export default function SettingsPanel({
                   <label className="settings-check">
                     <input type="checkbox" checked={attachTagsForVideos} onChange={(e) => setAttachTagsForVideos(e.target.checked)} />
                     <span>Attach on video generation <em>recommended off — animate the shot’s own image</em></span>
+                  </label>
+                  <label className="settings-check">
+                    <input type="checkbox" checked={autoAttachRefs !== false} onChange={(e) => setAutoAttachRefs(e.target.checked)} />
+                    <span>Auto-attach linked board references <em>a &lt;Tag&gt; spends spare model slots on board images linked to that asset</em></span>
                   </label>
                 </section>
 

@@ -90,6 +90,7 @@ import {
   promptText
 } from './prompts.js';
 import {
+  KIND_BY_ASSET_TYPE,
   REFERENCE_SCHEMA_VERSION,
   assignReferences,
   enabledReferencePaths,
@@ -268,6 +269,11 @@ export default function App() {
   // identity-preserving model while environments use cheap t2i. Read by
   // resolveModelSettings between an asset's own override and the project default.
   const [assetTypeModels, setAssetTypeModels] = useState({});
+
+  // Whether a <Tag> may spend a model's spare input slots on board references
+  // linked to that asset (beyond the primary it always carried). Mirrors
+  // attachTagsForImages: a project-level behaviour switch.
+  const [autoAttachRefs, setAutoAttachRefs] = useState(true);
 
   // --- PROMPTS ---
   // Every editable prompt in one bag, keyed by the slot ids in prompts.js. A
@@ -580,6 +586,7 @@ export default function App() {
     setAtlasSafetyChecker(state.atlasSafetyChecker !== false);
     setCustomModelCaps(state.customModelCaps && typeof state.customModelCaps === 'object' ? state.customModelCaps : {});
     setAssetTypeModels(state.assetTypeModels && typeof state.assetTypeModels === 'object' ? state.assetTypeModels : {});
+    setAutoAttachRefs(state.autoAttachRefs !== false);
     // Only the fields a dream saved are stored, so unset ones follow the
     // project's current models rather than a pinned stale one.
     setDreamSettings(createDreamSettings(state.dreamSettings || {}));
@@ -640,6 +647,7 @@ export default function App() {
       atlasSafetyChecker,
       customModelCaps,
       assetTypeModels,
+      autoAttachRefs,
       dreamSettings: compactDreamSettings(dreamSettings),
       // Only the slots that differ from their defaults are written, so a future
       // change to a default still reaches projects that never edited it.
@@ -724,7 +732,7 @@ export default function App() {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, customModelCaps, assetTypeModels, promptSettings, concatenatedVideo, edit, dreamSettings]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, customModelCaps, assetTypeModels, autoAttachRefs, promptSettings, concatenatedVideo, edit, dreamSettings]);
 
   // --- UNDO / REDO ----------------------------------------------------------
 
@@ -1347,6 +1355,9 @@ export default function App() {
   // --- PROMPT COMPOSITION ---
   // The single place where a raw shot prompt becomes the string a model sees:
   // global pre/post prompt + <Tag> substitution + reference image resolution.
+  // `wrap.shot` wires the reference board in: with it, tags auto-attach their
+  // linked board references and the shot's pinned/inherited edges resolve at
+  // generation time, all under the model's capacity.
   const buildPrompt = (type, rawPrompt, modelId, primaryImagePaths = [], attachTaggedImages = null, excludedImagePaths = [], wrap = {}) => applyPromptOverride(composeGenerationPrompt({
     prompt: rawPrompt,
     // The pre/post prompt is on unless this particular generation turned it
@@ -1360,7 +1371,12 @@ export default function App() {
       : attachTaggedImages,
     excludedImagePaths,
     type,
-    modelId
+    modelId,
+    references: referenceImages,
+    assignments: refAssignments,
+    shot: wrap.shot || null,
+    scene: wrap.shot ? sceneOfShot(wrap.shot.id) : null,
+    autoAttachRefs
   }), wrap.promptOverride);
 
   const handleDeselectSentImage = (imagePath, origin) => {
@@ -1411,7 +1427,10 @@ export default function App() {
     excludedImagePaths = [], usePrePrompt = true, usePostPrompt = true, promptOverride = null
   }) => {
     const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const composed = buildPrompt(type, rawPrompt, model, primaryImagePaths, attachTaggedImages, excludedImagePaths, { usePrePrompt, usePostPrompt, promptOverride });
+    const composed = buildPrompt(type, rawPrompt, model, primaryImagePaths, attachTaggedImages, excludedImagePaths, {
+      usePrePrompt, usePostPrompt, promptOverride,
+      shot: shots.find(s => s.id === shotId) || null
+    });
 
     setBatchJobs(prev => [{
       id: jobId,
@@ -2279,6 +2298,21 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'Image API request failed');
 
       attachImageToAsset(asset.id, data.filePath);
+      // The board indexes everything the resolver can auto-attach, so a
+      // generated asset image registers itself — linked, kinded and tagged.
+      // Shot outputs deliberately do not (they would flood the board with
+      // takes); the gallery's "Add to ref board" action covers those.
+      setReferenceImages(prev => {
+        if (prev.some(r => r.path === data.filePath)) return prev;
+        return [...prev, normalizeReference({
+          path: data.filePath,
+          name: `${asset.name || asset.tag} ${(asset.images || []).length + 1}`,
+          kind: KIND_BY_ASSET_TYPE[asset.type] || 'other',
+          assetId: asset.id,
+          tags: asset.tag ? [asset.tag] : [],
+          source: 'generated'
+        })];
+      });
       setImageGallery(prev => [{
         id: `img_asset_${Date.now()}`,
         path: data.filePath,
@@ -3934,6 +3968,39 @@ export default function App() {
     setRefAssignments(prev => setEdgeEnabled(prev, entry.edge.id, !entry.enabled));
   };
 
+  /**
+   * One-click "Add to ref board" for gallery stills. Shot outputs are never
+   * auto-registered (they would flood the board with takes); this is the
+   * deliberate opt-in for the keepers.
+   */
+  const handleAddPathToBoard = (path, name = '') => {
+    if (!path) return;
+    if (referenceImages.some(r => r.path === path)) {
+      showToast('Already on the reference board.', 'warning');
+      return;
+    }
+    setReferenceImages(prev => [normalizeReference({
+      path,
+      name: String(name).replace(/\.[^.]+$/, '') || 'Still',
+      source: 'generated'
+    }), ...prev]);
+    showToast('Added to the reference board.', 'success');
+  };
+
+  /** Promote an auto/inherited reference to a shot-scope edge — it survives model swaps and batches. */
+  const handlePinReferenceToShot = (shotId, refId) => {
+    setRefAssignments(prev => assignReferences(prev, [refId], [{ scope: 'shot', targetId: shotId }]));
+    showToast('Reference pinned to this shot.', 'success');
+  };
+
+  /** Opt this shot out of a board-contributed reference (auto-attached or inherited). */
+  const handleExcludeReferenceFromShot = (shot, refId) => {
+    const current = shot.refExclusions || [];
+    if (!current.includes(refId)) {
+      handleUpdateShotField(shot.id, 'refExclusions', [...current, refId]);
+    }
+  };
+
   const toggleSceneReferenceEntry = (entry) => {
     // A project-wide reference is only shown here for context. Toggling it from
     // a scene header would quietly switch it off for the whole film, which is
@@ -5135,6 +5202,14 @@ export default function App() {
                                               Select
                                             </button>
                                             <button
+                                              className="btn btn-secondary"
+                                              style={{ padding: '2px 6px', fontSize: '0.7rem' }}
+                                              onClick={() => handleAddPathToBoard(out.path, `${shot.name} ${out.name}`)}
+                                              title="Add to ref board"
+                                            >
+                                              + Board
+                                            </button>
+                                            <button
                                               className="btn btn-danger"
                                               style={{ padding: '4px' }}
                                               onClick={() => handleDeleteNestedOutput(shot.id, 'image', activeImagePromptGroup.id, out.id)}
@@ -5274,7 +5349,10 @@ export default function App() {
           genModalInputImages,
           genModalAttachTags,
           genModalExcludedImages,
-          { usePrePrompt: genModalUsePre, usePostPrompt: genModalUsePost, promptOverride: genModalOverride }
+          {
+            usePrePrompt: genModalUsePre, usePostPrompt: genModalUsePost, promptOverride: genModalOverride,
+            shot: shots.find(s => s.id === generationModal.shotId) || null
+          }
         );
         const modalPre = genModalUsePre
           ? (generationModal.type === 'image' ? prePrompt : videoPrePrompt)
@@ -5552,9 +5630,19 @@ export default function App() {
                         </span>
                       ) : (
                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                          {preview.imageSources.map((entry, index) => (
+                          {preview.imageSources.map((entry, index) => {
+                            const modalShot = shots.find(s => s.id === generationModal.shotId);
+                            const originColor = {
+                              primary: 'var(--success)',
+                              pinned: 'var(--primary)',
+                              inherited: '#38bdf8',
+                              'auto-tag': 'var(--warning, #f59e0b)',
+                              tag: 'var(--warning, #f59e0b)'
+                            }[entry.origin] || 'var(--primary)';
+                            const boardEntry = Boolean(entry.refId);
+                            return (
                             <div key={entry.path} style={{ width: '86px', textAlign: 'center', position: 'relative' }}>
-                              <div style={{ position: 'relative', height: '58px', borderRadius: '4px', overflow: 'hidden', border: `2px solid ${entry.origin === 'primary' ? 'var(--success)' : 'var(--primary)'}`, background: '#000' }}>
+                              <div style={{ position: 'relative', height: '58px', borderRadius: '4px', overflow: 'hidden', border: `2px solid ${originColor}`, background: '#000' }}>
                                 <AssetImage path={entry.path} alt={entry.label} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                                 {/* On a pointer model this badge is not
                                     decoration — it is the name the prompt
@@ -5562,6 +5650,19 @@ export default function App() {
                                 <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '0.6rem', fontWeight: 'bold', background: entry.token ? 'var(--primary)' : 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '0 4px' }}>
                                   {entry.token || index + 1}
                                 </span>
+                                {/* Pin: turn an automatic or inherited pick into
+                                    a shot-scope edge that survives everything. */}
+                                {boardEntry && modalShot && (entry.origin === 'auto-tag' || entry.origin === 'inherited') && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ position: 'absolute', bottom: '2px', left: '2px', padding: '1px 4px', fontSize: '0.6rem', zIndex: 3, cursor: 'pointer' }}
+                                    onClick={(e) => { e.stopPropagation(); handlePinReferenceToShot(modalShot.id, entry.refId); }}
+                                    title="Pin to this shot"
+                                  >
+                                    📌
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="btn btn-danger"
@@ -5581,18 +5682,28 @@ export default function App() {
                                   }}
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleDeselectSentImage(entry.path, entry.origin);
+                                    // Board-contributed entries opt out per shot
+                                    // (persists); recipe-only ones just leave
+                                    // this generation.
+                                    if (boardEntry && modalShot && entry.origin !== 'primary') {
+                                      handleExcludeReferenceFromShot(modalShot, entry.refId);
+                                    } else {
+                                      handleDeselectSentImage(entry.path, entry.origin);
+                                    }
                                   }}
                                   title={`Deselect ${entry.label}`}
                                 >
                                   <X size={10} />
                                 </button>
                               </div>
-                              <span style={{ fontSize: '0.62rem', color: entry.origin === 'primary' ? 'var(--success)' : 'var(--primary-hover)', display: 'block', marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                {entry.label}
+                              <span
+                                title={`${entry.label} — ${entry.origin}`}
+                                style={{ fontSize: '0.62rem', color: originColor, display: 'block', marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                              >
+                                {entry.origin === 'primary' ? '' : `${entry.origin} · `}{entry.label}
                               </span>
                             </div>
-                          ))}
+                          ); })}
                         </div>
                       )}
 
@@ -7245,6 +7356,13 @@ export default function App() {
                             </button>
                           </div>
                           <button
+                            className="btn btn-secondary"
+                            style={{ padding: '4px', width: '100%', fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}
+                            onClick={() => handleAddPathToBoard(img.path, img.name)}
+                          >
+                            + Add to ref board
+                          </button>
+                          <button
                             className="btn btn-danger"
                             style={{ padding: '4px', width: '100%', fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}
                             onClick={() => handleDeleteAsset('images', img.id)}
@@ -7517,6 +7635,7 @@ export default function App() {
           })}
           attachTagsForImages={attachTagsForImages} setAttachTagsForImages={setAttachTagsForImages}
           attachTagsForVideos={attachTagsForVideos} setAttachTagsForVideos={setAttachTagsForVideos}
+          autoAttachRefs={autoAttachRefs} setAutoAttachRefs={setAutoAttachRefs}
           atlasSafetyChecker={atlasSafetyChecker} setAtlasSafetyChecker={setAtlasSafetyChecker}
           theme={theme} onToggleTheme={handleToggleTheme}
           promptSettings={promptSettings}
