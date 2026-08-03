@@ -345,6 +345,35 @@ export async function listAssetImages() {
   }
 }
 
+// Everything the media bin can pull from the project folder, by extension —
+// the browser twin of the server's /api/project-media.
+const MEDIA_EXTENSIONS = {
+  image: IMAGE_EXTENSIONS,
+  video: ['.mp4', '.mov', '.webm', '.m4v'],
+  audio: ['.wav', '.mp3', '.m4a', '.aac', '.ogg', '.flac']
+};
+
+export async function listAssetMedia() {
+  try {
+    const dir = await getAssetsDir(false);
+    const media = [];
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind !== 'file') continue;
+      const lower = name.toLowerCase();
+      const type = Object.keys(MEDIA_EXTENSIONS)
+        .find(kind => MEDIA_EXTENSIONS[kind].some(ext => lower.endsWith(ext)));
+      if (!type) continue;
+      let mtime = 0;
+      try { mtime = (await handle.getFile()).lastModified; } catch { /* listed anyway */ }
+      media.push({ name, path: `assets/${name}`, type, mtime });
+    }
+    return media.sort((a, b) => b.mtime - a.mtime);
+  } catch (error) {
+    if (error.name === 'NotFoundError') return [];
+    throw error;
+  }
+}
+
 /** Copy every asset referenced by another project's library into this one. */
 export async function copyAssetsFrom(sourceDirHandle, assetPaths) {
   const targetDir = await getAssetsDir();

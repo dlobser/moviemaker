@@ -14,6 +14,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link2, Link2Off, Volume2, VolumeX, Headphones, Trash2 } from 'lucide-react';
+import { BIN_DRAG_TYPE } from './MediaBin.jsx';
 
 const TRACK_PADDING = 12;
 
@@ -32,6 +33,7 @@ export default function Timeline({
   onSelect,
   onSeek,
   onScrubStart,
+  onDropAsset,
   onMoveClip,
   onTrimClip,
   onMoveAudioClip,
@@ -172,6 +174,37 @@ export default function Timeline({
     };
   }, [dragging, timeAt, snap, onSeek, onMoveClip, onTrimClip, onMoveAudioClip, onTrimAudioClip]);
 
+  // --- bin drops (native DnD; separate world from the pointer drags) --------
+
+  const dropLineRef = useRef(null);
+
+  const binDragOver = (event) => {
+    if (![...event.dataTransfer.types].includes(BIN_DRAG_TYPE)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    // Same direct-DOM technique as the playhead: an indicator line, no renders.
+    if (dropLineRef.current) {
+      const px = Math.round(TRACK_PADDING + timeAt(event.clientX) * pixelsPerSecond);
+      dropLineRef.current.style.display = 'block';
+      dropLineRef.current.style.transform = `translateX(${px}px)`;
+    }
+  };
+
+  const binDragLeave = () => {
+    if (dropLineRef.current) dropLineRef.current.style.display = 'none';
+  };
+
+  const binDrop = (target) => (event) => {
+    const data = event.dataTransfer.getData(BIN_DRAG_TYPE);
+    if (!data) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (dropLineRef.current) dropLineRef.current.style.display = 'none';
+    try {
+      onDropAsset?.(JSON.parse(data), timeAt(event.clientX), target);
+    } catch { /* malformed payload — nothing to place */ }
+  };
+
   /**
    * Ruler-drag scrubbing — the standard NLE gesture. Down seeks immediately
    * and arms the same window listeners the clip drags use; the picture then
@@ -195,7 +228,11 @@ export default function Timeline({
   );
 
   return (
-    <div className={`edit-timeline ${dragging ? `is-dragging mode-${dragging.mode}` : ''}`}>
+    <div
+      className={`edit-timeline ${dragging ? `is-dragging mode-${dragging.mode}` : ''}`}
+      onDragOver={binDragOver}
+      onDrop={binDrop({ kind: 'auto' })}
+    >
       <div className="edit-scroll" style={{ width }}>
         <div className="edit-ruler" onPointerDown={startScrub}>
           {ticks.map(tick => (
@@ -219,6 +256,9 @@ export default function Timeline({
           onPointerDown={(event) => {
             if (event.target === event.currentTarget) startScrub(event);
           }}
+          onDragOver={binDragOver}
+          onDragLeave={binDragLeave}
+          onDrop={binDrop({ kind: 'video' })}
         >
           {timeline.video.map(entry => (
             <Clip
@@ -262,6 +302,9 @@ export default function Timeline({
               onPointerDown={(event) => {
                 if (event.target === event.currentTarget) startScrub(event);
               }}
+              onDragOver={binDragOver}
+              onDragLeave={binDragLeave}
+              onDrop={binDrop({ kind: 'audio', trackId: trackEntry.track.id })}
             >
               {trackEntry.clips.map(entry => (
                 <Clip
@@ -280,6 +323,7 @@ export default function Timeline({
         ))}
 
         <PlayheadMarker store={timeStore} pixelsPerSecond={pixelsPerSecond} />
+        <div ref={dropLineRef} className="edit-dropline" style={{ display: 'none', left: 0 }} />
       </div>
     </div>
   );

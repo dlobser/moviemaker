@@ -11,7 +11,7 @@
 
 import { loadCredentials, saveCredentials } from './static/keyStore.js';
 import {
-  readProjectState, writeProjectState, listAssetImages,
+  readProjectState, writeProjectState, listAssetImages, listAssetMedia,
   importFile, getAssetObjectUrl, getActiveName, getActiveHandle,
   isFileSystemAccessSupported,
   listCheckpoints, writeCheckpoint, readCheckpoint, deleteCheckpoint
@@ -142,6 +142,10 @@ export async function apiFetch(path, options = {}) {
       return asResponse(await listAssetImages());
     }
 
+    if (route === '/api/project-media') {
+      return asResponse(await listAssetMedia());
+    }
+
     // The hosted build measures sources with a media element instead — see
     // edit/durations.js. An empty result keeps a stray caller from treating
     // this as a failure.
@@ -152,7 +156,10 @@ export async function apiFetch(path, options = {}) {
     if (route === '/api/upload') {
       const file = options.body?.get?.('file');
       if (!file) return errorResponse('No file provided', 400);
-      const filePath = await importFile(file, file.type?.startsWith('audio') ? 'audio' : 'ref');
+      const prefix = file.type?.startsWith('audio') ? 'audio'
+        : file.type?.startsWith('video') ? 'video'
+        : 'ref';
+      const filePath = await importFile(file, prefix);
       return asResponse({ filePath, originalName: file.name, mimeType: file.type });
     }
 

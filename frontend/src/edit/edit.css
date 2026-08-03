@@ -89,6 +89,91 @@
   display: flex;
 }
 
+/* --- media bin ------------------------------------------------------------ */
+
+.edit-bin {
+  flex: 0 0 220px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-light);
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+.edit-bin.is-drop {
+  outline: 2px dashed var(--accent);
+  outline-offset: -4px;
+}
+
+.edit-bin-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 0.8rem;
+}
+
+.edit-bin-head strong { flex: 1; }
+
+.edit-bin-empty {
+  padding: 12px 10px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.edit-bin-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.edit-bin-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 0.74rem;
+  border-bottom: 1px solid var(--border-light);
+  cursor: grab;
+  background: none;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+  color: inherit;
+  text-align: left;
+  width: 100%;
+}
+
+.edit-bin-row:hover { background: rgba(139, 92, 246, 0.08); }
+.edit-bin-row.as-button { cursor: pointer; }
+
+.edit-bin-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.edit-bin-length {
+  color: var(--text-dim);
+  font-size: 0.68rem;
+}
+
+/* Drop-position indicator, driven by direct DOM writes like the playhead. */
+.edit-dropline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--success, #22c55e);
+  pointer-events: none;
+  z-index: 4;
+}
+
 .edit-stage {
   flex: 1 1 auto;
   min-width: 0;

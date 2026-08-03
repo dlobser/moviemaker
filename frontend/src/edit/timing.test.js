@@ -475,3 +475,43 @@ test('with nothing measured yet the current settings stand', () => {
   const settings = pickDefaultSettings(['assets/unknown.mp4'], durations, { width: 720, height: 480, fps: 30 });
   assert.deepEqual(settings, { width: 720, height: 480, fps: 30 });
 });
+
+// --- Phase B: the media bin --------------------------------------------------
+
+test('a per-clip stillSeconds outranks the shot duration and the fallback', () => {
+  const ctx = makeContext(scenes, durations, 5);
+  const shotStill = { id: 'x1', source: { kind: 'shot', shotId: 'sh3' }, in: 0, out: null };
+  assert.equal(clipLength(shotStill, ctx), 3, 'shot videoDuration still wins with no per-clip value');
+  assert.equal(clipLength({ ...shotStill, stillSeconds: 7.5 }, ctx), 7.5);
+
+  const binStill = { id: 'x2', source: { kind: 'asset', path: 'assets/pic.png', stream: 'image' }, in: 0, out: null };
+  assert.equal(clipLength(binStill, ctx), 5, 'a bin still with nothing set holds the project default');
+  assert.equal(clipLength({ ...binStill, stillSeconds: 2 }, ctx), 2);
+});
+
+test('an asset image source resolves as an image, not a video', () => {
+  const resolved = resolveClipSource(
+    { source: { kind: 'asset', path: 'assets/pic.png', name: 'pic', stream: 'image' } },
+    scenes
+  );
+  assert.equal(resolved.kind, 'image');
+  assert.equal(resolved.path, 'assets/pic.png');
+});
+
+test('the bin migrates: junk dropped, fields defaulted, and its paths get probed', async () => {
+  const { migrateEdit, collectSourcePaths } = await import('./model.js');
+  const edit = migrateEdit({
+    bin: [
+      { path: 'assets/music.mp3', type: 'audio' },
+      { path: 'assets/clip.mp4' },          // no type: defaults to video
+      { name: 'orphan with no path' },      // dropped
+      null
+    ]
+  });
+  assert.equal(edit.bin.length, 2);
+  assert.equal(edit.bin[0].type, 'audio');
+  assert.equal(edit.bin[1].type, 'video');
+  assert.ok(edit.bin.every(item => item.id && item.addedAt));
+  const paths = collectSourcePaths(edit, []);
+  assert.ok(paths.includes('assets/music.mp3') && paths.includes('assets/clip.mp4'));
+});

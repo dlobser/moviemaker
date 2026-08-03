@@ -228,7 +228,9 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname);
-    const prefix = file.fieldname === 'audio' ? 'audio' : 'ref';
+    const prefix = file.fieldname === 'audio' || file.mimetype?.startsWith('audio/') ? 'audio'
+      : file.mimetype?.startsWith('video/') ? 'video'
+      : 'ref';
     cb(null, `${prefix}_${Date.now()}${ext}`);
   }
 });
@@ -504,6 +506,37 @@ app.get('/api/project-images', (req, res) => {
         };
       });
     res.json(images);
+  } catch (err) {
+    console.error('Error reading assets directory:', err);
+    res.status(500).json({ error: 'Failed to read assets directory' });
+  }
+});
+
+// Everything the media bin can pull from the project folder, classified by
+// extension. /api/project-images stays untouched (older pickers read it).
+const MEDIA_EXTENSIONS = {
+  image: ['.png', '.jpg', '.jpeg', '.webp', '.gif'],
+  video: ['.mp4', '.mov', '.webm', '.m4v'],
+  audio: ['.wav', '.mp3', '.m4a', '.aac', '.ogg', '.flac']
+};
+
+app.get('/api/project-media', (req, res) => {
+  try {
+    if (!fs.existsSync(getAssetsDir())) {
+      return res.json([]);
+    }
+    const media = fs.readdirSync(getAssetsDir())
+      .map(file => {
+        const ext = path.extname(file).toLowerCase();
+        const type = Object.keys(MEDIA_EXTENSIONS).find(kind => MEDIA_EXTENSIONS[kind].includes(ext));
+        if (!type) return null;
+        let mtime = 0;
+        try { mtime = fs.statSync(path.join(getAssetsDir(), file)).mtimeMs; } catch { /* listed anyway */ }
+        return { name: file, path: `assets/${file}`, type, mtime };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);
+    res.json(media);
   } catch (err) {
     console.error('Error reading assets directory:', err);
     res.status(500).json({ error: 'Failed to read assets directory' });

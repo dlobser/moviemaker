@@ -9,7 +9,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   X, Play, Pause, SkipBack, ZoomIn, ZoomOut, RefreshCw, Wand2, Plus,
   Scissors, Trash2, RotateCcw, Music, Link2, Link2Off, Download, AlertTriangle,
-  GitCompare
+  GitCompare, FolderOpen
 } from 'lucide-react';
 
 import { apiFetch, resolveAssetUrl } from '../client.js';
@@ -17,6 +17,8 @@ import {
   collectSourcePaths,
   createAudioClip,
   createAudioTrack,
+  createBinItem,
+  createVideoClip,
   deriveAudioClipsForShots,
   deriveVideoClips,
   pickDefaultSettings
@@ -35,6 +37,7 @@ import { buildRenderPlan, missingSources } from './renderPlan.js';
 import { PreviewEngine } from './PreviewEngine.js';
 import { createTimeStore } from './timeStore.js';
 import Timeline from './Timeline.jsx';
+import MediaBin from './MediaBin.jsx';
 import './edit.css';
 
 const ZOOM_STEPS = [2, 4, 8, 16, 32, 64, 128];
@@ -56,6 +59,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
   const [selection, setSelection] = useState(null);
   const [zoom, setZoom] = useState(16);
   const [probing, setProbing] = useState(false);
+  const [binOpen, setBinOpen] = useState(false);
 
   const ctx = useMemo(
     () => makeContext(scenes, edit.durations, Number(videoDuration) || 5),
@@ -235,10 +239,23 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
   };
 
   const rebuildFromShots = () => {
-    setEdit(previous => normalize(
-      withDerivedAudio({ ...previous, video: deriveVideoClips(scenes) }, scenes),
-      ctx
-    ));
+    // Imported (asset-kind) clips are real cutting work, not derivable from
+    // the shot list — keep them, appended after the fresh sequence, and say so.
+    const imported = (edit.video || []).filter(clip => clip.source?.kind === 'asset');
+    if (imported.length > 0) {
+      const ok = window.confirm(
+        `Rebuild the running order from the shot list?\n\n`
+        + `${imported.length} imported clip${imported.length === 1 ? '' : 's'} (from the bin) will be kept and moved to the end.`
+      );
+      if (!ok) return;
+    }
+    setEdit(previous => {
+      const kept = (previous.video || []).filter(clip => clip.source?.kind === 'asset');
+      return normalize(
+        withDerivedAudio({ ...previous, video: [...deriveVideoClips(scenes), ...kept] }, scenes),
+        ctx
+      );
+    });
     setSelection(null);
     seek(0);
   };
@@ -276,6 +293,100 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
       onToast?.(`Could not import audio: ${error.message}`, 'error');
     }
   };
+
+  // --- the media bin --------------------------------------------------------
+
+  const binTypeFor = (file) => (
+    file.type.startsWith('audio/') ? 'audio'
+      : file.type.startsWith('image/') ? 'image'
+      : 'video'
+  );
+
+  /** Upload files one at a time; a failure toasts and the rest continue. */
+  const handleImportBinFiles = async (files) => {
+    for (const file of files) {
+      try {
+        const body = new FormData();
+        body.append('file', file);
+        const res = await apiFetch('/api/upload', { method: 'POST', body });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'upload failed');
+        const item = createBinItem({ path: data.filePath, name: file.name, type: binTypeFor(file) });
+        setEdit(previous => ({ ...previous, bin: [...(previous.bin || []), item] }));
+      } catch (error) {
+        onToast?.(`Could not import ${file.name}: ${error.message}`, 'error');
+      }
+    }
+  };
+
+  /** Add files already in the project folder — no copy, they are already assets. */
+  const handleAddBinItems = (entries) => {
+    setEdit(previous => {
+      const inBin = new Set((previous.bin || []).map(item => item.path));
+      const additions = entries
+        .filter(entry => !inBin.has(entry.path))
+        .map(entry => createBinItem({ path: entry.path, name: entry.name, type: entry.type }));
+      return additions.length ? { ...previous, bin: [...(previous.bin || []), ...additions] } : previous;
+    });
+  };
+
+  /** Never deletes the file; clips already on the timeline keep their own path. */
+  const handleRemoveBinItem = (itemId) => {
+    setEdit(previous => ({ ...previous, bin: (previous.bin || []).filter(item => item.id !== itemId) }));
+  };
+
+  /** Smart mode: the slot whose midpoint the drop time falls before. */
+  const indexForTime = (time) => {
+    const at = timeline.video.findIndex(entry => entry.start + entry.length / 2 > time);
+    return at === -1 ? timeline.video.length : at;
+  };
+
+  const handleDropAsset = useCallback((item, time, target) => {
+    beginEdit();
+
+    // The container-level fallback: route by media type.
+    const resolvedTarget = target.kind === 'auto'
+      ? (item.type === 'audio' ? { kind: 'audio', trackId: null } : { kind: 'video' })
+      : target;
+
+    if (resolvedTarget.kind === 'video') {
+      if (item.type === 'audio') {
+        onToast?.('Audio belongs on an audio track — drop it lower.', 'warning');
+        return;
+      }
+      const clip = createVideoClip(
+        { kind: 'asset', path: item.path, name: item.name, stream: item.type === 'image' ? 'image' : 'video' },
+        edit.smart ? {} : { start: time }
+      );
+      const index = edit.smart ? indexForTime(time) : timeline.video.length;
+      setEdit(previous => {
+        const video = [...previous.video];
+        video.splice(Math.min(index, video.length), 0, clip);
+        return normalize({ ...previous, video }, ctx);
+      });
+      setSelection({ kind: 'video', id: clip.id });
+      return;
+    }
+
+    // Audio target. Video files are allowed here too — the clip pulls just the
+    // file's audio stream.
+    const clip = createAudioClip(
+      { kind: 'asset', path: item.path, name: item.name, stream: 'audio' },
+      { start: Math.max(0, time) }
+    );
+    if (resolvedTarget.trackId) {
+      setEdit(previous => addAudioClip(previous, resolvedTarget.trackId, clip));
+    } else {
+      const track = createAudioTrack(item.name.replace(/\.[^.]+$/, ''));
+      setEdit(previous => addAudioClip(
+        { ...previous, audio: [...(previous.audio || []), track] },
+        track.id,
+        clip
+      ));
+    }
+    setSelection({ kind: 'audio', id: clip.id });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [edit.smart, timeline.video, ctx, setEdit, beginEdit, onToast]);
 
   // --- rendering ------------------------------------------------------------
 
@@ -411,6 +522,13 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
             )}
           </div>
         )}
+        <button
+          className={`edit-btn ${binOpen ? 'toggle-on' : ''}`}
+          onClick={() => setBinOpen(open => !open)}
+          title="The media bin: bring any video, audio or image into the edit"
+        >
+          <FolderOpen size={14} /> Bin{(edit.bin || []).length > 0 ? ` (${edit.bin.length})` : ''}
+        </button>
         <button className="edit-btn" onClick={() => fileInputRef.current?.click()} title="Import music or voiceover onto a new track">
           <Music size={14} /> Add audio
         </button>
@@ -444,6 +562,17 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
       </header>
 
       <div className="edit-body">
+        {binOpen && (
+          <MediaBin
+            bin={edit.bin || []}
+            durations={edit.durations}
+            onImportFiles={handleImportBinFiles}
+            onAddItems={handleAddBinItems}
+            onRemove={handleRemoveBinItem}
+            onToast={onToast}
+          />
+        )}
+
         {/* The canvas is always mounted: the engine binds to it once, and a
             conditional render would leave it with nothing to draw on. */}
         <div className="edit-stage">
@@ -468,6 +597,12 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
               entry={selectedVideo}
               ctx={ctx}
               onTransition={handleTransition}
+              onStillSeconds={(value) => setEdit(previous => normalize({
+                ...previous,
+                video: previous.video.map(clip => (
+                  clip.id === selectedVideo.clip.id ? { ...clip, stillSeconds: value } : clip
+                ))
+              }, ctx))}
               onClipAudio={(patch) => setEdit(previous => ({
                 ...previous,
                 video: previous.video.map(clip => (
@@ -533,6 +668,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
         onSelect={setSelection}
         onSeek={seek}
         onScrubStart={() => engineRef.current?.pause()}
+        onDropAsset={handleDropAsset}
         onMoveClip={handleMoveClip}
         onTrimClip={handleTrimClip}
         onMoveAudioClip={handleMoveAudioClip}
@@ -576,7 +712,7 @@ function RenderButton({ render, disabled, onStart, onOpen }) {
 // --- inspectors -------------------------------------------------------------
 
 function VideoInspector({
-  entry, ctx, onTransition, onClipAudio, onDetach, onReattach, onResetTrim, onDelete, onSplit
+  entry, ctx, onTransition, onStillSeconds, onClipAudio, onDetach, onReattach, onResetTrim, onDelete, onSplit
 }) {
   const limit = maxOut(entry.clip, ctx);
   const transitionType = entry.transition?.type || 'cut';
@@ -607,6 +743,25 @@ function VideoInspector({
           Trimmed against a different take. The in and out points were kept and
           clamped to the new source — worth a look.
         </p>
+      )}
+
+      {/* Stills hold for an editable length — bin images and shot-stills alike. */}
+      {entry.resolved.kind === 'image' && (
+        <label className="edit-field">
+          <span>Hold for {entry.length.toFixed(1)}s</span>
+          <input
+            type="number"
+            min="0.5"
+            max="60"
+            step="0.5"
+            value={Number(entry.clip.stillSeconds) > 0 ? entry.clip.stillSeconds : ''}
+            placeholder={entry.length.toFixed(1)}
+            onChange={(event) => {
+              const value = Number(event.target.value);
+              onStillSeconds(Number.isFinite(value) && value > 0 ? Math.min(60, Math.max(0.5, value)) : null);
+            }}
+          />
+        </label>
       )}
 
       <label className="edit-field">
@@ -789,12 +944,23 @@ function TransportClock({ store, duration }) {
   );
 }
 
-/** Place any lip-sync audio the shots carry, on its own track. */
+/**
+ * Place any lip-sync audio the shots carry, on its own track.
+ *
+ * Tracks holding imported (asset-kind) audio survive: replacing `edit.audio`
+ * wholesale used to destroy a music bed every time the running order was
+ * rebuilt. Shot-derived dialogue tracks are dropped and rebuilt fresh; within
+ * a kept track, only its asset clips survive (its shot clips would dangle).
+ */
 function withDerivedAudio(edit, scenes) {
+  const keptTracks = (edit.audio || [])
+    .filter(track => (track.clips || []).some(clip => clip.source?.kind === 'asset'))
+    .map(track => ({ ...track, clips: track.clips.filter(clip => clip.source?.kind === 'asset') }));
+
   const clips = deriveAudioClipsForShots(scenes, edit.video);
-  if (clips.length === 0) return { ...edit, audio: [] };
+  if (clips.length === 0) return { ...edit, audio: keptTracks };
   const track = createAudioTrack('Dialogue');
-  return { ...edit, audio: [{ ...track, clips }] };
+  return { ...edit, audio: [...keptTracks, { ...track, clips }] };
 }
 
 /** The picture clip sitting under a given time, for linking against. */
