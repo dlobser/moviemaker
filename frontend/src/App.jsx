@@ -79,7 +79,13 @@ import {
 import PromptEditor, { EffectivePrompt } from './PromptEditor.jsx';
 import { buildLlmImportPrompt, extractJsonDocument, normalizeImportedShotList } from './shotListImport.js';
 import { apiFetch, resolveAssetUrl, detectMode, isStatic } from './client.js';
-import { createEmptyEdit, migrateEdit } from './edit/model.js';
+import {
+  createAudioTrack, createEmptyEdit, deriveAudioClipsForShots, deriveVideoClips, migrateEdit
+} from './edit/model.js';
+import { makeContext, normalize } from './edit/timing.js';
+import { reconcile } from './edit/reconcile.js';
+import { createPipelineRun, estimateRun } from './pipeline.js';
+import PipelinePanel from './PipelinePanel.jsx';
 import EditView from './edit/EditView.jsx';
 import { AssetImage, AssetVideo, useAssetUrl } from './AssetMedia.jsx';
 import * as projectFs from './static/fileSystem.js';
@@ -203,6 +209,11 @@ export default function App() {
   // as it stood AFTER the image stage finished).
   const scenesRef = useRef(scenes);
   useEffect(() => { scenesRef.current = scenes; }, [scenes]);
+
+  // Same for anything else a long-lived pipeline run must read fresh: React
+  // closures captured at run start go stale the moment a stage writes state.
+  const assetLibraryRef = useRef([]);
+  const pipelineFnsRef = useRef({});
 
   const [viewingPromptText, setViewingPromptText] = useState(null);
   const [frameCaptureChoice, setFrameCaptureChoice] = useState(null); // { imagePath, imageName, shotId }
@@ -353,6 +364,16 @@ export default function App() {
   const [scriptGenIdea, setScriptGenIdea] = useState('');
   const [scriptGenBusy, setScriptGenBusy] = useState(false);
   const [scriptGenPreview, setScriptGenPreview] = useState(null); // result of generateShotListFromIdea
+
+  // --- PIPELINE (one-button generate) ---
+  const [pipelineOpen, setPipelineOpen] = useState(false);
+  const [pipelineIdea, setPipelineIdea] = useState('');
+  const [pipelineSkip, setPipelineSkip] = useState(() => new Set());
+  const [pipelineRunState, setPipelineRunState] = useState(null); // last snapshot; persisted
+  const [pipelineEstimate, setPipelineEstimate] = useState(null);
+  const pipelineRunRef = useRef(null); // live controller
+  const pipelineIdeaRef = useRef('');
+  useEffect(() => { pipelineIdeaRef.current = pipelineIdea; }, [pipelineIdea]);
 
   // --- UI STATES ---
   const [activeShotId, setActiveShotId] = useState(null);
@@ -605,6 +626,11 @@ export default function App() {
     setCustomModelCaps(state.customModelCaps && typeof state.customModelCaps === 'object' ? state.customModelCaps : {});
     setAssetTypeModels(state.assetTypeModels && typeof state.assetTypeModels === 'object' ? state.assetTypeModels : {});
     setAutoAttachRefs(state.autoAttachRefs !== false);
+    // The job log survives reload now; anything mid-flight when the page died
+    // is marked so rather than spinning forever.
+    setBatchJobs((Array.isArray(state.batchJobs) ? state.batchJobs : [])
+      .map(job => (job.status === 'running' ? { ...job, status: 'failed', error: 'interrupted by reload' } : job)));
+    setPipelineRunState(state.pipelineRun || null);
     // Only the fields a dream saved are stored, so unset ones follow the
     // project's current models rather than a pinned stale one.
     setDreamSettings(createDreamSettings(state.dreamSettings || {}));
@@ -666,6 +692,10 @@ export default function App() {
       customModelCaps,
       assetTypeModels,
       autoAttachRefs,
+      // Capped: the job log is a log, not an archive. Not in the autosave
+      // dependency list — it rides along with whatever else triggers a save.
+      batchJobs: batchJobs.slice(0, 100),
+      pipelineRun: pipelineRunState,
       dreamSettings: compactDreamSettings(dreamSettings),
       // Only the slots that differ from their defaults are written, so a future
       // change to a default still reaches projects that never edited it.
@@ -1739,13 +1769,17 @@ export default function App() {
   // --- BATCH GENERATION -----------------------------------------------------
 
   /** The prompt a batch run uses for a shot, before pre/post and tag expansion. */
+  // No raw-description fallback any more: sending an unwritten description as
+  // a prompt was a silent quality trap, and the write-all-prompts stage (or
+  // button) supersedes it — promptless shots are skipped by the candidate
+  // predicates instead.
   const resolveShotPrompt = (shot, type) => {
     if (type === 'image') {
       const lastGroup = (shot.imagePrompts || [])[(shot.imagePrompts || []).length - 1];
-      return shot.draftImagePrompt || lastGroup?.prompt || shot.description || '';
+      return shot.draftImagePrompt || lastGroup?.prompt || '';
     }
     const lastGroup = (shot.videoPrompts || [])[(shot.videoPrompts || []).length - 1];
-    return shot.draftVideoPrompt || lastGroup?.prompt || shot.draftImagePrompt || shot.description || '';
+    return shot.draftVideoPrompt || lastGroup?.prompt || shot.draftImagePrompt || '';
   };
 
   const shotsForScope = (scope) => {
@@ -3226,6 +3260,248 @@ export default function App() {
     } catch (err) {
       showToast(`Import failed: ${err.message}`, 'error');
     }
+  };
+
+  // --- PIPELINE STAGES -------------------------------------------------------
+  // Everything a long-lived run touches goes through pipelineFnsRef (updated
+  // every render) and scenesRef/assetLibraryRef, because the closures captured
+  // when the run started go stale the moment the script stage replaces the
+  // project.
+
+  useEffect(() => { assetLibraryRef.current = assetLibrary; }, [assetLibrary]);
+  // No dependency array on purpose: refreshed after EVERY render so a running
+  // pipeline always calls the newest closures. (An inline render assignment
+  // would hit the temporal dead zone — applyImportedDocument is declared
+  // further down the component.)
+  useEffect(() => {
+    pipelineFnsRef.current = {
+      submitGenerationJob,
+      writeShotPrompt,
+      generateAssetImage,
+      applyImportedDocument,
+      handleUpdateShotField,
+      submitFromProducingGroup,
+      resolveShotPrompt
+    };
+  });
+
+  const freshShots = () => scenesRef.current.flatMap(s => (s.shots || []).map(shot => ({ shot, sceneName: s.name })));
+
+  /**
+   * The stage list is a straight line with skippable nodes — no DAG machinery.
+   * Candidate predicates re-derive work from live state, so a rerun after a
+   * stop (or a reload) only does what is still missing, and the dirty stages
+   * import their predicates from dirty.js rather than growing a second
+   * dirtiness implementation.
+   */
+  const buildPipelineStages = () => {
+    const fns = () => pipelineFnsRef.current;
+    const submitShot = (type) => ({ shot }) => {
+      const scene = scenesRef.current.find(sc => (sc.shots || []).some(s => s.id === shot.id)) || null;
+      const resolved = resolveModelSettings({ type, project: projectModelDefaults, scene, shot });
+      const isImage = type === 'image';
+      return fns().submitGenerationJob({
+        type,
+        shotId: shot.id,
+        shotName: shot.name,
+        rawPrompt: fns().resolveShotPrompt(shot, type),
+        model: resolved.model,
+        resolution: resolved.resolution,
+        duration: resolved.duration || videoDuration,
+        primaryImagePaths: isImage ? shotReferencePaths(shot) : (shot.selectedImage ? [shot.selectedImage] : []),
+        attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
+      });
+    };
+
+    return [
+      {
+        id: 'script',
+        label: 'Generate script',
+        candidates: () => (
+          freshShots().length === 0 && pipelineIdeaRef.current.trim() ? [{ id: 'script' }] : []
+        ),
+        run: async () => {
+          const result = await generateShotListFromIdea({
+            idea: pipelineIdeaRef.current,
+            assetLibrary: assetLibraryRef.current,
+            llm: { provider: activeLlm, model: llmModel },
+            apiFetch,
+            intro: promptText(promptSettings, 'importIntro')
+          });
+          fns().applyImportedDocument(result.raw, 'replace');
+          // Let React commit the new scenes before the next stage derives from them.
+          await new Promise(resolve => setTimeout(resolve, 50));
+        },
+        concurrency: 1
+      },
+      {
+        id: 'assetImages',
+        label: 'Asset reference images',
+        candidates: () => assetLibraryRef.current
+          .filter(asset => (asset.images || []).length === 0
+            && (String(asset.description || '').trim() || String(asset.imagePrompt || '').trim()))
+          .map(asset => ({ id: asset.id, asset })),
+        run: ({ asset }) => {
+          const fresh = assetLibraryRef.current.find(a => a.id === asset.id) || asset;
+          return fns().generateAssetImage(fresh);
+        },
+        concurrency: 1 // strictly serial, like the existing asset batch
+      },
+      {
+        id: 'shotPrompts',
+        label: 'Write shot prompts',
+        candidates: () => {
+          const out = [];
+          for (const { shot } of freshShots()) {
+            if (!String(shot.description || '').trim()) continue;
+            if (!String(shot.draftImagePrompt || '').trim()) out.push({ id: `${shot.id}_img`, shot, type: 'image' });
+            if (!String(shot.draftVideoPrompt || '').trim()) out.push({ id: `${shot.id}_vid`, shot, type: 'video' });
+          }
+          return out;
+        },
+        run: async ({ shot, type }) => {
+          const result = await fns().writeShotPrompt(shot, type, { withContext: true });
+          if (result.ok) {
+            fns().handleUpdateShotField(shot.id, type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt', result.text);
+          }
+          return result;
+        },
+        concurrency: 2 // LLM providers rate-limit harder than image hosts
+      },
+      {
+        id: 'shotImages',
+        label: 'Generate shot images',
+        candidates: () => freshShots().filter(({ shot }) => (
+          pipelineFnsRef.current.resolveShotPrompt(shot, 'image').trim()
+          && !(shot.imagePrompts || []).some(p => (p.outputs || []).length > 0)
+        )),
+        run: submitShot('image'),
+        concurrency: batchConcurrency
+      },
+      {
+        id: 'select',
+        label: 'Select stills',
+        candidates: () => freshShots().filter(({ shot }) => (
+          !shot.selectedImage && (shot.imagePrompts || []).some(p => (p.outputs || []).length > 0)
+        )),
+        run: ({ shot }) => {
+          const outputs = (shot.imagePrompts || []).flatMap(p => p.outputs || []);
+          const newest = [...outputs].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0];
+          if (newest) fns().handleUpdateShotField(shot.id, 'selectedImage', newest.path);
+          return { ok: Boolean(newest) };
+        },
+        concurrency: 1
+      },
+      {
+        id: 'dirtyImages',
+        label: 'Regenerate stale images',
+        candidates: () => dirtyImageCandidates(scenesRef.current, assetLibraryRef.current),
+        run: ({ shot }) => {
+          const fresh = scenesRef.current.flatMap(s => s.shots || []).find(s => s.id === shot.id) || shot;
+          return fns().submitFromProducingGroup(fresh, 'image');
+        },
+        concurrency: batchConcurrency
+      },
+      {
+        id: 'shotVideos',
+        label: 'Generate shot videos',
+        candidates: () => freshShots().filter(({ shot }) => (
+          pipelineFnsRef.current.resolveShotPrompt(shot, 'video').trim()
+          && shot.selectedImage
+          && !(shot.videoPrompts || []).some(p => (p.outputs || []).length > 0)
+        )),
+        run: submitShot('video'),
+        concurrency: Math.min(2, batchConcurrency)
+      },
+      {
+        id: 'dirtyVideos',
+        label: 'Regenerate stale videos',
+        candidates: () => dirtyVideoCandidates(scenesRef.current, assetLibraryRef.current),
+        run: ({ shot }) => {
+          const fresh = scenesRef.current.flatMap(s => s.shots || []).find(s => s.id === shot.id) || shot;
+          return fns().submitFromProducingGroup(fresh, 'video');
+        },
+        concurrency: Math.min(2, batchConcurrency)
+      },
+      {
+        id: 'timeline',
+        label: 'Build timeline',
+        candidates: () => (freshShots().some(({ shot }) => shot.selectedVideo || shot.selectedImage) ? [{ id: 'timeline' }] : []),
+        run: () => {
+          setEdit(previous => {
+            const ctx = makeContext(scenesRef.current, previous.durations, Number(videoDuration) || 5);
+            if ((previous.video || []).length === 0) {
+              const clips = deriveVideoClips(scenesRef.current);
+              const audioClips = deriveAudioClipsForShots(scenesRef.current, clips);
+              const audio = audioClips.length > 0
+                ? [...(previous.audio || []), { ...createAudioTrack('Dialogue'), clips: audioClips }]
+                : (previous.audio || []);
+              return normalize({ ...previous, video: clips, audio }, ctx);
+            }
+            // An existing cut is real work: reconcile keeps trims, transitions
+            // and linked audio, only updating the running order.
+            return reconcile(previous, scenesRef.current, ctx, { add: true, prune: true, reorder: true });
+          });
+          return { ok: true };
+        },
+        concurrency: 1
+      }
+    ];
+  };
+
+  /** Known catalog prices per candidate; null = credit-priced. LLM calls count as free. */
+  const pipelinePriceFor = (stage, candidate) => {
+    const modelPrice = (type, model) => {
+      const record = type === 'image' ? getImageModel(model) : getVideoModel(model);
+      return { price: typeof record?.price === 'number' ? record.price : null };
+    };
+    if (stage.id === 'assetImages') {
+      return modelPrice('image', resolveAssetModelSettings(candidate.asset).model);
+    }
+    if (stage.id === 'shotImages' || stage.id === 'dirtyImages') {
+      return modelPrice('image', resolveShotModelSettings('image', candidate.shot).model);
+    }
+    if (stage.id === 'shotVideos' || stage.id === 'dirtyVideos') {
+      return modelPrice('video', resolveShotModelSettings('video', candidate.shot).model);
+    }
+    return { price: 0 };
+  };
+
+  // The panel's live counts + cost estimate, recomputed while it is open.
+  useEffect(() => {
+    if (!pipelineOpen) return undefined;
+    let cancelled = false;
+    estimateRun({ stages: buildPipelineStages(), skip: pipelineSkip, priceFor: pipelinePriceFor })
+      .then(rows => { if (!cancelled) setPipelineEstimate(rows); })
+      .catch(() => { if (!cancelled) setPipelineEstimate(null); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pipelineOpen, pipelineSkip, scenes, assetLibrary, pipelineIdea]);
+
+  const handleRunPipeline = () => {
+    if (pipelineRunRef.current) return;
+    const run = createPipelineRun({
+      stages: buildPipelineStages(),
+      options: {
+        skip: pipelineSkip,
+        concurrency: batchConcurrency,
+        retry: { attempts: 2, backoffMs: 2000 }
+      }
+    });
+    pipelineRunRef.current = run;
+    run.subscribe(setPipelineRunState);
+    run.start().then(finalState => {
+      pipelineRunRef.current = null;
+      const failed = Object.values(finalState.stageStates).reduce((sum, s) => sum + (s.failed?.length || 0), 0);
+      showToast(
+        finalState.status === 'cancelled'
+          ? 'Pipeline stopped. Rerun to pick up where it left off.'
+          : failed > 0
+            ? `Pipeline finished with ${failed} failure${failed === 1 ? '' : 's'} — rerun to retry just those.`
+            : 'Pipeline complete.',
+        finalState.status === 'cancelled' || failed > 0 ? 'warning' : 'success'
+      );
+    });
   };
 
   const handleCopyLlmPrompt = async () => {
@@ -4734,6 +5010,16 @@ export default function App() {
             </Menu>
 
             <Menu label="Generate" icon={Zap}>
+              <MenuItem
+                icon={Zap}
+                disabled={Boolean(batchRunner)}
+                onClick={() => setPipelineOpen(true)}
+                badge={pipelineRunRef.current && <span className="menu-badge">running</span>}
+                title="One button: idea → script → assets → prompts → images → videos → timeline"
+              >
+                Pipeline…
+              </MenuItem>
+              <MenuSeparator />
               <MenuItem
                 icon={ImageIcon}
                 disabled={Boolean(batchRunner)}
@@ -7433,6 +7719,40 @@ export default function App() {
           onRun={handleRunDream}
           onStop={handleStopDream}
           onClose={() => setDreamOpen(false)}
+        />
+      )}
+
+      {/* --- A4b1. PIPELINE --- */}
+      {pipelineOpen && (
+        <PipelinePanel
+          stages={buildPipelineStages().map(stage => ({ id: stage.id, label: stage.label }))}
+          estimate={pipelineEstimate}
+          skip={pipelineSkip}
+          onToggleSkip={(stageId) => setPipelineSkip(prev => {
+            const next = new Set(prev);
+            if (next.has(stageId)) next.delete(stageId); else next.add(stageId);
+            return next;
+          })}
+          runState={pipelineRunState}
+          running={Boolean(pipelineRunRef.current)}
+          idea={pipelineIdea}
+          onIdeaChange={setPipelineIdea}
+          showIdeaBox={shots.length === 0}
+          llmControls={(
+            <div style={{ display: 'flex', gap: '10px', marginTop: '6px' }}>
+              <select className="select-field" value={activeLlm} onChange={(e) => setActiveLlm(e.target.value)}>
+                {LLM_PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+              </select>
+              <select className="select-field" value={llmModel} onChange={(e) => setLlmModel(e.target.value)}>
+                {llmModelsList.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
+          )}
+          onRun={handleRunPipeline}
+          onPause={() => pipelineRunRef.current?.pause()}
+          onResume={() => pipelineRunRef.current?.resume()}
+          onCancel={() => pipelineRunRef.current?.cancel()}
+          onClose={() => setPipelineOpen(false)}
         />
       )}
 
