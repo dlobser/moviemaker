@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Sparkles,
   Film,
@@ -109,6 +109,7 @@ import SettingsPanel from './SettingsPanel.jsx';
 import CustomModelPath from './CustomModelPath.jsx';
 import { resolveModelSettings } from './modelSettings.js';
 import { generateShotListFromIdea } from './scriptGen.js';
+import { buildDirtyMap, dirtyImageCandidates, dirtyVideoCandidates, groupForSelection } from './dirty.js';
 import MediaPickerDialog from './MediaPickerDialog.jsx';
 import { collectShotMedia } from './imagePicker.js';
 import DreamDialog from './DreamDialog.jsx';
@@ -196,6 +197,12 @@ export default function App() {
   const [scenes, setScenes] = useState([]);
   const [activeSceneId, setActiveSceneId] = useState(null);
   const shots = scenes.flatMap(s => s.shots || []);
+
+  // The freshest scenes, for async runners that outlive a render (the
+  // two-stage stale regeneration re-derives its video candidates from state
+  // as it stood AFTER the image stage finished).
+  const scenesRef = useRef(scenes);
+  useEffect(() => { scenesRef.current = scenes; }, [scenes]);
 
   const [viewingPromptText, setViewingPromptText] = useState(null);
   const [frameCaptureChoice, setFrameCaptureChoice] = useState(null); // { imagePath, imageName, shotId }
@@ -309,6 +316,9 @@ export default function App() {
   const cancelBatchRef = useRef(false);
   const [batchDialog, setBatchDialog] = useState(null); // { type: 'image'|'video', scope: 'scene'|'all' }
   const [batchOnlyMissing, setBatchOnlyMissing] = useState(true);
+  const [batchOnlyDirty, setBatchOnlyDirty] = useState(false);
+  // Shot-list display filter: show only shots whose image or video is stale.
+  const [showOnlyStale, setShowOnlyStale] = useState(false);
   const [batchConcurrency, setBatchConcurrency] = useState(3);
 
   // --- UNDO / REDO ---
@@ -1746,9 +1756,14 @@ export default function App() {
     return scenes.flatMap(scene => (scene.shots || []).map(shot => ({ shot, sceneName: scene.name })));
   };
 
+  // Which shots are stale, recomputed whenever the shot list or an asset
+  // changes. String ops over shots × tags — trivial at personal-project scale.
+  const dirtyMap = useMemo(() => buildDirtyMap(scenes, assetLibrary), [scenes, assetLibrary]);
+
   /** Shots a batch would actually act on, given the current dialog options. */
-  const batchCandidates = (type, scope, onlyMissing) => shotsForScope(scope)
+  const batchCandidates = (type, scope, onlyMissing, onlyDirty = false) => shotsForScope(scope)
     .filter(({ shot }) => {
+      if (onlyDirty) return Boolean(dirtyMap.get(shot.id)?.[type]?.dirty);
       if (!resolveShotPrompt(shot, type).trim()) return false;
       if (!onlyMissing) return true;
       // "Only shots without a result yet" — the point of a first full sweep.
@@ -1757,26 +1772,17 @@ export default function App() {
         : !(shot.videoPrompts || []).some(p => (p.outputs || []).length > 0);
     });
 
-  const handleRunBatch = async () => {
-    if (!batchDialog) return;
-    const { type, scope } = batchDialog;
-    const candidates = batchCandidates(type, scope, batchOnlyMissing);
-
-    if (candidates.length === 0) {
-      showToast('No shots match — every shot either has no prompt or already has output.', 'warning');
-      return;
-    }
-
-    setBatchDialog(null);
-    setActiveOverlay('batch');
+  /**
+   * The worker-pool body every generation batch shares: run `submitFor` over
+   * the candidates with bounded concurrency, driving the runner UI. Returns
+   * { completed, failed, cancelled }.
+   */
+  const runBatchOver = async (candidates, type, submitFor, { label } = {}) => {
     cancelBatchRef.current = false;
-
-    const scopeLabel = scope === 'scene' ? `scene "${scenes.find(s => s.id === activeSceneId)?.name}"` : 'all scenes';
-    setBatchRunner({ total: candidates.length, done: 0, type, label: `${type} × ${candidates.length} in ${scopeLabel}` });
-    showToast(`Batch started: ${candidates.length} ${type} generation${candidates.length === 1 ? '' : 's'}.`, 'info');
+    setBatchRunner({ total: candidates.length, done: 0, type, label: label || `${type} × ${candidates.length}` });
 
     // Fixed-size worker pool so we do not slam the provider with N parallel
-    // requests; each worker pulls the next shot off the shared cursor.
+    // requests; each worker pulls the next candidate off the shared cursor.
     let cursor = 0;
     let completed = 0;
     let failed = 0;
@@ -1789,57 +1795,166 @@ export default function App() {
         cursor += 1;
         if (index >= candidates.length) return;
 
-        const { shot } = candidates[index];
-        const isImage = type === 'image';
-        const resolved = resolveShotModelSettings(type, shot);
-        const model = resolved.model;
-        const resolution = resolved.resolution;
-
-        // Video batches animate the shot's own selected still. That image is
-        // the primary input and must never be displaced by a tagged asset.
-        //
-        // Image batches use the same resolution the generation modal shows, so
-        // a reference you unticked on a shot stays unticked when the batch runs
-        // — previously the modal's choices were session-only and a sweep sent
-        // everything regardless.
-        const primaryImagePaths = isImage
-          ? shotReferencePaths(shot)
-          : (shot.selectedImage ? [shot.selectedImage] : []);
-
-        const result = await submitGenerationJob({
-          type,
-          shotId: shot.id,
-          shotName: shot.name,
-          rawPrompt: resolveShotPrompt(shot, type),
-          model,
-          resolution,
-          duration: resolved.duration || videoDuration,
-          primaryImagePaths,
-          attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
-        });
-
+        const result = await submitFor(candidates[index]);
         if (result?.ok) completed += 1; else failed += 1;
         setBatchRunner(prev => (prev ? { ...prev, done: completed + failed } : prev));
       }
     };
 
     await Promise.all(Array.from({ length: workerCount }, worker));
-
     setBatchRunner(null);
-    if (cancelBatchRef.current) {
-      showToast(`Batch stopped. ${completed} finished, ${failed} failed, ${candidates.length - completed - failed} skipped.`, 'warning');
+    const cancelled = cancelBatchRef.current;
+    cancelBatchRef.current = false;
+    return { completed, failed, cancelled, total: candidates.length };
+  };
+
+  /** The standard per-shot submission a scope batch performs. */
+  const submitForShot = (type) => ({ shot }) => {
+    const isImage = type === 'image';
+    const resolved = resolveShotModelSettings(type, shot);
+
+    // Video batches animate the shot's own selected still. That image is
+    // the primary input and must never be displaced by a tagged asset.
+    //
+    // Image batches use the same resolution the generation modal shows, so
+    // a reference you unticked on a shot stays unticked when the batch runs
+    // — previously the modal's choices were session-only and a sweep sent
+    // everything regardless.
+    const primaryImagePaths = isImage
+      ? shotReferencePaths(shot)
+      : (shot.selectedImage ? [shot.selectedImage] : []);
+
+    return submitGenerationJob({
+      type,
+      shotId: shot.id,
+      shotName: shot.name,
+      rawPrompt: resolveShotPrompt(shot, type),
+      model: resolved.model,
+      resolution: resolved.resolution,
+      duration: resolved.duration || videoDuration,
+      primaryImagePaths,
+      attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
+    });
+  };
+
+  const handleRunBatch = async () => {
+    if (!batchDialog) return;
+    const { type, scope } = batchDialog;
+    const candidates = batchCandidates(type, scope, batchOnlyMissing, batchOnlyDirty);
+
+    if (candidates.length === 0) {
+      showToast(batchOnlyDirty
+        ? 'No stale shots in this scope.'
+        : 'No shots match — every shot either has no prompt or already has output.', 'warning');
+      return;
+    }
+
+    setBatchDialog(null);
+    setActiveOverlay('batch');
+
+    const scopeLabel = scope === 'scene' ? `scene "${scenes.find(s => s.id === activeSceneId)?.name}"` : 'all scenes';
+    showToast(`Batch started: ${candidates.length} ${type} generation${candidates.length === 1 ? '' : 's'}.`, 'info');
+
+    // A dirtiness-selected candidate regenerates from its producing recipe,
+    // not from the draft prompt — the whole point is reproducing the original
+    // request with the asset's fresh material.
+    const submitFor = batchOnlyDirty
+      ? ({ shot }) => submitFromProducingGroup(shot, type)
+      : submitForShot(type);
+
+    const { completed, failed, cancelled, total } = await runBatchOver(
+      candidates, type, submitFor,
+      { label: `${type} × ${candidates.length} in ${scopeLabel}` }
+    );
+
+    if (cancelled) {
+      showToast(`Batch stopped. ${completed} finished, ${failed} failed, ${total - completed - failed} skipped.`, 'warning');
     } else if (failed > 0) {
       showToast(`Batch done: ${completed} succeeded, ${failed} failed. See the Batch Manager for errors.`, 'warning');
     } else {
       showToast(`Batch complete — ${completed} ${type}${completed === 1 ? '' : 's'} generated.`, 'success');
     }
-    cancelBatchRef.current = false;
   };
 
   // Stops dispatching new jobs; requests already in flight are left to finish.
   const handleCancelBatch = () => {
     cancelBatchRef.current = true;
     showToast('Batch will stop after the in-flight generations finish.', 'warning');
+  };
+
+  // --- STALE REGENERATION ---------------------------------------------------
+
+  /**
+   * Regenerate from the recipe that produced the current selection — raw
+   * prompt, model, exclusions and all — not from the draft prompt. Tags
+   * resolve at compose time, so fresh asset text and images attach
+   * automatically; the signature match lands the output in the same group and
+   * refreshes its stamps, which is what clears the dirty state.
+   *
+   * Videos animate the CURRENT shot.selectedImage, not the recorded one.
+   */
+  const submitFromProducingGroup = (shot, type) => {
+    const groups = type === 'image' ? shot.imagePrompts : shot.videoPrompts;
+    const selected = type === 'image' ? shot.selectedImage : shot.selectedVideo;
+    const group = groupForSelection(groups || [], selected);
+    if (!group) {
+      return Promise.resolve({ ok: false, error: 'No producing group for the current selection.' });
+    }
+
+    return submitGenerationJob({
+      type,
+      shotId: shot.id,
+      shotName: shot.name,
+      rawPrompt: group.rawPrompt ?? group.prompt ?? '',
+      model: group.model,
+      resolution: group.resolution,
+      duration: group.duration,
+      primaryImagePaths: type === 'video'
+        ? (shot.selectedImage ? [shot.selectedImage] : [])
+        : (group.primaryImagePaths || []),
+      attachTaggedImages: group.attachTaggedImages !== false,
+      excludedImagePaths: group.excludedImagePaths || [],
+      usePrePrompt: group.usePrePrompt !== false,
+      usePostPrompt: group.usePostPrompt !== false,
+      promptOverride: typeof group.promptOverride === 'string' ? group.promptOverride : null
+    });
+  };
+
+  /**
+   * One button: stale images first, then — judged against the state those
+   * regenerations produced — the stale videos. The order matters: a
+   * regenerated image flips its video to dirty via the source-image rule.
+   */
+  const handleRegenerateStale = async () => {
+    const imageCandidates = dirtyImageCandidates(scenesRef.current, assetLibrary);
+    if (imageCandidates.length > 0) {
+      showToast(`Regenerating ${imageCandidates.length} stale image${imageCandidates.length === 1 ? '' : 's'}…`, 'info');
+      setActiveOverlay('batch');
+      const { cancelled } = await runBatchOver(
+        imageCandidates, 'image',
+        ({ shot }) => submitFromProducingGroup(shot, 'image'),
+        { label: `stale images × ${imageCandidates.length}` }
+      );
+      if (cancelled) return;
+    }
+
+    // Re-derive from the freshest state: the image stage changed selections.
+    const videoCandidates = dirtyVideoCandidates(scenesRef.current, assetLibrary);
+    if (videoCandidates.length === 0) {
+      showToast(imageCandidates.length > 0 ? 'Stale images regenerated; no stale videos.' : 'Nothing is stale.', 'success');
+      return;
+    }
+    showToast(`Now regenerating ${videoCandidates.length} stale video${videoCandidates.length === 1 ? '' : 's'}…`, 'info');
+    const { completed, failed } = await runBatchOver(
+      videoCandidates, 'video',
+      ({ shot: staleShot }) => {
+        // Read the freshest copy — the image stage may have re-selected.
+        const fresh = scenesRef.current.flatMap(s => s.shots || []).find(s => s.id === staleShot.id) || staleShot;
+        return submitFromProducingGroup(fresh, 'video');
+      },
+      { label: `stale videos × ${videoCandidates.length}` }
+    );
+    showToast(`Stale sweep done: ${completed} regenerated${failed ? `, ${failed} failed` : ''}.`, failed ? 'warning' : 'success');
   };
 
   // --- WRITE ALL PROMPTS (LLM batch) ---------------------------------------
@@ -4668,6 +4783,23 @@ export default function App() {
               </MenuItem>
 
               <MenuSeparator />
+              {(() => {
+                const staleImages = [...dirtyMap.values()].filter(d => d.image.dirty).length;
+                const staleVideos = [...dirtyMap.values()].filter(d => d.video.dirty).length;
+                const total = staleImages + staleVideos;
+                return (
+                  <MenuItem
+                    icon={RefreshCw}
+                    disabled={Boolean(batchRunner) || total === 0}
+                    onClick={handleRegenerateStale}
+                    badge={total > 0 && <span className="menu-badge">{total}</span>}
+                    title="Regenerate every shot whose assets changed since it was made: images first, then the videos that depended on them"
+                  >
+                    Regenerate stale
+                  </MenuItem>
+                );
+              })()}
+              <MenuSeparator />
               <MenuItem
                 icon={Moon}
                 onClick={() => setDreamOpen(true)}
@@ -4960,10 +5092,21 @@ export default function App() {
             </div>
           )}
 
+          {/* Stale-only display filter, shown only when something is stale. */}
+          {[...dirtyMap.values()].some(d => d.image.dirty || d.video.dirty) && (
+            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.78rem', color: 'var(--warning, #f59e0b)', alignSelf: 'flex-start' }}>
+              <input type="checkbox" checked={showOnlyStale} onChange={(e) => setShowOnlyStale(e.target.checked)} />
+              Stale only ({[...dirtyMap.values()].filter(d => d.image.dirty || d.video.dirty).length} shot{[...dirtyMap.values()].filter(d => d.image.dirty || d.video.dirty).length === 1 ? '' : 's'} whose assets changed since generation)
+            </label>
+          )}
+
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             {activeSceneShots.map((shot, index) => {
               const isCollapsed = isShotCollapsed(shot.id);
               const isActive = shot.id === activeShotId;
+              const shotDirty = dirtyMap.get(shot.id);
+              const isStale = Boolean(shotDirty?.image.dirty || shotDirty?.video.dirty);
+              if (showOnlyStale && !isStale) return null;
 
               return (
                 <div
@@ -5016,6 +5159,17 @@ export default function App() {
                       </div>
                       <span className="shot-number">#{index + 1}</span>
                       <span className="shot-collapsed-title">{shot.name || `Shot ${index + 1}`}</span>
+                      {isStale && (
+                        <span
+                          style={{ fontSize: '0.65rem', background: 'rgba(245, 158, 11, 0.15)', color: 'var(--warning, #f59e0b)', padding: '2px 6px', borderRadius: '999px', whiteSpace: 'nowrap' }}
+                          title={[
+                            ...(shotDirty.image.dirty ? shotDirty.image.reasons.map(r => `image: ${r}`) : []),
+                            ...(shotDirty.video.dirty ? shotDirty.video.reasons.map(r => `video: ${r}`) : [])
+                          ].join('\n')}
+                        >
+                          stale
+                        </span>
+                      )}
                       <span className="shot-collapsed-desc">{shot.description || '(No description)'}</span>
                     </div>
 
@@ -7114,7 +7268,7 @@ export default function App() {
 
       {/* --- A4. BATCH GENERATION DIALOG --- */}
       {batchDialog && (() => {
-        const candidates = batchCandidates(batchDialog.type, batchDialog.scope, batchOnlyMissing);
+        const candidates = batchCandidates(batchDialog.type, batchDialog.scope, batchOnlyMissing, batchOnlyDirty);
         const allInScope = shotsForScope(batchDialog.scope);
         const noPrompt = allInScope.filter(({ shot }) => !resolveShotPrompt(shot, batchDialog.type).trim()).length;
         const model = batchDialog.type === 'image' ? getImageModel(imageModel) : getVideoModel(videoModel);
@@ -7143,11 +7297,22 @@ export default function App() {
 
                 <div className="form-group">
                   <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.9rem' }}>
-                    <input type="checkbox" checked={batchOnlyMissing} onChange={(e) => setBatchOnlyMissing(e.target.checked)} />
+                    <input type="checkbox" checked={batchOnlyMissing} disabled={batchOnlyDirty} onChange={(e) => setBatchOnlyMissing(e.target.checked)} />
                     Skip shots that already have output
                   </label>
                   <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
                     Leave this on for the first sweep, turn it off to re-roll everything.
+                  </span>
+                </div>
+
+                <div className="form-group">
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.9rem' }}>
+                    <input type="checkbox" checked={batchOnlyDirty} onChange={(e) => setBatchOnlyDirty(e.target.checked)} />
+                    Only stale shots
+                  </label>
+                  <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                    Shots whose tagged assets changed since their selected {batchDialog.type} was made.
+                    Regenerates from the original recipe with the fresh asset material.
                   </span>
                 </div>
 
