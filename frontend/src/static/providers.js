@@ -1,7 +1,13 @@
-// Direct browser calls to the generation providers, replacing the Node proxy.
+// Static-mode host for the shared provider module: direct browser calls to
+// the generation providers, replacing the Node proxy.
 //
-// CORS is the whole story here. A static page can only talk to APIs that send
-// permissive Access-Control-Allow-Origin headers:
+// The dispatch and per-provider request shaping live in
+// ../shared/providers/ — one implementation for both modes. What remains here
+// is the browser transport: CORS handling, the optional proxy, File System
+// Access API IO, and Fal storage uploads from in-browser blobs.
+//
+// CORS is the whole story for the transport. A static page can only talk to
+// APIs that send permissive Access-Control-Allow-Origin headers:
 //
 //   Gemini    - allows browser requests.
 //   OpenAI    - allows browser requests.
@@ -14,6 +20,9 @@
 // through a proxy they control.
 
 import { writeAsset, readAssetDataUrl } from './fileSystem.js';
+import * as shared from '../shared/providers/index.js';
+
+export { isHiggsfieldModel } from '../shared/providers/index.js';
 
 /** Wrap a URL in the user's CORS proxy, if they configured one. */
 function viaProxy(url, credentials) {
@@ -21,7 +30,7 @@ function viaProxy(url, credentials) {
   if (!proxy) return url;
   return proxy.includes('{url}')
     ? proxy.replace('{url}', encodeURIComponent(url))
-    : `${proxy}${proxy.endsWith('=') ? '' : ''}${encodeURIComponent(url)}`;
+    : `${proxy}${encodeURIComponent(url)}`;
 }
 
 /**
@@ -43,11 +52,12 @@ async function callApi(url, options, credentials, providerLabel) {
   }
 }
 
-/** Pull a finished generation into the project folder. */
+/** Pull a finished generation (remote or data: URL) into the project folder. */
 async function downloadToProject(remoteUrl, prefix, fallbackExt, credentials) {
   let response;
   try {
-    response = await fetch(viaProxy(remoteUrl, credentials));
+    // data: URLs need no proxy and always "download".
+    response = await fetch(remoteUrl.startsWith('data:') ? remoteUrl : viaProxy(remoteUrl, credentials));
   } catch (error) {
     throw new Error(
       `The result was generated but could not be downloaded into your project folder (likely CORS on the media host). ` +
@@ -59,96 +69,48 @@ async function downloadToProject(remoteUrl, prefix, fallbackExt, credentials) {
   return writeAsset(blob, prefix, blob.type ? null : fallbackExt);
 }
 
-// --- LLM ------------------------------------------------------------------
+/** Push a local asset into Fal storage so remote models can read it by URL. */
+async function uploadToFalMedia(assetPath, credentials) {
+  const apiKey = credentials.falKey;
+  if (!apiKey) throw new Error('Image-to-video needs a Fal.ai key to host the input image.');
+  const dataUrl = await readAssetDataUrl(assetPath);
+  const blob = await (await fetch(dataUrl)).blob();
 
-/**
- * Pull the text out of a provider response, failing with something readable.
- *
- * Models return an empty candidate more often than you'd think — safety stops,
- * token limits, recitation blocks — and reaching straight for `.text.trim()`
- * turned those into "Cannot read properties of undefined".
- */
-function requireText(value, providerLabel, detail = '') {
-  if (typeof value === 'string' && value.trim()) return value.trim();
-  throw new Error(
-    `${providerLabel} returned no text${detail ? ` (${detail})` : ''}. ` +
-    `This usually means the response was blocked or cut short — try rewording the description, or a different model.`
-  );
+  const initRes = await callApi('https://rest.fal.ai/storage/upload/initiate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Key ${apiKey}` },
+    body: JSON.stringify({ file_name: assetPath.split('/').pop(), content_type: blob.type || 'image/png' })
+  }, credentials, 'Fal.ai storage');
+  if (!initRes.ok) throw new Error(`Fal.ai upload init failed: ${await initRes.text()}`);
+
+  const { upload_url, file_url } = await initRes.json();
+  const putRes = await fetch(upload_url, {
+    method: 'PUT', headers: { 'Content-Type': blob.type || 'image/png' }, body: blob
+  });
+  if (!putRes.ok) throw new Error(`Fal.ai upload failed: ${putRes.status}`);
+  return file_url;
 }
 
-export async function generateText({ provider, prompt, systemPrompt, model }, credentials) {
-  if (provider === 'gemini') {
-    const apiKey = credentials.geminiKey;
-    if (!apiKey) throw new Error('Gemini API key is not configured.');
-    const targetModel = model || 'gemini-2.5-flash';
-    const res = await callApi(
-      `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: `${systemPrompt}\n\nUser text: ${prompt}` }] }] })
-      },
-      credentials, 'Gemini'
-    );
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message || 'Gemini API Error');
-    const candidate = data.candidates?.[0];
-    const text = candidate?.content?.parts?.map(part => part.text).filter(Boolean).join('\n');
-    return requireText(text, 'Gemini', candidate?.finishReason || data.promptFeedback?.blockReason);
-  }
-
-  if (provider === 'chatgpt') {
-    const apiKey = credentials.openaiKey;
-    if (!apiKey) throw new Error('OpenAI API key is not configured.');
-    const res = await callApi(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: model || 'gpt-4o-mini',
-          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
-        })
-      },
-      credentials, 'OpenAI'
-    );
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message || 'OpenAI API Error');
-    const choice = data.choices?.[0];
-    return requireText(choice?.message?.content, 'OpenAI', choice?.finish_reason);
-  }
-
-  if (provider === 'claude') {
-    const apiKey = credentials.claudeKey;
-    if (!apiKey) throw new Error('Claude API key is not configured.');
-    const res = await callApi(
-      'https://api.anthropic.com/v1/messages',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          // Required for Anthropic to accept a request straight from a page.
-          'anthropic-dangerous-direct-browser-access': 'true'
-        },
-        body: JSON.stringify({
-          model: model || 'claude-sonnet-5',
-          max_tokens: 1024,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: prompt }]
-        })
-      },
-      credentials, 'Anthropic'
-    );
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message || 'Claude API Error');
-    const text = data.content?.filter(block => block.type === 'text').map(block => block.text).join('\n');
-    return requireText(text, 'Claude', data.stop_reason);
-  }
-
-  throw new Error(`Unsupported LLM provider: ${provider}`);
+/** The shared module's host contract, browser edition. */
+function buildCtx(credentials) {
+  return {
+    fetch: (url, options, providerLabel) => callApi(url, options, credentials, providerLabel || 'The provider'),
+    credentials,
+    readAssetDataUrl,
+    uploadPublicUrl: (assetPath) => uploadToFalMedia(assetPath, credentials),
+    saveRemote: (url, prefix, ext) => downloadToProject(url, prefix, ext, credentials),
+    capabilities: { direct: false }
+  };
 }
+
+export const generateImage = (req, credentials) => shared.generateImage(req, buildCtx(credentials));
+export const generateVideo = (req, credentials) => shared.generateVideo(req, buildCtx(credentials));
+export const generateText = (req, credentials) => shared.generateText(req, buildCtx(credentials));
+export const runLipSync = (req, credentials) => shared.runLipSync(req, buildCtx(credentials));
+
+// --- model listing ----------------------------------------------------------
+// A nicety, not a dispatch concern: stays host-local because the browser needs
+// its own auth header shape and its own fallback lists.
 
 export async function listModels(provider, credentials) {
   const fallbacks = {
@@ -211,259 +173,4 @@ export async function listModels(provider, credentials) {
     // Listing is a nicety; fall through to the static list.
   }
   return fallbacks[provider] || [];
-}
-
-// --- Fal.ai queue ---------------------------------------------------------
-
-async function callFalModel(modelId, input, credentials) {
-  const apiKey = credentials.falKey;
-  if (!apiKey) throw new Error('Fal.ai API key is not configured.');
-  const headers = { 'Content-Type': 'application/json', Authorization: `Key ${apiKey}` };
-
-  const submit = await callApi(`https://queue.fal.run/${modelId}`, {
-    method: 'POST', headers, body: JSON.stringify(input)
-  }, credentials, 'Fal.ai');
-
-  if (!submit.ok) throw new Error(`Fal.ai submission failed (${submit.status}): ${await submit.text()}`);
-  const submitData = await submit.json();
-  const requestId = submitData.request_id || submitData.gateway_request_id;
-  const statusUrl = submitData.status_url || `https://queue.fal.run/${encodeURIComponent(modelId)}/requests/${requestId}/status`;
-  const resultUrl = submitData.response_url || `https://queue.fal.run/${encodeURIComponent(modelId)}/requests/${requestId}`;
-
-  for (let attempt = 0; attempt < 120; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    const statusRes = await fetch(viaProxy(statusUrl, credentials), { headers: { Authorization: `Key ${apiKey}` } });
-    if (!statusRes.ok) throw new Error(`Fal.ai status check failed: ${statusRes.status}`);
-    const status = await statusRes.json();
-    if (status.status === 'COMPLETED') {
-      const resultRes = await fetch(viaProxy(resultUrl, credentials), { headers: { Authorization: `Key ${apiKey}` } });
-      if (!resultRes.ok) throw new Error(`Fal.ai result fetch failed: ${resultRes.status}`);
-      return resultRes.json();
-    }
-    if (status.status === 'FAILED') throw new Error(`Fal.ai task failed: ${status.error || 'unknown error'}`);
-  }
-  throw new Error('Fal.ai task timed out.');
-}
-
-/** Push a local asset into Fal storage so video models can read it by URL. */
-async function uploadToFalMedia(assetPath, credentials) {
-  const apiKey = credentials.falKey;
-  if (!apiKey) throw new Error('Image-to-video needs a Fal.ai key to host the input image.');
-  const dataUrl = await readAssetDataUrl(assetPath);
-  const blob = await (await fetch(dataUrl)).blob();
-
-  const initRes = await callApi('https://rest.fal.ai/storage/upload/initiate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Key ${apiKey}` },
-    body: JSON.stringify({ file_name: assetPath.split('/').pop(), content_type: blob.type || 'image/png' })
-  }, credentials, 'Fal.ai storage');
-  if (!initRes.ok) throw new Error(`Fal.ai upload init failed: ${await initRes.text()}`);
-
-  const { upload_url, file_url } = await initRes.json();
-  const putRes = await fetch(upload_url, {
-    method: 'PUT', headers: { 'Content-Type': blob.type || 'image/png' }, body: blob
-  });
-  if (!putRes.ok) throw new Error(`Fal.ai upload failed: ${putRes.status}`);
-  return file_url;
-}
-
-// --- Higgsfield -----------------------------------------------------------
-
-const HIGGSFIELD_BASE = 'https://platform.higgsfield.ai';
-const HIGGSFIELD_PREFIXES = [
-  'higgsfield-ai/', 'reve/', 'google/', 'openai/', 'bytedance/',
-  'kling-video/', 'kling/', 'minimax/', 'alibaba/', 'black-forest-labs/'
-];
-
-export function isHiggsfieldModel(modelId) {
-  return typeof modelId === 'string' && HIGGSFIELD_PREFIXES.some(prefix => modelId.startsWith(prefix));
-}
-
-async function callHiggsfieldModel(modelId, input, credentials) {
-  const key = credentials.higgsfieldKey;
-  if (!key) throw new Error('Higgsfield API key is not configured.');
-  const auth = `Key ${credentials.higgsfieldSecret ? `${key}:${credentials.higgsfieldSecret}` : key}`;
-
-  const submit = await callApi(`${HIGGSFIELD_BASE}/${modelId}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: auth },
-    body: JSON.stringify(input)
-  }, credentials, 'Higgsfield');
-
-  if (!submit.ok) throw new Error(`Higgsfield submission failed (${submit.status}): ${await submit.text()}`);
-  const submitData = await submit.json();
-  if (submitData.status === 'completed') return submitData;
-
-  const requestId = submitData.request_id || submitData.id;
-  const statusUrl = submitData.status_url || `${HIGGSFIELD_BASE}/requests/${requestId}/status`;
-
-  for (let attempt = 0; attempt < 120; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    const statusRes = await fetch(viaProxy(statusUrl, credentials), { headers: { Authorization: auth } });
-    if (!statusRes.ok) throw new Error(`Higgsfield status check failed: ${statusRes.status}`);
-    const status = await statusRes.json();
-    if (status.status === 'completed') return status;
-    if (status.status === 'failed') throw new Error(`Higgsfield failed: ${status.error || status.message || 'unknown'}`);
-    if (status.status === 'nsfw') throw new Error('Higgsfield rejected the generation as NSFW.');
-    if (status.status === 'cancelled') throw new Error('Higgsfield generation was cancelled.');
-  }
-  throw new Error('Higgsfield generation timed out.');
-}
-
-// --- images ---------------------------------------------------------------
-
-export async function generateImage({ provider, prompt, resolution, inputImagePaths = [] }, credentials) {
-  if (provider === 'higgsfield' || isHiggsfieldModel(provider)) {
-    const modelId = provider === 'higgsfield' ? 'higgsfield-ai/soul/standard' : provider;
-    const input = { prompt };
-    if (resolution?.includes(':')) input.aspect_ratio = resolution;
-    else if (resolution) input.resolution = resolution;
-
-    if (inputImagePaths.length > 0) {
-      const dataUrls = await Promise.all(inputImagePaths.map(readAssetDataUrl));
-      // Three aliases because Higgsfield's models disagree on the field name;
-      // `image_references` is the one the multi-reference models read.
-      input.image_url = dataUrls[0];
-      input.reference_images = dataUrls;
-      input.image_references = dataUrls;
-    }
-    const result = await callHiggsfieldModel(modelId, input, credentials);
-    const url = result.images?.[0]?.url || result.image?.url;
-    if (!url) throw new Error('No image returned from Higgsfield.');
-    return downloadToProject(url, 'img', '.png', credentials);
-  }
-
-  if (provider === 'google-gemini-image') {
-    const apiKey = credentials.geminiKey;
-    if (!apiKey) throw new Error('Google AI Studio key is not configured.');
-    if (inputImagePaths.length > 3) throw new Error('Gemini Image accepts at most 3 input images.');
-
-    const imageParts = await Promise.all(inputImagePaths.map(async (assetPath) => {
-      const dataUrl = await readAssetDataUrl(assetPath);
-      const [meta, data] = dataUrl.split(',');
-      return { inlineData: { mimeType: meta.slice(5).replace(';base64', ''), data } };
-    }));
-
-    const res = await callApi(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }, ...imageParts] }],
-          generationConfig: { responseModalities: ['IMAGE'] }
-        })
-      },
-      credentials, 'Gemini Image'
-    );
-    const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error?.message || 'Gemini Image API error');
-
-    const part = data.candidates?.flatMap(c => c.content?.parts || []).find(p => p.inlineData?.data);
-    if (!part) throw new Error('Gemini Image returned no image.');
-    const blob = await (await fetch(`data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`)).blob();
-    return writeAsset(blob, 'img');
-  }
-
-  if (provider === 'chatgpt') {
-    const apiKey = credentials.openaiKey;
-    if (!apiKey) throw new Error('OpenAI API key is not configured.');
-    let size = '1024x1024';
-    if (resolution && /16:9|1344|1792|21:9|3:2/.test(resolution)) size = '1792x1024';
-    else if (resolution && /9:16|768/.test(resolution)) size = '1024x1792';
-
-    const res = await callApi('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model: 'dall-e-3', prompt, n: 1, size, quality: 'standard' })
-    }, credentials, 'DALL-E');
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message || 'DALL-E 3 API Error');
-    return downloadToProject(data.data[0].url, 'img', '.png', credentials);
-  }
-
-  // Everything else routes through Fal.
-  const modelId = provider === 'fal-ai' ? 'fal-ai/flux/schnell' : provider;
-  let imageSize = 'landscape_16_9';
-  if (resolution === '9:16') imageSize = 'portrait_16_9';
-  else if (resolution === '1:1') imageSize = 'square_hd';
-  else if (resolution === '4:3') imageSize = 'landscape_4_3';
-  else if (resolution === '3:2') imageSize = { width: 1200, height: 800 };
-  else if (resolution === '21:9') imageSize = { width: 1536, height: 640 };
-  else if (resolution?.includes('x')) imageSize = resolution;
-
-  const input = { prompt, image_size: imageSize, num_inference_steps: 4 };
-  if (inputImagePaths.length > 0) {
-    input.image_url = await readAssetDataUrl(inputImagePaths[0]);
-  } else if (modelId.includes('redux')) {
-    throw new Error('Flux Redux needs at least one input reference image.');
-  }
-
-  const result = await callFalModel(modelId, input, credentials);
-  if (!result.images?.length) throw new Error('No images returned from Fal.ai');
-  return downloadToProject(result.images[0].url, 'img', '.png', credentials);
-}
-
-// --- video ----------------------------------------------------------------
-
-export async function generateVideo({ provider, prompt, imageUrls = [], resolution, duration }, credentials) {
-  const routesToHiggsfield = provider === 'higgsfield' || isHiggsfieldModel(provider);
-  const aspect = resolution === '720x1280' ? '9:16' : '16:9';
-
-  if (routesToHiggsfield) {
-    const modelId = provider === 'higgsfield' ? 'higgsfield-ai/dop/preview' : provider;
-    const input = { prompt, aspect_ratio: aspect, duration: Number(duration) || 5 };
-    if (imageUrls.length > 0) {
-      const dataUrls = await Promise.all(imageUrls.map(readAssetDataUrl));
-      input.image_url = dataUrls[0];
-      input.input_images = dataUrls;
-    }
-    const result = await callHiggsfieldModel(modelId, input, credentials);
-    const url = result.video?.url || result.videos?.[0]?.url;
-    if (!url) throw new Error('No video returned from Higgsfield.');
-    return downloadToProject(url, 'vid', '.mp4', credentials);
-  }
-
-  if (provider === 'runway' || provider === 'kling') {
-    throw new Error(
-      `${provider === 'runway' ? 'Runway' : 'Kling'} does not support direct browser calls — its API has no CORS support. ` +
-      `Use a Fal.ai or Higgsfield model, or run the local server build.`
-    );
-  }
-
-  // Fal video
-  const hasImage = imageUrls.length > 0;
-  let modelId = provider === 'fal-ai' ? 'fal-ai/kling-video' : provider;
-  if (modelId === 'fal-ai/kling-video') {
-    modelId = hasImage ? 'fal-ai/kling-video/v2.1/standard/image-to-video' : 'fal-ai/kling-video/v3/standard/text-to-video';
-  } else if (modelId === 'fal-ai/luma-dream-machine') {
-    modelId = hasImage ? 'fal-ai/luma-dream-machine/image-to-video' : 'fal-ai/luma-dream-machine/text-to-video';
-  }
-
-  let durationValue = duration || '5';
-  if (modelId.startsWith('fal-ai/veo')) durationValue = durationValue === '10' ? '8s' : '5s';
-
-  const input = { prompt, duration: durationValue, aspect_ratio: aspect };
-  if (hasImage) input.image_url = await uploadToFalMedia(imageUrls[0], credentials);
-
-  const result = await callFalModel(modelId, input, credentials);
-  const url = result.video?.url || result.videos?.[0]?.url;
-  if (!url) throw new Error('No video URL returned from Fal.ai');
-  return downloadToProject(url, 'vid', '.mp4', credentials);
-}
-
-// --- lip sync -------------------------------------------------------------
-
-export async function runLipSync({ videoPath, audioPath }, credentials) {
-  if (!credentials.falKey) throw new Error('Fal.ai API key is required for lip-sync.');
-  const [videoUrl, audioUrl] = await Promise.all([
-    uploadToFalMedia(videoPath, credentials),
-    uploadToFalMedia(audioPath, credentials)
-  ]);
-  const result = await callFalModel('fal-ai/sync-lipsync', {
-    video_url: videoUrl, audio_url: audioUrl, lipsync_mode: 'cut_off'
-  }, credentials);
-  const url = result.video?.url || result.url;
-  if (!url) throw new Error('No synced video returned.');
-  return downloadToProject(url, 'sync', '.mp4', credentials);
 }

@@ -1157,3 +1157,341 @@ body.light-theme .batch-status-chip {
   background: rgba(244, 63, 94, 0.15);
   color: var(--accent);
 }
+
+/* --- INLINE PROMPT EDITOR -------------------------------------------------
+   The generation modal's prompt field. A mirror div renders the coloured text
+   behind a transparent-text textarea, so the two MUST agree on every property
+   that affects layout: font, size, line-height, padding, wrapping and width.
+   Changing one without the other slides the highlights off the words. For the
+   same reason a .prompt-mark may only paint (colour, background, radius) — a
+   border, padding or font-weight on it would reflow the mirror alone. */
+
+:root {
+  --mark-snippet: #f59e0b;
+  --mark-snippet-bg: rgba(245, 158, 11, 0.16);
+  --mark-affix: #06b6d4;
+  --mark-affix-bg: rgba(6, 182, 212, 0.16);
+  --mark-tag: #a78bfa;
+  --mark-tag-bg: rgba(139, 92, 246, 0.2);
+  --mark-missing: #f43f5e;
+  --mark-missing-bg: rgba(244, 63, 94, 0.16);
+}
+
+body.light-theme {
+  --mark-snippet: #b45309;
+  --mark-snippet-bg: rgba(245, 158, 11, 0.22);
+  --mark-affix: #0e7490;
+  --mark-affix-bg: rgba(6, 182, 212, 0.18);
+  --mark-tag: #6d28d9;
+  --mark-tag-bg: rgba(139, 92, 246, 0.16);
+  --mark-missing: #be123c;
+  --mark-missing-bg: rgba(244, 63, 94, 0.14);
+}
+
+.prompt-editor {
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  transition: var(--transition);
+}
+
+.prompt-editor:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-glow);
+}
+
+.prompt-editor-body {
+  position: relative;
+}
+
+.prompt-mirror,
+.prompt-input {
+  font-family: var(--font-body);
+  font-size: 0.9rem;
+  line-height: 1.55;
+  letter-spacing: normal;
+  padding: 12px;
+  margin: 0;
+  border: 0;
+  min-height: 132px;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  box-sizing: border-box;
+}
+
+.prompt-mirror {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--text-main);
+}
+
+.prompt-input {
+  position: relative;
+  display: block;
+  width: 100%;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text-main);
+  resize: vertical;
+  outline: none;
+}
+
+.prompt-input::placeholder { color: var(--text-dim); }
+
+.prompt-mark { border-radius: 3px; }
+.prompt-mark-snippet { color: var(--mark-snippet); background: var(--mark-snippet-bg); }
+.prompt-mark-affix { color: var(--mark-affix); background: var(--mark-affix-bg); }
+.prompt-mark-tag { color: var(--mark-tag); background: var(--mark-tag-bg); }
+.prompt-mark-missing-tag {
+  color: var(--mark-missing);
+  background: var(--mark-missing-bg);
+  text-decoration: underline wavy;
+}
+
+/* Floats over the hovered block's trailing edge. The mirror cannot receive
+   the pointer, so this is placed from a hit-test rather than by :hover. */
+.prompt-mark-remove {
+  position: absolute;
+  transform: translate(-4px, -2px);
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 50%;
+  background: var(--mark-missing);
+  color: #fff;
+  cursor: pointer;
+  z-index: 4;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+.prompt-affix {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 10px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--mark-affix);
+  background: var(--mark-affix-bg);
+}
+
+.prompt-affix-pre { border-bottom: 1px solid var(--border-light); border-radius: var(--radius-sm) var(--radius-sm) 0 0; }
+.prompt-affix-post { border-top: 1px solid var(--border-light); border-radius: 0 0 var(--radius-sm) var(--radius-sm); }
+
+.prompt-affix-text {
+  flex: 1;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: text;
+}
+
+.prompt-affix-text:hover { text-decoration: underline dotted; }
+
+.prompt-affix-remove {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.25);
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: var(--transition);
+}
+
+.prompt-affix:hover .prompt-affix-remove { opacity: 1; }
+
+.prompt-editor-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border-light);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.prompt-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.prompt-legend-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+/* The disabled pre/post prompt, offered back as a chip. */
+.prompt-affix-restore {
+  background: none;
+  border: 1px dashed var(--border-light);
+  border-radius: 20px;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+
+.prompt-affix-restore:hover { color: var(--mark-affix); border-color: var(--mark-affix); }
+
+/* --- AUTO PROMPT CONTROLS ------------------------------------------------- */
+
+.auto-prompt-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.auto-prompt-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 2px;
+}
+
+.auto-prompt-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.auto-prompt-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.auto-prompt-check input { margin-top: 3px; flex-shrink: 0; }
+.auto-prompt-check strong { display: block; color: var(--text-main); font-weight: 600; }
+.auto-prompt-check em { display: block; font-style: normal; font-size: 0.73rem; color: var(--text-dim); }
+
+/* --- EFFECTIVE PROMPT ------------------------------------------------------
+   The resolved text, always visible under the editor. Read-only until clicked,
+   at which point it becomes an override sent verbatim — so the overridden state
+   has to look obviously different from the composed one, or the panel would
+   claim to be showing a composition it is no longer following. */
+
+.effective-prompt {
+  margin-top: 10px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+}
+
+body.light-theme .effective-prompt { background: rgba(15, 23, 42, 0.05); }
+
+.effective-prompt.is-overridden { border-color: var(--mark-snippet); }
+
+.effective-prompt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.effective-prompt-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: 0;
+  padding: 0;
+  font-family: var(--font-body);
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.effective-prompt-toggle:hover { color: var(--text-main); }
+
+.effective-prompt-stats {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+
+.effective-prompt-revert {
+  padding: 3px 8px;
+  font-size: 0.68rem;
+  gap: 4px;
+}
+
+.effective-prompt-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 9px;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: var(--mark-snippet);
+  background: var(--mark-snippet-bg);
+}
+
+.effective-prompt-banner svg { flex-shrink: 0; margin-top: 2px; }
+
+.effective-prompt-body {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  overflow-y: auto;
+  border: 0;
+  background: none;
+  transition: var(--transition);
+}
+
+.effective-prompt-readonly {
+  color: var(--text-muted);
+  cursor: text;
+}
+
+.effective-prompt-readonly:hover {
+  background: rgba(139, 92, 246, 0.06);
+  color: var(--text-main);
+}
+
+.effective-prompt-readonly em { color: var(--text-dim); }
+
+.effective-prompt-input {
+  color: var(--text-main);
+  resize: vertical;
+  outline: none;
+  min-height: 90px;
+}

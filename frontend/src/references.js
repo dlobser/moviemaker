@@ -52,6 +52,16 @@ export const REFERENCE_ROLES = [
 // pool instead — see `assetsContaining` and the push helper in App.jsx.
 export const REFERENCE_SCOPES = ['project', 'scene', 'shot'];
 
+// The board kind a generated image lands under, per asset type — used when
+// asset generations auto-register themselves as references.
+export const KIND_BY_ASSET_TYPE = {
+  character: 'character',
+  environment: 'scenery',
+  prop: 'prop',
+  vehicle: 'prop',
+  style: 'style'
+};
+
 export function kindLabel(kindId) {
   return REFERENCE_KINDS.find(k => k.id === kindId)?.label || 'Other';
 }
@@ -144,7 +154,7 @@ export function migrateReferenceState(state = {}) {
   return { references, assignments, scenes };
 }
 
-function normalizeAssignment(edge) {
+export function normalizeAssignment(edge) {
   if (!edge || !edge.refId || !REFERENCE_SCOPES.includes(edge.scope)) return null;
   if (edge.scope !== 'project' && !edge.targetId) return null;
   return {

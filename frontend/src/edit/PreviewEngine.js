@@ -23,6 +23,9 @@ import { AudioScheduler } from './AudioScheduler.js';
 const HARD_CORRECT = 0.25;
 const SOFT_CORRECT = 0.08;
 
+/** A seek that has produced no `seeked` event after this long is wedged. */
+const SEEK_WATCHDOG_MS = 1500;
+
 export class PreviewEngine {
   constructor({ canvas, resolveUrl, onTime, onStateChange }) {
     this.canvas = canvas;
@@ -60,7 +63,9 @@ export class PreviewEngine {
       resolveUrl: this.resolveUrl
     });
 
-    this.slots = [this.createSlot(), this.createSlot()];
+    // Three, not two: current, next AND previous stay warm, so scrubbing
+    // backwards across a cut does not hit a cold src assignment.
+    this.slots = [this.createSlot(), this.createSlot(), this.createSlot()];
     this.images = new Map();   // asset path -> HTMLImageElement
     this.urls = new Map();     // asset path -> object/http url
     this.frame = null;
@@ -85,7 +90,54 @@ export class PreviewEngine {
     source.connect(gain);
     gain.connect(this.master);
 
-    return { element, gain, path: null, clipId: null, ready: false };
+    const slot = {
+      element,
+      gain,
+      path: null,
+      clipId: null,
+      ready: false,
+      // Coalesced seeking: at most one currentTime assignment in flight per
+      // element, latest requested target wins. Raw assignments every rAF tick
+      // piled up aborted seeks and froze the picture during a scrub.
+      seekTarget: null,
+      seeking: false,
+      seekIssuedAt: 0,
+      // Generation token: a superseded loadInto must never mark the slot
+      // ready with stale content (the AudioScheduler pattern).
+      loadToken: 0
+    };
+    // One persistent listener; seekElement's own temporary listeners coexist.
+    element.addEventListener('seeked', () => this.onSlotSeeked(slot));
+    return slot;
+  }
+
+  /**
+   * Latest-target-wins seek. Never more than one in-flight seek per element:
+   * if one is already running, the target is parked and the `seeked` handler
+   * chases it.
+   */
+  requestSeek(slot, mediaTime) {
+    slot.seekTarget = mediaTime;
+    if (slot.seeking) return;                 // seeked handler re-issues
+    if (slot.element.readyState < 1) return;  // no metadata yet; loadInto path handles it
+    slot.seeking = true;
+    const target = slot.seekTarget;
+    slot.seekTarget = null;
+    slot.seekIssuedAt = performance.now();
+    try {
+      slot.element.currentTime = target;
+    } catch {
+      slot.seeking = false;
+    }
+  }
+
+  onSlotSeeked(slot) {
+    slot.seeking = false;
+    if (slot.seekTarget !== null) {
+      const next = slot.seekTarget;
+      slot.seekTarget = null;
+      this.requestSeek(slot, next);           // pointer moved on; chase it
+    }
   }
 
   // --- content ---------------------------------------------------------------
@@ -144,23 +196,34 @@ export class PreviewEngine {
     return image;
   }
 
-  /** The slot already showing this clip, or the one least likely to be missed. */
-  claimSlot(entry, keepClipId) {
+  /**
+   * The slot already showing this clip, an empty one, or one whose clip is
+   * not in `keep` (clip ids to protect: current + incoming during dissolves,
+   * current + neighbours during preload). Null when everything is protected —
+   * callers skip rather than evict.
+   */
+  claimSlot(entry, keep = []) {
     const existing = this.slots.find(slot => slot.clipId === entry.clip.id);
     if (existing) return existing;
-    const free = this.slots.find(slot => slot.clipId !== keepClipId && slot.clipId !== entry.clip.id);
-    return free || this.slots[0];
+    return this.slots.find(slot => !keep.includes(slot.clipId) && slot.clipId !== entry.clip.id) || null;
   }
 
   async loadInto(slot, entry) {
     const path = entry.resolved.path;
     if (slot.clipId === entry.clip.id && slot.path === path) return slot;
 
+    // Overlapping loads race on the shared slots; the token makes sure only
+    // the newest load can mark the slot ready (a stale seekElement resolve —
+    // its 4s timeout included — becomes harmless).
+    const token = ++slot.loadToken;
     slot.clipId = entry.clip.id;
     slot.ready = false;
+    slot.seekTarget = null;
+    slot.seeking = false;
 
     if (slot.path !== path) {
       const url = await this.urlFor(path);
+      if (token !== slot.loadToken) return slot;
       if (!url) return slot;
       slot.path = path;
       slot.element.src = url;
@@ -168,9 +231,9 @@ export class PreviewEngine {
 
     try {
       await seekElement(slot.element, entry.in);
-      slot.ready = true;
+      if (token === slot.loadToken) slot.ready = true;
     } catch {
-      slot.ready = false;
+      if (token === slot.loadToken) slot.ready = false;
     }
     return slot;
   }
@@ -211,12 +274,11 @@ export class PreviewEngine {
       // Scheduled buffers are pinned to absolute times, so a seek has to throw
       // them away and lay the whole schedule down again from the new position.
       this.scheduler.start(this.playhead);
-      // Force every slot to re-align on the next frame.
-      for (const slot of this.slots) slot.ready = false;
     } else {
       this.scheduler.stop();
       for (const slot of this.slots) slot.element.pause();
-      this.drawAt(this.playhead);
+      // No explicit draw: the always-on rAF loop lands the frame, and
+      // syncSlot's paused drift rule issues the coalesced seek.
     }
     this.onTime(this.playhead);
   }
@@ -265,18 +327,24 @@ export class PreviewEngine {
       return;
     }
 
-    this.syncSlot(current, time, incoming?.clip.id);
+    const next = this.timeline.video[current.index + 1];
+    const previous = this.timeline.video[current.index - 1];
+    // Everything worth keeping warm; claimSlot never evicts these.
+    const keep = [current.clip.id, incoming?.clip.id, next?.clip.id, previous?.clip.id].filter(Boolean);
+
+    this.syncSlot(current, time, keep);
     this.paintEntry(current, 1);
 
     if (incoming) {
-      this.syncSlot(incoming, time, current.clip.id);
+      this.syncSlot(incoming, time, keep);
       this.paintEntry(incoming, mix);
       this.mixAudio(current, 1 - mix, incoming, mix);
+      // With three slots it is safe to warm the next clip even mid-dissolve —
+      // the two on screen are protected by `keep`.
+      this.preload(current, [current.clip.id, incoming.clip.id, next?.clip.id].filter(Boolean));
     } else {
       this.mixAudio(current, 1, null, 0);
-      // Only safe while nothing is dissolving: during a transition both slots
-      // are spoken for.
-      this.preload(current);
+      this.preload(current, keep);
     }
 
     this.paintDip(current, incoming, time);
@@ -284,16 +352,24 @@ export class PreviewEngine {
   }
 
   /** Get the right media onto a slot and keep it in step with the clock. */
-  syncSlot(entry, time, keepClipId) {
+  syncSlot(entry, time, keep = []) {
     if (entry.resolved.kind === 'image' || entry.resolved.kind === 'missing') return;
 
-    const slot = this.claimSlot(entry, keepClipId);
+    const slot = this.claimSlot(entry, keep);
+    if (!slot) return;
     if (slot.clipId !== entry.clip.id || slot.path !== entry.resolved.path) {
       this.loadInto(slot, entry);
       return;
     }
     // Nothing decodable yet — there is no frame to show and no point steering.
     if (slot.element.readyState < 2) return;
+
+    // A wedged seek (seeking to exactly `duration` never fires `seeked` in
+    // most browsers) must not freeze the slot forever.
+    if (slot.seeking && performance.now() - slot.seekIssuedAt > SEEK_WATCHDOG_MS) {
+      console.warn('[preview] seek watchdog fired; retrying');
+      slot.seeking = false;
+    }
 
     // Correcting drift against a seek that has not landed just fights it, but
     // transport still applies: gating playback on the seek promise is what
@@ -302,10 +378,16 @@ export class PreviewEngine {
       const expected = entry.in + (time - entry.start);
       const drift = expected - slot.element.currentTime;
 
-      if (Math.abs(drift) > HARD_CORRECT) {
-        slot.element.currentTime = expected;
+      if (!this.playing) {
+        // Paused: land on the exact frame. Half a frame of tolerance stops
+        // re-seek churn once we are there.
+        const frame = 1 / (this.timeline?.settings?.fps || 24);
+        if (!slot.seeking && Math.abs(drift) > frame / 2) this.requestSeek(slot, expected);
         slot.element.playbackRate = 1;
-      } else if (this.playing && Math.abs(drift) > SOFT_CORRECT) {
+      } else if (Math.abs(drift) > HARD_CORRECT) {
+        this.requestSeek(slot, expected);
+        slot.element.playbackRate = 1;
+      } else if (Math.abs(drift) > SOFT_CORRECT) {
         slot.element.playbackRate = 1 + Math.max(-0.05, Math.min(0.05, drift));
       } else {
         slot.element.playbackRate = 1;
@@ -388,24 +470,28 @@ export class PreviewEngine {
   }
 
   /**
-   * Keep the spare slot holding whatever comes next.
+   * Keep the spare slots holding the neighbours — the next clip AND the
+   * previous one, so scrubbing backwards across a cut is as warm as playing
+   * forwards through it. Next wins the slot tiebreak (it is warmed first).
    *
-   * There is no lead-time window: with two slots the spare has nothing else to
-   * do, so loading the next clip the moment the current one starts gives a full
-   * clip's worth of head start. A fixed window was too tight — a clip that had
-   * not finished fetching by its own cut point started late and then had to be
-   * yanked into place by drift correction.
+   * There is no lead-time window: a spare slot has nothing else to do, so
+   * loading the moment the current clip starts gives a full clip's worth of
+   * head start. A fixed window was too tight — a clip that had not finished
+   * fetching by its own cut point started late and then had to be yanked into
+   * place by drift correction.
    */
-  preload(current) {
-    const next = this.timeline.video[current.index + 1];
-    if (!next || next.resolved.kind === 'missing') return;
-
-    if (next.resolved.kind === 'image') {
-      this.imageFor(next.resolved.path);
-      return;
-    }
-    const slot = this.claimSlot(next, current.clip.id);
-    if (slot.clipId !== next.clip.id) this.loadInto(slot, next);
+  preload(current, keep = []) {
+    const warm = (entry) => {
+      if (!entry || entry.resolved.kind === 'missing') return;
+      if (entry.resolved.kind === 'image') {
+        this.imageFor(entry.resolved.path);
+        return;
+      }
+      const slot = this.claimSlot(entry, keep);
+      if (slot && slot.clipId !== entry.clip.id) this.loadInto(slot, entry);
+    };
+    warm(this.timeline.video[current.index + 1]);
+    warm(this.timeline.video[current.index - 1]);
   }
 
   idleSlots() {

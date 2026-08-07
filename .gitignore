@@ -4,6 +4,6 @@ config.json
 *.log
 .claude/
 gitignore/
+assets/
 .logs/
 projects/
-frontend/dist/

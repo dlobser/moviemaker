@@ -104,6 +104,11 @@ Tags must be a single word (letters, digits, _ or -), and every tag used in a
 prompt must exist in the "assets" array.
 Valid asset "type" values: ${assetTypeList}.
 
+Scenes may optionally carry the same "imageModel" / "imageResolution" /
+"videoModel" / "videoResolution" / "videoDuration" fields shown on shots —
+they become defaults for every shot in that scene that does not set its own.
+Omit any you have no opinion on; never emit them as empty strings.
+
 Assets already defined in this project (reuse these tags, do not redefine them):
 ${existingAssets}
 
@@ -119,6 +124,32 @@ ${llmList}
 === SOURCE MATERIAL ===
 ${sourceMaterial || '<<< PASTE YOUR SCRIPT, TREATMENT OR SHOT LIST HERE >>>'}
 `;
+}
+
+/**
+ * Pull the JSON document out of text pasted straight from a chat window.
+ *
+ * A file picked off disk is whatever the user saved, but a paste is usually a
+ * model's reply verbatim: wrapped in a ```json fence, or introduced with a
+ * sentence, or followed by an offer to make changes. All of that is trivial to
+ * strip here and irritating to strip by hand, so the paste box accepts it.
+ */
+export function extractJsonDocument(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) throw new Error('Nothing to import yet — paste a shot list first.');
+
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/, '')
+    .trim();
+
+  const start = unfenced.indexOf('{');
+  const end = unfenced.lastIndexOf('}');
+  if (start === -1 || end <= start) {
+    throw new Error('No JSON object found in the pasted text.');
+  }
+
+  return JSON.parse(unfenced.slice(start, end + 1));
 }
 
 let idCounter = 0;
@@ -211,21 +242,45 @@ export function normalizeImportedShotList(raw) {
     throw new Error('No "scenes" (or legacy "shots") array found in the imported file.');
   }
 
+  // Every imported scene and shot gets a fresh id, so anything in the document
+  // that pointed at the old ids (reference assignments, above all) needs a map
+  // from exported id → minted id to survive the round trip.
+  const idMap = {};
+  // Pre-v2 exports kept per-shot reference ids as `shot.referenceImages`.
+  // Writing that legacy field back onto shots can never migrate (the schema
+  // migration only runs at load, and the project is already stamped v2), so
+  // the importer surfaces them here for the caller to turn into edges.
+  const legacyShotRefs = [];
+
   const scenes = sceneSource.map((rawScene, sceneIndex) => {
     const rawShots = Array.isArray(rawScene?.shots) ? rawScene.shots : [];
     if (rawShots.length === 0) {
       warnings.push(`Scene "${rawScene?.name || sceneIndex + 1}" has no shots.`);
     }
 
+    const sceneId = makeId('scene');
+    if (rawScene?.id) idMap[rawScene.id] = sceneId;
+
     return {
-      id: makeId('scene'),
+      id: sceneId,
       name: asString(rawScene?.name, `Scene ${sceneIndex + 1}`),
       number: Number(rawScene?.number) || sceneIndex + 1,
+      // Optional scene-level generation defaults (resolveModelSettings reads
+      // them between shot overrides and project defaults). Absent = inherit.
+      imageModel: asString(rawScene?.imageModel) || null,
+      imageResolution: asString(rawScene?.imageResolution) || null,
+      videoModel: asString(rawScene?.videoModel) || null,
+      videoResolution: asString(rawScene?.videoResolution) || null,
+      videoDuration: rawScene?.videoDuration != null && rawScene.videoDuration !== '' ? String(rawScene.videoDuration) : null,
       sceneConcatenatedVideo: null,
       shots: rawShots.map((rawShot, shotIndex) => {
         const shot = rawShot && typeof rawShot === 'object' ? rawShot : {};
+        const shotId = makeId('shot');
+        if (shot.id) idMap[shot.id] = shotId;
+        const legacyRefIds = Array.isArray(shot.referenceImages) ? shot.referenceImages.filter(Boolean) : [];
+        if (legacyRefIds.length > 0) legacyShotRefs.push({ shotId, refIds: legacyRefIds });
         return {
-          id: makeId('shot'),
+          id: shotId,
           name: asString(shot.name, `Shot ${shotIndex + 1}`),
           setup: asString(shot.setup),
           description: asString(shot.description),
@@ -241,8 +296,8 @@ export function normalizeImportedShotList(raw) {
           videoDuration: shot.videoDuration != null ? String(shot.videoDuration) : null,
           selectedImage: asString(shot.selectedImage) || null,
           selectedVideo: asString(shot.selectedVideo) || null,
-          referenceImages: Array.isArray(shot.referenceImages) ? shot.referenceImages : [],
           lipSyncAudio: asString(shot.lipSyncAudio) || null,
+          audioRefs: Array.isArray(shot.audioRefs) ? shot.audioRefs.map(asString).filter(Boolean) : [],
           // Preserve generated history when re-importing a full project export.
           imagePrompts: Array.isArray(shot.imagePrompts) ? shot.imagePrompts : [],
           videoPrompts: Array.isArray(shot.videoPrompts) ? shot.videoPrompts : []
@@ -251,5 +306,5 @@ export function normalizeImportedShotList(raw) {
     };
   });
 
-  return { project, assets, promptSnippets, scenes, warnings };
+  return { project, assets, promptSnippets, scenes, warnings, idMap, legacyShotRefs };
 }

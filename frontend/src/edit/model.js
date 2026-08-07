@@ -49,7 +49,22 @@ export function createEmptyEdit() {
     smart: true,
     video: [],
     audio: [],
+    // The media bin: a curated list of external files brought into the edit,
+    // not a folder scan — assets/ holds hundreds of generated iterations that
+    // would drown one. Durations flow through `durations` like everything else.
+    bin: [],
     durations: {}
+  };
+}
+
+/** One bin entry. Type decides which track kinds it can land on. */
+export function createBinItem({ path, name, type }) {
+  return {
+    id: newId('bin'),
+    path,
+    name: name || basename(path),
+    type: ['video', 'audio', 'image'].includes(type) ? type : 'video',
+    addedAt: new Date().toISOString()
   };
 }
 
@@ -155,7 +170,7 @@ export function resolveClipSource(clip, scenes) {
 
   if (source.kind === 'asset') {
     return {
-      kind: source.stream === 'audio' ? 'audio' : 'video',
+      kind: source.stream === 'audio' ? 'audio' : source.stream === 'image' ? 'image' : 'video',
       path: source.path || null,
       name: source.name || basename(source.path),
       shotId: null
@@ -226,6 +241,11 @@ export function collectSourcePaths(edit, scenes) {
       const resolved = resolveClipSource(clip, scenes);
       if (resolved.path) paths.add(resolved.path);
     }
+  }
+  // Bin items measure through the same probe cache, so the panel can show a
+  // duration before the file ever lands on a track.
+  for (const item of edit?.bin || []) {
+    if (item?.path) paths.add(item.path);
   }
   return [...paths];
 }
@@ -307,7 +327,19 @@ export function migrateEdit(raw) {
     smart: raw.smart !== false,
     video: (Array.isArray(raw.video) ? raw.video : []).map(normalizeVideoClip),
     audio: (Array.isArray(raw.audio) ? raw.audio : []).map(normalizeAudioTrack),
+    bin: (Array.isArray(raw.bin) ? raw.bin : []).map(normalizeBinItem).filter(Boolean),
     durations: (raw.durations && typeof raw.durations === 'object') ? raw.durations : {}
+  };
+}
+
+function normalizeBinItem(raw) {
+  if (!raw || typeof raw !== 'object' || !raw.path) return null; // pathless items are junk
+  return {
+    id: raw.id || newId('bin'),
+    path: raw.path,
+    name: raw.name || basename(raw.path),
+    type: ['video', 'audio', 'image'].includes(raw.type) ? raw.type : 'video',
+    addedAt: raw.addedAt || new Date().toISOString()
   };
 }
 
@@ -330,6 +362,8 @@ function normalizeVideoClip(raw) {
     start: Math.max(0, finiteOr(raw?.start, 0)),
     in: Math.max(0, finiteOr(raw?.in, 0)),
     out: raw?.out === null || raw?.out === undefined ? null : Math.max(0, finiteOr(raw.out, 0)),
+    // Per-clip hold for stills; null = shot duration / project default.
+    stillSeconds: Number(raw?.stillSeconds) > 0 ? Number(raw.stillSeconds) : null,
     transition: normalizeTransition(raw?.transition),
     audio: {
       gain: finiteOr(raw?.audio?.gain, 1),

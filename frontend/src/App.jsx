@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Sparkles,
   Film,
@@ -31,13 +31,16 @@ import {
   StopCircle,
   LayoutGrid,
   Scissors,
-  RotateCcw
+  RotateCcw,
+  Moon,
+  ClipboardPaste,
+  Undo2,
+  Redo2,
+  FileText
 } from 'lucide-react';
 import {
   IMAGE_MODELS,
   VIDEO_MODELS,
-  IMAGE_ASPECT_RATIOS,
-  VIDEO_RESOLUTIONS,
   LLM_PROVIDERS,
   PROVIDER_LABELS,
   getImageModel,
@@ -46,20 +49,45 @@ import {
   isKnownVideoModel,
   priceLabel,
   groupedModelOptions,
-  refImageCapacity
+  parseModelId,
+  durationOptions,
+  modelCapabilities,
+  refAudioCapacity,
+  refImageCapacity,
+  setCustomModelOverrides,
+  sizeOptions
 } from './catalog.js';
 import {
   ASSET_TYPES,
   assetInputImages,
+  assetPrimaryImage,
+  assetPromptText,
+  buildAutoPromptContext,
   composeGenerationPrompt,
   defaultAssetPrompt,
+  droppedTags,
   extractTags,
   findAssetByTag,
-  normalizeTag
+  normalizeTag,
+  scanPromptTags,
+  tagPreservationRule
 } from './promptTags.js';
-import { buildLlmImportPrompt, normalizeImportedShotList } from './shotListImport.js';
+import {
+  insertIntoPrompt,
+  remapDecorations,
+  removeDecoration,
+  undecorate
+} from './promptDecorations.js';
+import PromptEditor, { EffectivePrompt } from './PromptEditor.jsx';
+import { buildLlmImportPrompt, extractJsonDocument, normalizeImportedShotList } from './shotListImport.js';
 import { apiFetch, resolveAssetUrl, detectMode, isStatic } from './client.js';
-import { createEmptyEdit, migrateEdit } from './edit/model.js';
+import {
+  createAudioTrack, createEmptyEdit, deriveAudioClipsForShots, deriveVideoClips, migrateEdit
+} from './edit/model.js';
+import { makeContext, normalize } from './edit/timing.js';
+import { reconcile } from './edit/reconcile.js';
+import { createPipelineRun, estimateRun } from './pipeline.js';
+import PipelinePanel from './PipelinePanel.jsx';
 import EditView from './edit/EditView.jsx';
 import { AssetImage, AssetVideo, useAssetUrl } from './AssetMedia.jsx';
 import * as projectFs from './static/fileSystem.js';
@@ -71,10 +99,12 @@ import {
   promptText
 } from './prompts.js';
 import {
+  KIND_BY_ASSET_TYPE,
   REFERENCE_SCHEMA_VERSION,
   assignReferences,
   enabledReferencePaths,
   migrateReferenceState,
+  normalizeAssignment,
   normalizeReference,
   pruneAssignments,
   resolveSceneReferences,
@@ -84,10 +114,75 @@ import {
 } from './references.js';
 import ReferencePanel, { ReferenceStrip } from './ReferencePanel.jsx';
 import SettingsPanel from './SettingsPanel.jsx';
+import CustomModelPath from './CustomModelPath.jsx';
+import { resolveModelSettings } from './modelSettings.js';
+import { generateShotListFromIdea } from './scriptGen.js';
+import { buildDirtyMap, dirtyImageCandidates, dirtyVideoCandidates, groupForSelection } from './dirty.js';
+import MediaPickerDialog from './MediaPickerDialog.jsx';
+import { collectShotMedia } from './imagePicker.js';
+import DreamDialog from './DreamDialog.jsx';
+import {
+  DEFAULT_DREAM_SYSTEM_PROMPT,
+  buildDreamUserMessage,
+  compactDreamSettings,
+  createDreamSettings,
+  dreamShotName,
+  parseDreamReply
+} from './dream.js';
+import { captureLastFrame } from './dreamFrame.js';
+import {
+  canRedo as historyCanRedo,
+  canUndo as historyCanUndo,
+  createHistory,
+  describeChange,
+  pushHistory,
+  redoHistory,
+  redoLabel as historyRedoLabel,
+  undoHistory,
+  undoLabel as historyUndoLabel
+} from './history.js';
 import { Menu, MenuItem, MenuLabel, MenuSeparator } from './MenuBar.jsx';
 import './reference.css';
 import './menu.css';
 import './settings.css';
+
+/**
+ * A compact model pill: the resolved model + where it came from, and (when
+ * editable) a hidden <select> over the whole pill so clicking it overrides or
+ * clears the level it sits on. Clearing means inherit, never "no model".
+ */
+function ModelPill({ type, resolved, value, onChange, title }) {
+  const models = type === 'image' ? IMAGE_MODELS : VIDEO_MODELS;
+  const label = (type === 'image' ? getImageModel(resolved.model) : getVideoModel(resolved.model))?.label || resolved.model || '—';
+  return (
+    <span
+      className="model-pill"
+      title={title || `${type === 'image' ? 'Image' : 'Video'} model: ${resolved.model || 'none'} (from ${resolved.source})`}
+      style={{
+        position: 'relative', display: 'inline-flex', alignItems: 'center', gap: '4px',
+        padding: '1px 8px', borderRadius: '999px', fontSize: '0.68rem', cursor: onChange ? 'pointer' : 'default',
+        background: resolved.source === 'project' ? 'rgba(100,116,139,0.15)' : 'rgba(139,92,246,0.18)',
+        border: '1px solid rgba(139,92,246,0.25)', color: 'var(--text-dim)', maxWidth: '220px', whiteSpace: 'nowrap'
+      }}
+    >
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        {type === 'image' ? '🖼' : '🎬'} {label}
+      </span>
+      <em style={{ fontStyle: 'normal', opacity: 0.7 }}>· {resolved.source}</em>
+      {onChange && (
+        <select
+          value={value || ''}
+          onChange={(e) => onChange(e.target.value || null)}
+          style={{ position: 'absolute', inset: 0, opacity: 0, width: '100%', cursor: 'pointer' }}
+          title=""
+        >
+          <option value="">Inherit ({resolved.source === 'shot' || resolved.source === 'scene' ? 'clear override' : label})</option>
+          <ModelOptions models={models} unit={type === 'image' ? 'img' : 'video'} />
+        </select>
+      )}
+    </span>
+  );
+}
 
 /** Render a model <select>'s options grouped by provider, with pricing inline. */
 function ModelOptions({ models, unit }) {
@@ -110,6 +205,17 @@ export default function App() {
   const [scenes, setScenes] = useState([]);
   const [activeSceneId, setActiveSceneId] = useState(null);
   const shots = scenes.flatMap(s => s.shots || []);
+
+  // The freshest scenes, for async runners that outlive a render (the
+  // two-stage stale regeneration re-derives its video candidates from state
+  // as it stood AFTER the image stage finished).
+  const scenesRef = useRef(scenes);
+  useEffect(() => { scenesRef.current = scenes; }, [scenes]);
+
+  // Same for anything else a long-lived pipeline run must read fresh: React
+  // closures captured at run start go stale the moment a stage writes state.
+  const assetLibraryRef = useRef([]);
+  const pipelineFnsRef = useRef({});
 
   const [viewingPromptText, setViewingPromptText] = useState(null);
   const [frameCaptureChoice, setFrameCaptureChoice] = useState(null); // { imagePath, imageName, shotId }
@@ -169,8 +275,27 @@ export default function App() {
   // attaching a character portrait there silently replaces the frame you meant
   // to animate, so it is off unless explicitly asked for.
   const [attachTagsForImages, setAttachTagsForImages] = useState(true);
+  // Atlas Cloud's open-weight image models expose their safety checker as a
+  // request flag. Defaults to the provider's own default (on).
+  const [atlasSafetyChecker, setAtlasSafetyChecker] = useState(true);
   const [attachTagsForVideos, setAttachTagsForVideos] = useState(false);
   const [genModalAttachTags, setGenModalAttachTags] = useState(true);
+
+  // Per-project capability overrides for custom model paths, keyed by the id
+  // as typed: { 'higgsfield:vendor/model': { refImages: 8 } }. The catalog
+  // reads these through a registry so every capacity check sees them.
+  const [customModelCaps, setCustomModelCaps] = useState({});
+  useEffect(() => { setCustomModelOverrides(customModelCaps); }, [customModelCaps]);
+
+  // Per-asset-type image model defaults, e.g. characters on an
+  // identity-preserving model while environments use cheap t2i. Read by
+  // resolveModelSettings between an asset's own override and the project default.
+  const [assetTypeModels, setAssetTypeModels] = useState({});
+
+  // Whether a <Tag> may spend a model's spare input slots on board references
+  // linked to that asset (beyond the primary it always carried). Mirrors
+  // attachTagsForImages: a project-level behaviour switch.
+  const [autoAttachRefs, setAutoAttachRefs] = useState(true);
 
   // --- PROMPTS ---
   // Every editable prompt in one bag, keyed by the slot ids in prompts.js. A
@@ -204,18 +329,54 @@ export default function App() {
   const cancelBatchRef = useRef(false);
   const [batchDialog, setBatchDialog] = useState(null); // { type: 'image'|'video', scope: 'scene'|'all' }
   const [batchOnlyMissing, setBatchOnlyMissing] = useState(true);
+  const [batchOnlyDirty, setBatchOnlyDirty] = useState(false);
+  // Shot-list display filter: show only shots whose image or video is stale.
+  const [showOnlyStale, setShowOnlyStale] = useState(false);
   const [batchConcurrency, setBatchConcurrency] = useState(3);
+
+  // --- UNDO / REDO ---
+  // Snapshots of the whole project, taken from the same payload the autosave
+  // writes. See history.js for why it is whole-project rather than per-action.
+  const [history, setHistory] = useState(createHistory);
+  const lastSnapshotRef = useRef(null);   // the state the last snapshot captured
+  const skipHistoryRef = useRef(true);    // true while loading, so a load is not a step
+
+  // --- DREAM MODE (self-contained; nothing else reads this) ---
+  const [dreamOpen, setDreamOpen] = useState(false);
+  const [dreamSettings, setDreamSettings] = useState(() => createDreamSettings());
+  const [dreamRun, setDreamRun] = useState(null); // { active, total, clip, completed, phase, log[] }
+  const dreamCancelRef = useRef(false);
 
   // --- PROJECTS (one folder per project) ---
   const [project, setProject] = useState({ path: null, name: 'Loading…', workingFolder: '', isLegacy: true, recent: [] });
   const [newProjectDraft, setNewProjectDraft] = useState(null); // { directory, name }
   const [runtimeMode, setRuntimeMode] = useState(null); // 'server' | 'static'
   const [needsFolderPermission, setNeedsFolderPermission] = useState(false);
+  const [folderNoticeDismissed, setFolderNoticeDismissed] = useState(false);
 
   // --- SHOT LIST IMPORT ---
   const [importReport, setImportReport] = useState(null); // { added, warnings[] }
   const [llmPromptSource, setLlmPromptSource] = useState('');
   const shotListInputRef = useRef(null);
+  // Pasting an LLM's reply straight in, as an alternative to saving it to a file
+  // first. Same document, same normaliser — only the way it arrives differs.
+  const [pasteImport, setPasteImport] = useState(null); // null | { text, mode }
+
+  // Idea → Script: in-app script generation replacing the clipboard round-trip.
+  const [scriptGenOpen, setScriptGenOpen] = useState(false);
+  const [scriptGenIdea, setScriptGenIdea] = useState('');
+  const [scriptGenBusy, setScriptGenBusy] = useState(false);
+  const [scriptGenPreview, setScriptGenPreview] = useState(null); // result of generateShotListFromIdea
+
+  // --- PIPELINE (one-button generate) ---
+  const [pipelineOpen, setPipelineOpen] = useState(false);
+  const [pipelineIdea, setPipelineIdea] = useState('');
+  const [pipelineSkip, setPipelineSkip] = useState(() => new Set());
+  const [pipelineRunState, setPipelineRunState] = useState(null); // last snapshot; persisted
+  const [pipelineEstimate, setPipelineEstimate] = useState(null);
+  const pipelineRunRef = useRef(null); // live controller
+  const pipelineIdeaRef = useRef('');
+  useEffect(() => { pipelineIdeaRef.current = pipelineIdea; }, [pipelineIdea]);
 
   // --- UI STATES ---
   const [activeShotId, setActiveShotId] = useState(null);
@@ -224,6 +385,8 @@ export default function App() {
   const [loadingStates, setLoadingStates] = useState({});
   const [toast, setToast] = useState(null);
   const [projectImagesSelector, setProjectImagesSelector] = useState(null); // null | { target: 'ref' }
+  // Picking a shot's active still or clip from anywhere in the project.
+  const [mediaPicker, setMediaPicker] = useState(null); // null | { shotId, kind }
   const [projectImagesList, setProjectImagesList] = useState([]);
 
   // --- MODALS FOR GENERATION PER SHOT ---
@@ -231,12 +394,32 @@ export default function App() {
   // { type: 'image'|'video', shotId: string, existingPromptId: string|null }
 
   const [genModalPrompt, setGenModalPrompt] = useState('');
-  const [genModalImageInput, setGenModalImageInput] = useState('');
   const [genModalInputImages, setGenModalInputImages] = useState([]);
   const [genModalDuration, setGenModalDuration] = useState('5');
   const [genModalModel, setGenModalModel] = useState('');
   const [genModalRes, setGenModalRes] = useState('');
   const [genModalExcludedImages, setGenModalExcludedImages] = useState([]);
+  // The project's pre/post prompt, per generation. They are wrapped around
+  // every prompt by default; turning one off here is how you get a shot out
+  // from under the film's global grade without editing the project settings.
+  const [genModalUsePre, setGenModalUsePre] = useState(true);
+  const [genModalUsePost, setGenModalUsePost] = useState(true);
+  // Ranges in genModalPrompt that were inserted rather than typed — snippets
+  // and inlined pre/post text. Shown in their own colour so the prompt says
+  // where it came from. Purely a composing aid: they live as long as the modal
+  // does and are never saved, since the text alone is what gets generated.
+  const [genModalDecorations, setGenModalDecorations] = useState([]);
+  // Where to put the caret once the next prompt change has rendered.
+  const [genModalCaret, setGenModalCaret] = useState(null);
+  // A hand-edited effective prompt. null means "compose it from the fields
+  // above"; a string means the user took the wheel and it is sent verbatim.
+  const [genModalOverride, setGenModalOverride] = useState(null);
+  const [genModalEffectiveOpen, setGenModalEffectiveOpen] = useState(false);
+  // --- Auto Prompt controls ---
+  const [genModalAutoInstructions, setGenModalAutoInstructions] = useState('');
+  const [genModalAutoContext, setGenModalAutoContext] = useState(false);
+  const [genModalAutoBare, setGenModalAutoBare] = useState(false);
+  const [genModalAutoOpen, setGenModalAutoOpen] = useState(false);
 
   // --- DOUBLE CLICK PREVIEW WITH ZOOM & PAN ---
   const [zoomImage, setZoomImage] = useState(null); // { path: string, name: string }
@@ -282,6 +465,7 @@ export default function App() {
 
   // refs
   const audioInputRefs = useRef({});
+  const audioRefInputRefs = useRef({});
 
   // Helper: Toast Alert
   const showToast = (message, type = 'info') => {
@@ -300,8 +484,11 @@ export default function App() {
         // the browser may still want a click before granting access again.
         const restored = await projectFs.restoreActiveProject();
         if (restored?.needsPermission) {
+          // Not a gate: the app opens as normal and a banner offers the click.
+          // Reading the folder is what has to wait, so the state load does too.
           setNeedsFolderPermission(true);
           await fetchConfig();
+          await fetchProject();
           return;
         }
       }
@@ -368,8 +555,15 @@ export default function App() {
     }
   };
 
-  /** Push a saved state blob into every piece of studio state. */
-  const applyLoadedState = (state) => {
+  /**
+   * Push a saved state blob into every piece of studio state.
+   *
+   * `resetHistory` is on for every real load — opening a project, restoring a
+   * checkpoint, importing — because undoing across a project switch would
+   * paste one film into another. Undo and redo replay through here too, and
+   * pass false so they keep the stack they are walking.
+   */
+  const applyLoadedState = (state, { resetHistory = true } = {}) => {
     // Migrate or load scenes
     let loadedScenes = state.scenes || [];
     if (loadedScenes.length === 0 && state.shots && state.shots.length > 0) {
@@ -435,6 +629,18 @@ export default function App() {
     setBatchConcurrency(state.batchConcurrency || 3);
     setAttachTagsForImages(state.attachTagsForImages !== false);
     setAttachTagsForVideos(state.attachTagsForVideos === true);
+    setAtlasSafetyChecker(state.atlasSafetyChecker !== false);
+    setCustomModelCaps(state.customModelCaps && typeof state.customModelCaps === 'object' ? state.customModelCaps : {});
+    setAssetTypeModels(state.assetTypeModels && typeof state.assetTypeModels === 'object' ? state.assetTypeModels : {});
+    setAutoAttachRefs(state.autoAttachRefs !== false);
+    // The job log survives reload now; anything mid-flight when the page died
+    // is marked so rather than spinning forever.
+    setBatchJobs((Array.isArray(state.batchJobs) ? state.batchJobs : [])
+      .map(job => (job.status === 'running' ? { ...job, status: 'failed', error: 'interrupted by reload' } : job)));
+    setPipelineRunState(state.pipelineRun || null);
+    // Only the fields a dream saved are stored, so unset ones follow the
+    // project's current models rather than a pinned stale one.
+    setDreamSettings(createDreamSettings(state.dreamSettings || {}));
     // Folds the flat pre/post and system-prompt fields older projects saved at
     // the top level into the prompt bag.
     setPromptSettings(migratePromptSettings(state));
@@ -458,6 +664,10 @@ export default function App() {
       foundShotId = loadedScenes[0]?.shots[0]?.id || null;
     }
     setActiveShotId(foundShotId);
+
+    // A load is not an undoable step: the next snapshot becomes the new floor.
+    if (resetHistory) setHistory(createHistory());
+    skipHistoryRef.current = true;
   };
 
   // The full serialisable studio state. Shared by autosave and Save As.
@@ -485,6 +695,15 @@ export default function App() {
       batchConcurrency,
       attachTagsForImages,
       attachTagsForVideos,
+      atlasSafetyChecker,
+      customModelCaps,
+      assetTypeModels,
+      autoAttachRefs,
+      // Capped: the job log is a log, not an archive. Not in the autosave
+      // dependency list — it rides along with whatever else triggers a save.
+      batchJobs: batchJobs.slice(0, 100),
+      pipelineRun: pipelineRunState,
+      dreamSettings: compactDreamSettings(dreamSettings),
       // Only the slots that differ from their defaults are written, so a future
       // change to a default still reaches projects that never edited it.
       promptSettings: compactPromptSettings(promptSettings),
@@ -506,8 +725,9 @@ export default function App() {
 
   // Auto-Save Project State
   const saveProjectState = async (updatedScenes = scenes, extra = {}) => {
-    // Nothing to write to yet in the hosted build until a folder is picked.
-    if (isStatic() && !projectFs.getActiveHandle()) return;
+    // Nothing to write to yet in the hosted build until a folder is picked —
+    // and a folder we have not been re-granted access to would only throw.
+    if (isStatic() && (!projectFs.getActiveHandle() || needsFolderPermission)) return;
     try {
       await apiFetch(`/api/state`, {
         method: 'POST',
@@ -536,13 +756,117 @@ export default function App() {
     return () => document.body.classList.remove('reference-docked');
   }, [referencePanelOpen]);
 
+  /**
+   * Capture the state that existed *before* the change we just settled on.
+   *
+   * Sharing the autosave's debounce is deliberate: it means a burst of typing
+   * becomes one undo step rather than sixty, and that what undo restores is
+   * always something that was also written to disk.
+   */
+  const recordHistory = () => {
+    const snapshot = buildStatePayload();
+    if (skipHistoryRef.current) {
+      // The change came from a load or from undo itself — take it as the new
+      // baseline without recording a step.
+      skipHistoryRef.current = false;
+      lastSnapshotRef.current = snapshot;
+      return;
+    }
+    const previous = lastSnapshotRef.current;
+    lastSnapshotRef.current = snapshot;
+    if (!previous) return;
+    setHistory(prev => pushHistory(prev, {
+      state: previous,
+      label: describeChange(previous, snapshot),
+      at: Date.now()
+    }));
+  };
+
   const saveStateRef = useRef();
-  saveStateRef.current = () => { saveProjectState(); };
+  saveStateRef.current = () => { saveProjectState(); recordHistory(); };
   useEffect(() => {
     if (scenes.length === 0) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
-  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, promptSettings, concatenatedVideo, edit]);
+  }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, customModelCaps, assetTypeModels, autoAttachRefs, promptSettings, concatenatedVideo, edit, dreamSettings]);
+
+  // --- UNDO / REDO ----------------------------------------------------------
+
+  const undoBusyReason = () => {
+    if (batchRunner) return 'a batch is running';
+    if (dreamRun?.active) return 'a dream is running';
+    return null;
+  };
+
+  /**
+   * Step the whole project back one state.
+   *
+   * Refused mid-batch and mid-dream: those write results in asynchronously, so
+   * rolling the project back underneath them would drop whatever landed next
+   * into a project that no longer expects it.
+   */
+  const handleUndo = () => {
+    const busy = undoBusyReason();
+    if (busy) {
+      showToast(`Cannot undo while ${busy}. Stop it first.`, 'warning');
+      return;
+    }
+    const label = historyUndoLabel(history);
+    const step = undoHistory(history, { state: buildStatePayload(), label, at: Date.now() });
+    if (!step) {
+      showToast('Nothing left to undo.', 'info');
+      return;
+    }
+    applyLoadedState(step.entry.state, { resetHistory: false });
+    setHistory(step.history);
+    showToast(`Undid ${step.entry.label}.`);
+  };
+
+  const handleRedo = () => {
+    const busy = undoBusyReason();
+    if (busy) {
+      showToast(`Cannot redo while ${busy}. Stop it first.`, 'warning');
+      return;
+    }
+    const label = historyRedoLabel(history);
+    const step = redoHistory(history, { state: buildStatePayload(), label, at: Date.now() });
+    if (!step) {
+      showToast('Nothing left to redo.', 'info');
+      return;
+    }
+    applyLoadedState(step.entry.state, { resetHistory: false });
+    setHistory(step.history);
+    showToast(`Redid ${label || 'change'}.`);
+  };
+
+  // Kept in refs so the key listener can be bound once rather than rebound on
+  // every history change.
+  const undoRef = useRef();
+  const redoRef = useRef();
+  undoRef.current = handleUndo;
+  redoRef.current = handleRedo;
+
+  useEffect(() => {
+    const onKey = (event) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const key = event.key.toLowerCase();
+      if (key !== 'z' && key !== 'y') return;
+
+      // A text field has its own undo stack and the browser's is better than
+      // ours inside one — stepping the whole project back mid-sentence is not
+      // what Ctrl+Z means while the caret is in a textarea.
+      const target = event.target;
+      if (target?.isContentEditable) return;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+      event.preventDefault();
+      if (key === 'y' || event.shiftKey) redoRef.current();
+      else undoRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // Save Credentials
   const saveConfig = async (newKeys) => {
@@ -610,6 +934,7 @@ export default function App() {
           selectedVideo: null,
           referenceImages: [],
           lipSyncAudio: null,
+          audioRefs: [],
           imagePrompts: [],
           videoPrompts: [],
           draftImagePrompt: '',
@@ -648,6 +973,13 @@ export default function App() {
     showToast('Scene deleted.', 'success');
   };
 
+  /** Write one field on a scene (null clears it back to inherit). */
+  const handleUpdateSceneField = (sceneId, field, value) => {
+    const updated = scenes.map(s => (s.id === sceneId ? { ...s, [field]: value } : s));
+    setScenes(updated);
+    saveProjectState(updated);
+  };
+
   const handleRenameScene = (sceneId, newName) => {
     const updated = scenes.map(s => {
       if (s.id === sceneId) {
@@ -676,6 +1008,7 @@ export default function App() {
       selectedVideo: null,
       referenceImages: [],
       lipSyncAudio: null,
+      audioRefs: [],
       imagePrompts: [], 
       videoPrompts: [],
       draftImagePrompt: '',
@@ -755,6 +1088,29 @@ export default function App() {
     saveProjectState(updated);
   };
 
+  // --- MODEL SETTINGS RESOLUTION ---
+  // Every "which model does this generation use?" question funnels through
+  // resolveModelSettings so shot overrides, scene defaults, asset-type
+  // defaults and project defaults agree everywhere (modal, batch, asset gen).
+  const projectModelDefaults = {
+    imageModel, imageResolution, videoModel, videoResolution, videoDuration, assetTypeModels
+  };
+
+  const sceneOfShot = (shotId) => scenes.find(sc => (sc.shots || []).some(s => s.id === shotId)) || null;
+
+  const resolveShotModelSettings = (type, shot) => resolveModelSettings({
+    type,
+    project: projectModelDefaults,
+    scene: shot ? sceneOfShot(shot.id) : null,
+    shot
+  });
+
+  const resolveAssetModelSettings = (asset) => resolveModelSettings({
+    type: 'image',
+    project: projectModelDefaults,
+    asset
+  });
+
   // --- OPEN GENERATION MODALS ---
   const openGenerationModal = (type, shotId, existingPromptId = null) => {
     const shot = shots.find(s => s.id === shotId);
@@ -762,29 +1118,36 @@ export default function App() {
 
     setGenerationModal({ type, shotId, existingPromptId });
     setGenModalPrompt('');
-    setGenModalImageInput('');
-    // Everything this shot is set to send — its own references first, then the
-    // ones it inherits from its scene and the project, minus anything held back.
-    // Trimmed to the model's capacity so the preview never promises more than
-    // will be uploaded.
-    setGenModalInputImages(shotReferencePaths(shot).slice(
-      0,
-      refImageCapacity(type, type === 'image' ? (shot.imageModel || imageModel) : (shot.videoModel || videoModel))
-    ));
+    const resolved = resolveShotModelSettings(type, shot);
+    const startingModel = resolved.model;
+    // Image: everything this shot is set to send — its own references first,
+    // then the ones it inherits from its scene and the project, minus anything
+    // held back. Video: the shot's own still, which is what a video model has
+    // always been handed. Both are trimmed to the model's capacity so the
+    // preview never promises more than will be uploaded.
+    setGenModalInputImages((type === 'image'
+      ? shotReferencePaths(shot)
+      : (shot.selectedImage ? [shot.selectedImage] : [])
+    ).slice(0, refImageCapacity(type, startingModel)));
     setGenModalDuration(videoDuration);
     setGenModalExcludedImages([]);
+    setGenModalUsePre(true);
+    setGenModalUsePost(true);
+    setGenModalDecorations([]);
+    setGenModalCaret(null);
+    setGenModalOverride(null);
+    setGenModalEffectiveOpen(false);
+    setGenModalAutoInstructions('');
+    setGenModalAutoContext(false);
+    setGenModalAutoBare(false);
+    setGenModalAutoOpen(false);
 
     setGenModalAttachTags(type === 'image' ? attachTagsForImages : attachTagsForVideos);
 
-    // Per-shot overrides (set by shot list import) win over project defaults.
-    if (type === 'image') {
-      setGenModalModel(shot.imageModel || imageModel);
-      setGenModalRes(shot.imageResolution || imageResolution);
-    } else {
-      setGenModalModel(shot.videoModel || videoModel);
-      setGenModalRes(shot.videoResolution || videoResolution);
-      setGenModalDuration(shot.videoDuration || videoDuration);
-    }
+    // Shot overrides > scene defaults > project defaults, via the resolver.
+    setGenModalModel(resolved.model);
+    setGenModalRes(resolved.resolution);
+    if (type === 'video') setGenModalDuration(resolved.duration || videoDuration);
 
     let initialPromptText = '';
     if (existingPromptId) {
@@ -802,17 +1165,21 @@ export default function App() {
         if (found.resolution) setGenModalRes(found.resolution);
         if (found.attachTaggedImages !== undefined) setGenModalAttachTags(found.attachTaggedImages !== false);
         setGenModalExcludedImages(found.excludedImagePaths || []);
-        if (type === 'image') {
-          setGenModalInputImages(found.primaryImagePaths || found.inputImagePaths || []);
-        } else {
-          if (found.duration) setGenModalDuration(found.duration);
-          setGenModalImageInput((found.primaryImagePaths || [])[0] ?? found.imageInput ?? '');
-        }
+        setGenModalUsePre(found.usePrePrompt !== false);
+        setGenModalUsePost(found.usePostPrompt !== false);
+        setGenModalOverride(typeof found.promptOverride === 'string' ? found.promptOverride : null);
+        if (type === 'video' && found.duration) setGenModalDuration(found.duration);
+        // Video groups saved before video took more than one image carry a lone
+        // `imageInput`; reading it as a one-element list reproduces them exactly.
+        setGenModalInputImages(
+          found.primaryImagePaths
+          || found.inputImagePaths
+          || (found.imageInput ? [found.imageInput] : [])
+        );
       }
     } else {
       const draftField = type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
       initialPromptText = shot[draftField] !== undefined && shot[draftField] !== null && shot[draftField] !== '' ? shot[draftField] : (shot.description || '');
-      setGenModalImageInput(shot.selectedImage || '');
     }
 
     setGenModalPrompt(initialPromptText);
@@ -828,46 +1195,126 @@ export default function App() {
     }
   };
 
-  const appendSnippetToModalPrompt = (snippetText) => {
-    setGenModalPrompt(prev => {
-      const trimmed = prev.trim();
-      const newVal = trimmed ? `${trimmed}, ${snippetText}` : snippetText;
-      // Update draft synchronously
-      if (generationModal) {
-        const { type, shotId, existingPromptId } = generationModal;
-        if (shotId && !existingPromptId) {
-          const field = type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
-          handleUpdateShotField(shotId, field, newVal);
-        }
-      }
-      return newVal;
+  // What "at the cursor" is measured against. Read straight off the element:
+  // a blurred textarea still remembers its selection, where React's onSelect
+  // does not fire for every way a caret can move.
+  const genModalInputRef = useRef(null);
+  const genModalSelection = useRef({ start: 0, end: 0 });
+  const modalCaret = () => {
+    const el = genModalInputRef.current;
+    return el ? { start: el.selectionStart, end: el.selectionEnd } : genModalSelection.current;
+  };
+
+  /** One place for "the prompt changed": text, decorations and the shot draft. */
+  const updateModalPrompt = (nextText, nextDecorations) => {
+    setGenModalDecorations(nextDecorations !== undefined
+      ? nextDecorations
+      : remapDecorations(genModalDecorations, genModalPrompt, nextText));
+    setGenModalPrompt(nextText);
+    updateDraftPrompt(nextText);
+  };
+
+  /**
+   * Drop text in at the caret and mark it as inserted.
+   *
+   * Inserting always used to append to the end, which made a snippet or a tag
+   * useless for anything but the tail of a prompt — you wrote the sentence, hit
+   * the chip, then cut and pasted it into place.
+   */
+  const insertIntoModalPrompt = (text, options) => {
+    const result = insertIntoPrompt(genModalPrompt, genModalDecorations, modalCaret(), text, options);
+    genModalSelection.current = { start: result.cursor, end: result.cursor };
+    updateModalPrompt(result.text, result.decorations);
+    // Hand the caret back so you can keep typing where the insert left off,
+    // rather than having to click into the field again after every chip.
+    setGenModalCaret({ pos: result.cursor, nonce: Date.now() });
+  };
+
+  const appendSnippetToModalPrompt = (snippetText, name) => {
+    insertIntoModalPrompt(snippetText, { kind: 'snippet', label: name || 'snippet', joiner: ', ' });
+  };
+
+  /**
+   * Fold a global pre/post prompt into this prompt so it can be edited here.
+   *
+   * It stops being applied globally for this generation at the same moment —
+   * otherwise clicking it to tweak a word would send it twice.
+   */
+  const inlineAffix = (side) => {
+    const text = generationModal?.type === 'image'
+      ? (side === 'pre' ? prePrompt : postPrompt)
+      : (side === 'pre' ? videoPrePrompt : videoPostPrompt);
+    if (!text) return;
+    const at = side === 'pre' ? 0 : genModalPrompt.length;
+    const result = insertIntoPrompt(genModalPrompt, genModalDecorations, { start: at, end: at }, text, {
+      kind: 'affix',
+      label: `${side === 'pre' ? 'pre' : 'post'}-prompt`,
+      joiner: ', '
     });
+    if (side === 'pre') setGenModalUsePre(false); else setGenModalUsePost(false);
+    updateModalPrompt(result.text, result.decorations);
   };
 
   // --- AUTO-GENERATE PROMPT FROM SHOT VIA LLM ---
-  const handleAutoGeneratePromptInModal = async () => {
-    const { shotId } = generationModal;
-    const shot = shots.find(s => s.id === shotId);
-    if (!shot || !shot.description) {
-      showToast('Please add a visual description to the shot first.', 'warning');
-      return;
+
+  /**
+   * Write one shot's image or video prompt via the LLM.
+   *
+   * Stage-shaped — shot in, `{ ok, text?, error?, lostTags }` out, no UI
+   * coupling — so the modal button, the "write all prompts" batch and the
+   * pipeline orchestrator all share one implementation. Resolves, never
+   * rejects.
+   */
+  const writeShotPrompt = async (shot, type, { instructions = '', bare = false, withContext = false } = {}) => {
+    const isImage = type === 'image';
+    // Without the shot template there is nothing to write *from* except the
+    // instructions, so those become the requirement instead of the description.
+    if (bare && !instructions) return { ok: false, error: 'Instructions-only mode sends nothing else — write the instructions first.', lostTags: [] };
+    if (!bare && !shot?.description) return { ok: false, error: 'No visual description to write from.', lostTags: [] };
+    if (!shot) return { ok: false, error: 'Shot not found.', lostTags: [] };
+
+    const systemPrompt = bare ? '' : (isImage ? imageSystemPrompt : videoSystemPrompt);
+    const shotScene = sceneOfShot(shot.id);
+    // Whatever the writer is shown is what it can preserve, so the tags are
+    // collected from exactly the fields the template can send.
+    const shotText = [shot.description, shot.setup, shot.notes, shot.dialogue].filter(Boolean).join(' ');
+
+    const sections = [];
+
+    // Context first: the writer needs to know what exists before it is asked to
+    // write about it, and the tag list is only useful ahead of the request.
+    if (withContext) {
+      const index = shots.findIndex(s => s.id === shot.id);
+      const context = buildAutoPromptContext({
+        assetLibrary,
+        previousShot: index > 0 ? shots[index - 1] : null,
+        nextShot: index >= 0 && index < shots.length - 1 ? shots[index + 1] : null
+      });
+      if (context) sections.push(`${promptText(promptSettings, 'autoContextIntro')}\n\n${context}`);
     }
 
-    setLoadingStates(prev => ({ ...prev, modal_llm: true }));
-    const isImage = generationModal.type === 'image';
-    const systemPrompt = isImage ? imageSystemPrompt : videoSystemPrompt;
-    const sceneOfShot = scenes.find(s => (s.shots || []).some(sh => sh.id === shot.id));
-    const promptPayload = fillTemplate(
-      promptText(promptSettings, isImage ? 'imageUserTemplate' : 'videoUserTemplate'),
-      {
-        description: shot.description,
-        setup: shot.setup,
-        notes: shot.notes,
-        dialogue: shot.dialogue,
-        name: shot.name,
-        sceneName: sceneOfShot?.name || ''
-      }
-    );
+    if (!bare) {
+      sections.push(fillTemplate(
+        promptText(promptSettings, isImage ? 'imageUserTemplate' : 'videoUserTemplate'),
+        {
+          description: shot.description,
+          setup: shot.setup,
+          notes: shot.notes,
+          dialogue: shot.dialogue,
+          name: shot.name,
+          sceneName: shotScene?.name || '',
+          tags: tagPreservationRule(shotText)
+        }
+      ));
+    }
+
+    // Last, so they are the freshest thing in the window and read as the final
+    // word when they contradict the template.
+    if (instructions) {
+      sections.push(bare
+        ? instructions
+        : `=== EXTRA INSTRUCTIONS (these override anything above) ===\n${instructions}`);
+    }
 
     try {
       const res = await apiFetch(`/api/llm/generate`, {
@@ -875,24 +1322,54 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: activeLlm,
-          prompt: promptPayload,
+          prompt: sections.filter(Boolean).join('\n\n'),
           systemPrompt,
           model: llmModel
         })
       });
-
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed prompt generation');
       if (!data.text?.trim()) throw new Error('The model returned an empty prompt.');
 
-      setGenModalPrompt(data.text);
-      updateDraftPrompt(data.text);
-      showToast('Prompt generated via LLM!', 'success');
+      // A dropped tag is invisible until the generation comes back without the
+      // character in it — report them. Only meaningful when the writer was
+      // shown the shot; in instructions-only mode it never saw the tags.
+      return { ok: true, text: data.text, lostTags: bare ? [] : droppedTags(shotText, data.text) };
     } catch (err) {
       console.error(err);
-      showToast(`Prompt failed: ${err.message}`, 'error');
-    } finally {
-      setLoadingStates(prev => ({ ...prev, modal_llm: false }));
+      return { ok: false, error: err.message, lostTags: [] };
+    }
+  };
+
+  const handleAutoGeneratePromptInModal = async () => {
+    const { shotId } = generationModal;
+    const shot = shots.find(s => s.id === shotId);
+
+    setLoadingStates(prev => ({ ...prev, modal_llm: true }));
+    const result = await writeShotPrompt(shot, generationModal.type, {
+      instructions: genModalAutoInstructions.trim(),
+      bare: genModalAutoBare,
+      withContext: genModalAutoContext
+    });
+    setLoadingStates(prev => ({ ...prev, modal_llm: false }));
+
+    if (!result.ok) {
+      const preflight = result.error.includes('write the instructions') || result.error.includes('No visual description');
+      showToast(preflight ? result.error : `Prompt failed: ${result.error}`, preflight ? 'warning' : 'error');
+      return;
+    }
+
+    // A wholly new prompt keeps none of the old one's inserted blocks — the
+    // text they marked is gone.
+    updateModalPrompt(result.text, []);
+
+    if (result.lostTags.length > 0) {
+      showToast(
+        `Prompt written, but the writer dropped <${result.lostTags.join('>, <')}> — add ${result.lostTags.length === 1 ? 'it' : 'them'} back or its reference art will not be sent.`,
+        'warning'
+      );
+    } else {
+      showToast('Prompt generated via LLM!', 'success');
     }
   };
 
@@ -902,13 +1379,18 @@ export default function App() {
   // composed prompt already has the global pre/post text baked in, so matching
   // on it meant "+ Add Iteration" — which reloads the group and recomposes —
   // produced a different string every time and forked a fresh group.
+  // `!== false` throughout, so a group saved before a flag existed reads as the
+  // default it was generated under and keeps its own gallery.
   const imagePromptSignature = (group) => JSON.stringify([
     group.rawPrompt ?? group.prompt ?? '',
     group.model || '',
     group.resolution || '',
     group.primaryImagePaths || [],
     group.attachTaggedImages !== false,
-    group.excludedImagePaths || []
+    group.excludedImagePaths || [],
+    group.usePrePrompt !== false,
+    group.usePostPrompt !== false,
+    group.promptOverride ?? null
   ]);
 
   const videoPromptSignature = (group) => JSON.stringify([
@@ -918,16 +1400,39 @@ export default function App() {
     group.duration || '',
     group.primaryImagePaths || [],
     group.attachTaggedImages !== false,
-    group.excludedImagePaths || []
+    group.excludedImagePaths || [],
+    group.usePrePrompt !== false,
+    group.usePostPrompt !== false,
+    group.promptOverride ?? null
   ]);
+
+  /**
+   * Let a hand-edited effective prompt stand in for the composed text.
+   *
+   * Deliberately the *last* step and deliberately text-only. The images were
+   * already decided by the tags and the thumbnails, and they stay decided:
+   * deleting "@image3" from the override unbinds that image from the prompt
+   * without unsending it, which is the honest reading — the picture really is
+   * still in the request. Taking it out is what the thumbnail's ✕ is for.
+   */
+  const applyPromptOverride = (composed, override) => (
+    typeof override === 'string'
+      ? { ...composed, prompt: override, overridden: true }
+      : { ...composed, overridden: false }
+  );
 
   // --- PROMPT COMPOSITION ---
   // The single place where a raw shot prompt becomes the string a model sees:
   // global pre/post prompt + <Tag> substitution + reference image resolution.
-  const buildPrompt = (type, rawPrompt, modelId, primaryImagePaths = [], attachTaggedImages = null, excludedImagePaths = []) => composeGenerationPrompt({
+  // `wrap.shot` wires the reference board in: with it, tags auto-attach their
+  // linked board references and the shot's pinned/inherited edges resolve at
+  // generation time, all under the model's capacity.
+  const buildPrompt = (type, rawPrompt, modelId, primaryImagePaths = [], attachTaggedImages = null, excludedImagePaths = [], wrap = {}) => applyPromptOverride(composeGenerationPrompt({
     prompt: rawPrompt,
-    prePrompt: type === 'image' ? prePrompt : videoPrePrompt,
-    postPrompt: type === 'image' ? postPrompt : videoPostPrompt,
+    // The pre/post prompt is on unless this particular generation turned it
+    // off, so every existing caller and every saved group behaves as before.
+    prePrompt: wrap.usePrePrompt === false ? '' : (type === 'image' ? prePrompt : videoPrePrompt),
+    postPrompt: wrap.usePostPrompt === false ? '' : (type === 'image' ? postPrompt : videoPostPrompt),
     assetLibrary,
     primaryImagePaths,
     attachTaggedImages: attachTaggedImages === null
@@ -935,18 +1440,17 @@ export default function App() {
       : attachTaggedImages,
     excludedImagePaths,
     type,
-    modelId
-  });
+    modelId,
+    references: referenceImages,
+    assignments: refAssignments,
+    shot: wrap.shot || null,
+    scene: wrap.shot ? sceneOfShot(wrap.shot.id) : null,
+    autoAttachRefs
+  }), wrap.promptOverride);
 
   const handleDeselectSentImage = (imagePath, origin) => {
     if (origin === 'primary') {
-      if (generationModal?.type === 'image') {
-        setGenModalInputImages(prev => prev.filter(p => p !== imagePath));
-      } else {
-        if (genModalImageInput === imagePath) {
-          setGenModalImageInput('');
-        }
-      }
+      setGenModalInputImages(prev => prev.filter(p => p !== imagePath));
     }
     setGenModalExcludedImages(prev => [...prev, imagePath]);
   };
@@ -969,11 +1473,12 @@ export default function App() {
       model: genModalModel,
       resolution: genModalRes,
       duration: genModalDuration,
-      primaryImagePaths: type === 'image'
-        ? genModalInputImages
-        : (genModalImageInput ? [genModalImageInput] : []),
+      primaryImagePaths: genModalInputImages,
       attachTaggedImages: genModalAttachTags,
-      excludedImagePaths: genModalExcludedImages
+      excludedImagePaths: genModalExcludedImages,
+      usePrePrompt: genModalUsePre,
+      usePostPrompt: genModalUsePost,
+      promptOverride: genModalOverride
     });
   };
 
@@ -988,10 +1493,13 @@ export default function App() {
     // so a generation lands in the right gallery regardless of where it started.
     rawPrompt, model, resolution, duration,
     primaryImagePaths = [], attachTaggedImages = null,
-    excludedImagePaths = []
+    excludedImagePaths = [], usePrePrompt = true, usePostPrompt = true, promptOverride = null
   }) => {
     const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const composed = buildPrompt(type, rawPrompt, model, primaryImagePaths, attachTaggedImages, excludedImagePaths);
+    const composed = buildPrompt(type, rawPrompt, model, primaryImagePaths, attachTaggedImages, excludedImagePaths, {
+      usePrePrompt, usePostPrompt, promptOverride,
+      shot: shots.find(s => s.id === shotId) || null
+    });
 
     setBatchJobs(prev => [{
       id: jobId,
@@ -1010,6 +1518,38 @@ export default function App() {
       showToast(`Unknown asset tag${composed.missingTags.length === 1 ? '' : 's'}: <${composed.missingTags.join('>, <')}> — sent as literal text.`, 'warning');
     }
 
+    const caps = modelCapabilities(type, model);
+
+    // Warn, never silently truncate: an over-limit prompt is still sent, and
+    // whatever the provider does with it happens in the open.
+    if (composed.promptOverflow) {
+      showToast(`Prompt is ${composed.promptOverflow.length} characters — ${caps.label} documents a limit of ${composed.promptOverflow.limit}. Sent anyway; expect the provider to reject or truncate it.`, 'warning');
+    }
+
+    // A model that cannot run without an input image fails here, locally,
+    // before any request is billed.
+    if (caps.refMode === 'required' && composed.inputImagePaths.length === 0) {
+      const error = `${caps.label} requires at least one input reference image. Please add a reference image to this shot first.`;
+      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error } : j)));
+      showToast(error, 'error');
+      return { ok: false, error };
+    }
+
+    // Reference audio belongs to the shot rather than to a prompt recipe: it is
+    // part of what the shot sounds like, so every video generation of that shot
+    // carries it. Only a video job can, and only some models will.
+    const audioRefs = type === 'video'
+      ? ((shots.find(s => s.id === shotId) || {}).audioRefs || []).filter(Boolean)
+      : [];
+    if (audioRefs.length > (caps.maxRefAudio || 0)) {
+      const error = caps.maxRefAudio
+        ? `${caps.label} takes at most ${caps.maxRefAudio} reference audio clip${caps.maxRefAudio === 1 ? '' : 's'}, and this shot has ${audioRefs.length}.`
+        : `${caps.label} does not take reference audio, and this shot has ${audioRefs.length}. Remove them, or point the shot at a Seedance 2.0 model.`;
+      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error } : j)));
+      showToast(error, 'error');
+      return { ok: false, error };
+    }
+
     // What the group is keyed on: exactly what the user chose, so reopening it
     // reproduces this generation byte for byte.
     const recipe = {
@@ -1019,16 +1559,31 @@ export default function App() {
       duration,
       primaryImagePaths,
       attachTaggedImages: composed.attachTaggedImages,
-      excludedImagePaths
+      excludedImagePaths,
+      usePrePrompt,
+      usePostPrompt,
+      promptOverride
+    };
+
+    // A snapshot of every tagged asset as it looked at generation time, kept
+    // *beside* the recipe (never inside it — the signature must not fork
+    // groups over metadata). This is what dirty-shot detection compares the
+    // asset's current state against.
+    const meta = {
+      taggedAssetIds: composed.taggedAssets.map(a => a.id),
+      assetStamps: Object.fromEntries(composed.taggedAssets.map(a => [
+        a.id, { updatedAt: a.updatedAt || null, primaryImage: assetPrimaryImage(a) }
+      ])),
+      createdAt: new Date().toISOString()
     };
 
     if (type === 'image') {
-      return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe);
+      return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta);
     }
-    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths[0] || '', recipe);
+    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta, audioRefs);
   };
 
-  const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}) => {
+  const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}, meta = null) => {
     const { model, resolution: resOption } = recipe;
     try {
       const res = await apiFetch(`/api/image/generate`, {
@@ -1036,10 +1591,13 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: model,
-          providerFamily: getImageModel(model)?.provider || null,
+          // A custom path may declare its host as `fal:` / `higgsfield:`;
+          // a catalog model carries its provider in the catalog itself.
+          providerFamily: parseModelId(model).family || getImageModel(model)?.provider || null,
           prompt: promptText,
           resolution: resOption,
-          inputImagePaths
+          inputImagePaths,
+          safetyChecker: atlasSafetyChecker
         })
       });
 
@@ -1071,8 +1629,10 @@ export default function App() {
               const matchIndex = updatedPrompts.findIndex(p => imagePromptSignature(p) === signature);
 
               if (matchIndex >= 0) {
+                // The latest output defines the group's currency: refresh the
+                // asset snapshot so dirtiness is judged against this run.
                 updatedPrompts = updatedPrompts.map((p, i) => (
-                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
+                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput], ...(meta ? { meta } : {}) } : p
                 ));
                 groupId = updatedPrompts[matchIndex].id;
               } else {
@@ -1082,6 +1642,7 @@ export default function App() {
                   ...recipe,
                   prompt: promptText,          // composed, for display
                   inputImagePaths,             // what actually went to the model
+                  ...(meta ? { meta } : {}),
                   outputs: [newOutput]
                 });
               }
@@ -1123,19 +1684,25 @@ export default function App() {
     }
   };
 
-  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInput, recipe = {}) => {
+  // `imageInputs` is every reference the composition decided to send, in slot
+  // order. It used to be a single path, which was fine while every video model
+  // took one image and quietly wrong once Seedance 2.0's reference endpoint
+  // took nine — the prompt pointed at @image3 and only @image1 was ever sent.
+  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}, meta = null, audioInputs = []) => {
     const { model, resolution: resOption, duration } = recipe;
+    const imageUrlsToSend = Array.isArray(imageInputs) ? imageInputs.filter(Boolean) : [imageInputs].filter(Boolean);
+    const imageInput = imageUrlsToSend[0] || '';
     try {
-      const imageUrlsToSend = imageInput ? [imageInput] : [];
       const res = await apiFetch(`/api/video/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: model,
-          providerFamily: getVideoModel(model)?.provider || null,
+          providerFamily: parseModelId(model).family || getVideoModel(model)?.provider || null,
           videoModel: model,
           prompt: promptText,
           imageUrls: imageUrlsToSend,
+          audioUrls: audioInputs,
           resolution: resOption,
           duration: duration
         })
@@ -1166,8 +1733,10 @@ export default function App() {
               const matchIndex = updatedPrompts.findIndex(p => videoPromptSignature(p) === signature);
 
               if (matchIndex >= 0) {
+                // Latest output defines the group's currency — refresh the
+                // asset snapshot alongside it.
                 updatedPrompts = updatedPrompts.map((p, i) => (
-                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput] } : p
+                  i === matchIndex ? { ...p, outputs: [...(p.outputs || []), newOutput], ...(meta ? { meta } : {}) } : p
                 ));
                 groupId = updatedPrompts[matchIndex].id;
               } else {
@@ -1176,7 +1745,9 @@ export default function App() {
                   id: groupId,
                   ...recipe,
                   prompt: promptText,          // composed, for display
-                  imageInput,
+                  imageInput,                  // first slot, for older readers
+                  inputImagePaths: imageUrlsToSend,
+                  ...(meta ? { meta } : {}),
                   outputs: [newOutput]
                 });
               }
@@ -1224,13 +1795,17 @@ export default function App() {
   // --- BATCH GENERATION -----------------------------------------------------
 
   /** The prompt a batch run uses for a shot, before pre/post and tag expansion. */
+  // No raw-description fallback any more: sending an unwritten description as
+  // a prompt was a silent quality trap, and the write-all-prompts stage (or
+  // button) supersedes it — promptless shots are skipped by the candidate
+  // predicates instead.
   const resolveShotPrompt = (shot, type) => {
     if (type === 'image') {
       const lastGroup = (shot.imagePrompts || [])[(shot.imagePrompts || []).length - 1];
-      return shot.draftImagePrompt || lastGroup?.prompt || shot.description || '';
+      return shot.draftImagePrompt || lastGroup?.prompt || '';
     }
     const lastGroup = (shot.videoPrompts || [])[(shot.videoPrompts || []).length - 1];
-    return shot.draftVideoPrompt || lastGroup?.prompt || shot.draftImagePrompt || shot.description || '';
+    return shot.draftVideoPrompt || lastGroup?.prompt || shot.draftImagePrompt || '';
   };
 
   const shotsForScope = (scope) => {
@@ -1241,9 +1816,14 @@ export default function App() {
     return scenes.flatMap(scene => (scene.shots || []).map(shot => ({ shot, sceneName: scene.name })));
   };
 
+  // Which shots are stale, recomputed whenever the shot list or an asset
+  // changes. String ops over shots × tags — trivial at personal-project scale.
+  const dirtyMap = useMemo(() => buildDirtyMap(scenes, assetLibrary), [scenes, assetLibrary]);
+
   /** Shots a batch would actually act on, given the current dialog options. */
-  const batchCandidates = (type, scope, onlyMissing) => shotsForScope(scope)
+  const batchCandidates = (type, scope, onlyMissing, onlyDirty = false) => shotsForScope(scope)
     .filter(({ shot }) => {
+      if (onlyDirty) return Boolean(dirtyMap.get(shot.id)?.[type]?.dirty);
       if (!resolveShotPrompt(shot, type).trim()) return false;
       if (!onlyMissing) return true;
       // "Only shots without a result yet" — the point of a first full sweep.
@@ -1252,26 +1832,17 @@ export default function App() {
         : !(shot.videoPrompts || []).some(p => (p.outputs || []).length > 0);
     });
 
-  const handleRunBatch = async () => {
-    if (!batchDialog) return;
-    const { type, scope } = batchDialog;
-    const candidates = batchCandidates(type, scope, batchOnlyMissing);
-
-    if (candidates.length === 0) {
-      showToast('No shots match — every shot either has no prompt or already has output.', 'warning');
-      return;
-    }
-
-    setBatchDialog(null);
-    setActiveOverlay('batch');
+  /**
+   * The worker-pool body every generation batch shares: run `submitFor` over
+   * the candidates with bounded concurrency, driving the runner UI. Returns
+   * { completed, failed, cancelled }.
+   */
+  const runBatchOver = async (candidates, type, submitFor, { label } = {}) => {
     cancelBatchRef.current = false;
-
-    const scopeLabel = scope === 'scene' ? `scene "${scenes.find(s => s.id === activeSceneId)?.name}"` : 'all scenes';
-    setBatchRunner({ total: candidates.length, done: 0, type, label: `${type} × ${candidates.length} in ${scopeLabel}` });
-    showToast(`Batch started: ${candidates.length} ${type} generation${candidates.length === 1 ? '' : 's'}.`, 'info');
+    setBatchRunner({ total: candidates.length, done: 0, type, label: label || `${type} × ${candidates.length}` });
 
     // Fixed-size worker pool so we do not slam the provider with N parallel
-    // requests; each worker pulls the next shot off the shared cursor.
+    // requests; each worker pulls the next candidate off the shared cursor.
     let cursor = 0;
     let completed = 0;
     let failed = 0;
@@ -1284,58 +1855,545 @@ export default function App() {
         cursor += 1;
         if (index >= candidates.length) return;
 
-        const { shot } = candidates[index];
-        const isImage = type === 'image';
-        const model = isImage ? (shot.imageModel || imageModel) : (shot.videoModel || videoModel);
-        const resolution = isImage
-          ? (shot.imageResolution || imageResolution)
-          : (shot.videoResolution || videoResolution);
-
-        // Video batches animate the shot's own selected still. That image is
-        // the primary input and must never be displaced by a tagged asset.
-        //
-        // Image batches use the same resolution the generation modal shows, so
-        // a reference you unticked on a shot stays unticked when the batch runs
-        // — previously the modal's choices were session-only and a sweep sent
-        // everything regardless.
-        const primaryImagePaths = isImage
-          ? shotReferencePaths(shot)
-          : (shot.selectedImage ? [shot.selectedImage] : []);
-
-        const result = await submitGenerationJob({
-          type,
-          shotId: shot.id,
-          shotName: shot.name,
-          rawPrompt: resolveShotPrompt(shot, type),
-          model,
-          resolution,
-          duration: shot.videoDuration || videoDuration,
-          primaryImagePaths,
-          attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
-        });
-
+        const result = await submitFor(candidates[index]);
         if (result?.ok) completed += 1; else failed += 1;
         setBatchRunner(prev => (prev ? { ...prev, done: completed + failed } : prev));
       }
     };
 
     await Promise.all(Array.from({ length: workerCount }, worker));
-
     setBatchRunner(null);
-    if (cancelBatchRef.current) {
-      showToast(`Batch stopped. ${completed} finished, ${failed} failed, ${candidates.length - completed - failed} skipped.`, 'warning');
+    const cancelled = cancelBatchRef.current;
+    cancelBatchRef.current = false;
+    return { completed, failed, cancelled, total: candidates.length };
+  };
+
+  /** The standard per-shot submission a scope batch performs. */
+  const submitForShot = (type) => ({ shot }) => {
+    const isImage = type === 'image';
+    const resolved = resolveShotModelSettings(type, shot);
+
+    // Video batches animate the shot's own selected still. That image is
+    // the primary input and must never be displaced by a tagged asset.
+    //
+    // Image batches use the same resolution the generation modal shows, so
+    // a reference you unticked on a shot stays unticked when the batch runs
+    // — previously the modal's choices were session-only and a sweep sent
+    // everything regardless.
+    const primaryImagePaths = isImage
+      ? shotReferencePaths(shot)
+      : (shot.selectedImage ? [shot.selectedImage] : []);
+
+    return submitGenerationJob({
+      type,
+      shotId: shot.id,
+      shotName: shot.name,
+      rawPrompt: resolveShotPrompt(shot, type),
+      model: resolved.model,
+      resolution: resolved.resolution,
+      duration: resolved.duration || videoDuration,
+      primaryImagePaths,
+      attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
+    });
+  };
+
+  const handleRunBatch = async () => {
+    if (!batchDialog) return;
+    const { type, scope } = batchDialog;
+    const candidates = batchCandidates(type, scope, batchOnlyMissing, batchOnlyDirty);
+
+    if (candidates.length === 0) {
+      showToast(batchOnlyDirty
+        ? 'No stale shots in this scope.'
+        : 'No shots match — every shot either has no prompt or already has output.', 'warning');
+      return;
+    }
+
+    setBatchDialog(null);
+    setActiveOverlay('batch');
+
+    const scopeLabel = scope === 'scene' ? `scene "${scenes.find(s => s.id === activeSceneId)?.name}"` : 'all scenes';
+    showToast(`Batch started: ${candidates.length} ${type} generation${candidates.length === 1 ? '' : 's'}.`, 'info');
+
+    // A dirtiness-selected candidate regenerates from its producing recipe,
+    // not from the draft prompt — the whole point is reproducing the original
+    // request with the asset's fresh material.
+    const submitFor = batchOnlyDirty
+      ? ({ shot }) => submitFromProducingGroup(shot, type)
+      : submitForShot(type);
+
+    const { completed, failed, cancelled, total } = await runBatchOver(
+      candidates, type, submitFor,
+      { label: `${type} × ${candidates.length} in ${scopeLabel}` }
+    );
+
+    if (cancelled) {
+      showToast(`Batch stopped. ${completed} finished, ${failed} failed, ${total - completed - failed} skipped.`, 'warning');
     } else if (failed > 0) {
       showToast(`Batch done: ${completed} succeeded, ${failed} failed. See the Batch Manager for errors.`, 'warning');
     } else {
       showToast(`Batch complete — ${completed} ${type}${completed === 1 ? '' : 's'} generated.`, 'success');
     }
-    cancelBatchRef.current = false;
   };
 
   // Stops dispatching new jobs; requests already in flight are left to finish.
   const handleCancelBatch = () => {
     cancelBatchRef.current = true;
     showToast('Batch will stop after the in-flight generations finish.', 'warning');
+  };
+
+  // --- STALE REGENERATION ---------------------------------------------------
+
+  /**
+   * Regenerate from the recipe that produced the current selection — raw
+   * prompt, model, exclusions and all — not from the draft prompt. Tags
+   * resolve at compose time, so fresh asset text and images attach
+   * automatically; the signature match lands the output in the same group and
+   * refreshes its stamps, which is what clears the dirty state.
+   *
+   * Videos animate the CURRENT shot.selectedImage, not the recorded one.
+   */
+  const submitFromProducingGroup = (shot, type) => {
+    const groups = type === 'image' ? shot.imagePrompts : shot.videoPrompts;
+    const selected = type === 'image' ? shot.selectedImage : shot.selectedVideo;
+    const group = groupForSelection(groups || [], selected);
+    if (!group) {
+      return Promise.resolve({ ok: false, error: 'No producing group for the current selection.' });
+    }
+
+    return submitGenerationJob({
+      type,
+      shotId: shot.id,
+      shotName: shot.name,
+      rawPrompt: group.rawPrompt ?? group.prompt ?? '',
+      model: group.model,
+      resolution: group.resolution,
+      duration: group.duration,
+      primaryImagePaths: type === 'video'
+        ? (shot.selectedImage ? [shot.selectedImage] : [])
+        : (group.primaryImagePaths || []),
+      attachTaggedImages: group.attachTaggedImages !== false,
+      excludedImagePaths: group.excludedImagePaths || [],
+      usePrePrompt: group.usePrePrompt !== false,
+      usePostPrompt: group.usePostPrompt !== false,
+      promptOverride: typeof group.promptOverride === 'string' ? group.promptOverride : null
+    });
+  };
+
+  /**
+   * One button: stale images first, then — judged against the state those
+   * regenerations produced — the stale videos. The order matters: a
+   * regenerated image flips its video to dirty via the source-image rule.
+   */
+  const handleRegenerateStale = async () => {
+    const imageCandidates = dirtyImageCandidates(scenesRef.current, assetLibrary);
+    if (imageCandidates.length > 0) {
+      showToast(`Regenerating ${imageCandidates.length} stale image${imageCandidates.length === 1 ? '' : 's'}…`, 'info');
+      setActiveOverlay('batch');
+      const { cancelled } = await runBatchOver(
+        imageCandidates, 'image',
+        ({ shot }) => submitFromProducingGroup(shot, 'image'),
+        { label: `stale images × ${imageCandidates.length}` }
+      );
+      if (cancelled) return;
+    }
+
+    // Re-derive from the freshest state: the image stage changed selections.
+    const videoCandidates = dirtyVideoCandidates(scenesRef.current, assetLibrary);
+    if (videoCandidates.length === 0) {
+      showToast(imageCandidates.length > 0 ? 'Stale images regenerated; no stale videos.' : 'Nothing is stale.', 'success');
+      return;
+    }
+    showToast(`Now regenerating ${videoCandidates.length} stale video${videoCandidates.length === 1 ? '' : 's'}…`, 'info');
+    const { completed, failed } = await runBatchOver(
+      videoCandidates, 'video',
+      ({ shot: staleShot }) => {
+        // Read the freshest copy — the image stage may have re-selected.
+        const fresh = scenesRef.current.flatMap(s => s.shots || []).find(s => s.id === staleShot.id) || staleShot;
+        return submitFromProducingGroup(fresh, 'video');
+      },
+      { label: `stale videos × ${videoCandidates.length}` }
+    );
+    showToast(`Stale sweep done: ${completed} regenerated${failed ? `, ${failed} failed` : ''}.`, failed ? 'warning' : 'success');
+  };
+
+  // --- WRITE ALL PROMPTS (LLM batch) ---------------------------------------
+
+  /** Shots with a description but no draft prompt of this type — the natural
+      candidate predicate, so LLM-scripted projects that already carry drafts
+      skip this stage entirely. */
+  const shotsMissingPrompts = (type, scope = 'all') => shotsForScope(scope).filter(({ shot }) => {
+    const field = type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
+    return !String(shot[field] || '').trim() && String(shot.description || '').trim();
+  });
+
+  /**
+   * Fill every empty draft prompt via the LLM. Stage-shaped like the
+   * generation batches, but with a small fixed pool — LLM providers
+   * rate-limit harder than image hosts.
+   */
+  const handleWriteAllPrompts = async (type, scope = 'all') => {
+    const candidates = shotsMissingPrompts(type, scope);
+    if (candidates.length === 0) {
+      showToast(`Every shot with a description already has a ${type} prompt.`, 'info');
+      return;
+    }
+
+    cancelBatchRef.current = false;
+    setBatchRunner({ total: candidates.length, done: 0, type: 'prompt', label: `${type} prompts × ${candidates.length}` });
+    showToast(`Writing ${candidates.length} ${type} prompt${candidates.length === 1 ? '' : 's'}…`, 'info');
+
+    let cursor = 0;
+    let completed = 0;
+    let failed = 0;
+    const lostTagShots = [];
+
+    const worker = async () => {
+      while (true) {
+        if (cancelBatchRef.current) return;
+        const index = cursor;
+        cursor += 1;
+        if (index >= candidates.length) return;
+
+        const { shot } = candidates[index];
+        const result = await writeShotPrompt(shot, type, { withContext: true });
+        if (result.ok) {
+          handleUpdateShotField(shot.id, type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt', result.text);
+          if (result.lostTags.length > 0) lostTagShots.push(`${shot.name} (<${result.lostTags.join('>, <')}>)`);
+          completed += 1;
+        } else {
+          failed += 1;
+        }
+        setBatchRunner(prev => (prev ? { ...prev, done: completed + failed } : prev));
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(2, candidates.length) }, worker));
+
+    setBatchRunner(null);
+    if (cancelBatchRef.current) {
+      showToast(`Stopped. ${completed} written, ${failed} failed.`, 'warning');
+    } else if (failed > 0) {
+      showToast(`Prompts written: ${completed}; failed: ${failed}.`, 'warning');
+    } else {
+      showToast(`All ${completed} ${type} prompt${completed === 1 ? '' : 's'} written.`, 'success');
+    }
+    if (lostTagShots.length > 0) {
+      showToast(`The writer dropped tags on: ${lostTagShots.join('; ')} — check those prompts.`, 'warning');
+    }
+    cancelBatchRef.current = false;
+  };
+
+  // --- DREAM MODE -----------------------------------------------------------
+  //
+  // One continuous shot, made a clip at a time: generate, capture the clip's
+  // last frame, show that frame to the LLM, let it decide what happens next,
+  // animate the frame with that answer, repeat.
+  //
+  // Everything it touches is ordinary studio state — it creates ordinary shots
+  // and queues ordinary generation jobs through submitGenerationJob — so the
+  // result behaves like a hand-built sequence everywhere else in the app, and
+  // nothing outside this block and DreamDialog.jsx knows dreams exist.
+
+  const dreamLog = (text, level = 'info') => {
+    setDreamRun(prev => (prev ? { ...prev, log: [...prev.log, { text, level }] } : prev));
+  };
+
+  const dreamPhase = (clip, phase) => {
+    setDreamRun(prev => (prev ? { ...prev, clip, phase } : prev));
+  };
+
+  /**
+   * Open a new shot immediately after `afterShotId`, already holding the frame
+   * the previous clip ended on. Returns its id.
+   */
+  const appendDreamShot = (afterShotId, patch) => {
+    const newId = `shot_dream_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const blank = {
+      id: newId,
+      name: 'Dream',
+      setup: '',
+      description: '',
+      dialogue: '',
+      notes: '',
+      selectedImage: null,
+      selectedVideo: null,
+      referenceImages: [],
+      lipSyncAudio: null,
+      audioRefs: [],
+      imagePrompts: [],
+      videoPrompts: [],
+      draftImagePrompt: '',
+      draftVideoPrompt: ''
+    };
+
+    setScenes(prev => {
+      let placed = false;
+      const next = prev.map(scene => {
+        const index = (scene.shots || []).findIndex(s => s.id === afterShotId);
+        if (index === -1) return scene;
+        placed = true;
+        const shotList = [...scene.shots];
+        shotList.splice(index + 1, 0, { ...blank, ...patch });
+        return { ...scene, shots: shotList };
+      });
+      if (placed) return next;
+      // The shot we were following got deleted mid-dream — land in the active
+      // scene rather than dropping the clip on the floor.
+      return next.map(scene => (
+        scene.id === activeSceneId ? { ...scene, shots: [...(scene.shots || []), { ...blank, ...patch }] } : scene
+      ));
+    });
+
+    // A dream can add dozens of shots; leaving them all expanded buries the
+    // rest of the timeline.
+    setCollapsedShots(prev => ({ ...prev, [newId]: true }));
+    return newId;
+  };
+
+  /**
+   * Show the LLM a frame and get a clip back.
+   *
+   * `opening` marks the one call where the frame is the shot's own still rather
+   * than something captured off a previous clip, so the model is not told to
+   * continue from a clip that does not exist.
+   */
+  const askDreamForClip = async ({ settings, framePath, clip, total, history, opening = false }) => {
+    const res = await apiFetch('/api/llm/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: activeLlm,
+        model: llmModel,
+        systemPrompt: settings.systemPrompt || DEFAULT_DREAM_SYSTEM_PROMPT,
+        prompt: buildDreamUserMessage({
+          instructions: settings.instructions,
+          assetLibrary,
+          history,
+          clipNumber: clip,
+          totalClips: total,
+          hasFrame: true,
+          opening,
+          historyDepth: settings.historyDepth
+        }),
+        imagePaths: [framePath]
+      })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'The LLM call failed.');
+    return parseDreamReply(data.text);
+  };
+
+  /**
+   * The shots a chain run will walk: the start shot and everything after it, in
+   * timeline order, capped at the requested count.
+   */
+  const dreamChainShots = (startShotId, count) => {
+    const startIndex = shots.findIndex(s => s.id === startShotId);
+    if (startIndex === -1) return [];
+    return shots.slice(startIndex, startIndex + Math.max(1, count));
+  };
+
+  const handleRunDream = async () => {
+    const settings = dreamSettings;
+    const chaining = settings.mode === 'chain';
+    const startShot = shots.find(s => s.id === settings.startShotId);
+
+    if (!startShot) {
+      showToast('Pick a shot to start the dream from.', 'warning');
+      return;
+    }
+
+    // Chaining can never run past the last shot — there is nothing to hand the
+    // next frame to, and inventing one is the other mode's job.
+    const chainShots = chaining ? dreamChainShots(startShot.id, Number(settings.iterations) || 1) : [];
+    const total = chaining
+      ? chainShots.length
+      : Math.max(1, Math.min(60, Number(settings.iterations) || 1));
+
+    if (chaining && total === 0) {
+      showToast('There are no shots after that one to chain through.', 'warning');
+      return;
+    }
+
+    const imageModelId = settings.imageModel || imageModel;
+    const imageRes = settings.imageResolution || imageResolution;
+    const videoModelId = settings.videoModel || videoModel;
+    const videoRes = settings.videoResolution || videoResolution;
+    const duration = settings.videoDuration || videoDuration;
+
+    dreamCancelRef.current = false;
+    setDreamRun({ active: true, total, clip: 1, completed: 0, phase: 'starting', log: [], stopped: false, failed: false });
+
+    // What the LLM is told it has already dreamt.
+    const history = [];
+    let shotId = startShot.id;
+    let shotName = startShot.name || 'Shot';
+    let currentImage = startShot.selectedImage;
+    let currentVideo = startShot.selectedVideo;
+    let currentVideoPrompt = resolveShotPrompt(startShot, 'video');
+    let previousVideo = null;
+    let failure = null;
+
+    try {
+      for (let clip = 1; clip <= total; clip++) {
+        if (dreamCancelRef.current) break;
+
+        if (clip > 1) {
+          dreamPhase(clip, 'capturing the last frame');
+          const framePath = await captureLastFrame(previousVideo);
+          setImageGallery(prev => [{
+            id: `img_dream_${Date.now()}`,
+            path: framePath,
+            prompt: `Dream clip ${clip - 1} — final frame`,
+            name: `Dream frame ${clip - 1}`,
+            createdAt: new Date().toISOString()
+          }, ...prev]);
+
+          if (dreamCancelRef.current) break;
+
+          if (chaining) {
+            // Nothing is written here: the shot keeps the prompt it already has
+            // and only its opening still is replaced by the frame we captured.
+            const nextShot = chainShots[clip - 1];
+            shotId = nextShot.id;
+            shotName = nextShot.name || `Shot ${clip}`;
+            currentVideoPrompt = resolveShotPrompt(nextShot, 'video');
+            if (!currentVideoPrompt.trim()) {
+              throw new Error(`${shotName} has no video prompt or description of its own to chain from.`);
+            }
+            handleUpdateShotField(shotId, 'selectedImage', framePath);
+            history.push(nextShot.description || currentVideoPrompt);
+            dreamLog(`${clip}. ${shotName} — continuing from the previous frame`);
+          } else {
+            dreamPhase(clip, 'asking the LLM what happens next');
+            const next = await askDreamForClip({ settings, framePath, clip, total, history });
+
+            shotName = dreamShotName(clip);
+            shotId = appendDreamShot(shotId, {
+              name: shotName,
+              description: next.description,
+              draftVideoPrompt: next.videoPrompt,
+              selectedImage: framePath,
+              videoModel: videoModelId,
+              videoResolution: videoRes,
+              videoDuration: duration
+            });
+            currentVideoPrompt = next.videoPrompt;
+            history.push(next.description || next.videoPrompt);
+            dreamLog(`${clip}. ${next.description || next.videoPrompt.slice(0, 100)}`);
+          }
+
+          currentImage = framePath;
+          currentVideo = null;
+        }
+
+        if (dreamCancelRef.current) break;
+
+        // --- opening shot only: fill in whatever it is missing ---------------
+        // Everything after clip 1 arrives with a still already captured off the
+        // previous clip, so none of this can apply to it.
+
+        // No still and no clip: draw one from whatever the shot has written.
+        if (!currentImage && !currentVideo) {
+          const openingPrompt = resolveShotPrompt(startShot, 'image');
+          if (!openingPrompt.trim()) {
+            throw new Error(`${shotName} has no image, and no description to generate one from.`);
+          }
+          dreamPhase(clip, 'generating the opening image');
+          const result = await submitGenerationJob({
+            type: 'image',
+            shotId,
+            shotName,
+            rawPrompt: openingPrompt,
+            model: imageModelId,
+            resolution: imageRes,
+            primaryImagePaths: shotReferencePaths(startShot),
+            attachTaggedImages: attachTagsForImages
+          });
+          if (!result?.ok) throw new Error(result?.error || 'The opening image failed to generate.');
+          currentImage = result.path;
+          dreamLog('1. opening image ready');
+        }
+
+        // A still but nothing written to animate it with. This is the common
+        // way in — a frame grabbed off another clip, dropped on an empty shot —
+        // so read the image and write the opening clip rather than refusing.
+        if (clip === 1 && !currentVideo && !currentVideoPrompt.trim()) {
+          if (!currentImage) {
+            throw new Error(`${shotName} has nothing to start from — give it an image or a description.`);
+          }
+          dreamPhase(1, 'writing the opening clip from the image');
+          const opening = await askDreamForClip({
+            settings, framePath: currentImage, clip: 1, total, history: [], opening: true
+          });
+          currentVideoPrompt = opening.videoPrompt;
+          // Write them onto the shot so the run leaves a shot you can re-roll
+          // by hand, exactly like every shot the invent mode creates.
+          handleUpdateShotField(shotId, 'draftVideoPrompt', opening.videoPrompt);
+          if (opening.description && !String(startShot.description || '').trim()) {
+            handleUpdateShotField(shotId, 'description', opening.description);
+          }
+          dreamLog(`1. ${opening.description || opening.videoPrompt.slice(0, 100)}`);
+        }
+
+        if (clip === 1) {
+          history.push(startShot.description || currentVideoPrompt || '');
+        }
+
+        if (!currentVideo) {
+          if (!String(currentVideoPrompt || '').trim()) {
+            throw new Error(`${shotName} has no video prompt to work from.`);
+          }
+          dreamPhase(clip, 'generating the clip');
+          const result = await submitGenerationJob({
+            type: 'video',
+            shotId,
+            shotName,
+            rawPrompt: currentVideoPrompt,
+            model: videoModelId,
+            resolution: videoRes,
+            duration,
+            primaryImagePaths: currentImage ? [currentImage] : [],
+            attachTaggedImages: attachTagsForVideos
+          });
+          if (!result?.ok) throw new Error(result?.error || 'The clip failed to generate.');
+          currentVideo = result.path;
+        } else {
+          dreamLog(`${clip}. reusing ${shotName}'s existing clip`);
+        }
+
+        previousVideo = currentVideo;
+        setDreamRun(prev => (prev ? { ...prev, completed: clip } : prev));
+      }
+    } catch (error) {
+      console.error('Dream failed:', error);
+      failure = error.message || String(error);
+      dreamLog(`Stopped: ${failure}`, 'error');
+    }
+
+    const stopped = dreamCancelRef.current;
+    setDreamRun(prev => (prev ? { ...prev, active: false, phase: '', stopped, failed: Boolean(failure) } : prev));
+    dreamCancelRef.current = false;
+
+    // No explicit save: this closure captured `scenes` as they were before the
+    // dream added anything, so writing them here would overwrite the run. The
+    // debounced autosave already fired on every clip.
+
+    if (failure) {
+      showToast(`Dream ended early: ${failure}`, 'error');
+    } else if (stopped) {
+      showToast('Dream stopped. Everything generated so far is in your shot list.', 'warning');
+    } else {
+      showToast(`Dream complete — ${total} clip${total === 1 ? '' : 's'}.`, 'success');
+    }
+  };
+
+  const handleStopDream = () => {
+    dreamCancelRef.current = true;
+    dreamLog('Stopping after the clip in flight…', 'info');
+    showToast('Dream will stop once the current clip finishes.', 'warning');
   };
 
   // --- ASSET LIBRARY --------------------------------------------------------
@@ -1352,7 +2410,7 @@ export default function App() {
   };
 
   /** The model the asset editor will generate with, and how many refs it takes. */
-  const assetEditorModel = (draft) => (draft?.imageModel || imageModel);
+  const assetEditorModel = (draft) => resolveAssetModelSettings(draft || {}).model;
   const assetRefCapacity = (draft) => refImageCapacity('image', assetEditorModel(draft));
 
   /**
@@ -1392,7 +2450,7 @@ export default function App() {
    */
   const buildAssetPrompt = (draft) => {
     const others = assetLibrary.filter(a => a.id !== draft.id);
-    const modelId = draft.imageModel || imageModel;
+    const modelId = assetEditorModel(draft);
     // Only images still in the asset's pool can be sent — one deleted from the
     // grid must not keep riding along invisibly in the saved selection.
     const pool = draft.images || [];
@@ -1422,15 +2480,26 @@ export default function App() {
     });
   };
 
+  /**
+   * Stamp an asset as edited in a way *shots can see* — tag, name, description
+   * or primary image. The stamp is what dirty-shot detection (Phase C) compares
+   * against each generation's recorded snapshot, so it must NOT move on edits
+   * that only affect the asset's own artwork generation (inputImages, models,
+   * promptWrap): those would flag every shot for changes no shot can observe.
+   */
+  const touchAsset = (asset) => ({ ...asset, updatedAt: new Date().toISOString() });
+
   /** Attach a freshly generated image to an asset, in the library and the open editor. */
   const attachImageToAsset = (assetId, imagePath) => {
     setAssetLibrary(prev => prev.map(asset => {
       if (asset.id !== assetId) return asset;
-      return {
+      const next = {
         ...asset,
         images: [...(asset.images || []), imagePath],
         primaryImage: asset.primaryImage || imagePath
       };
+      // Only a change to the *effective* primary is visible to shots.
+      return assetPrimaryImage(next) !== assetPrimaryImage(asset) ? touchAsset(next) : next;
     }));
     // Keep the editor in sync if it is still open on this asset.
     setAssetEditor(prev => {
@@ -1445,8 +2514,9 @@ export default function App() {
 
   /** Generate one reference image for a saved asset. Resolves, never rejects. */
   const generateAssetImage = async (asset, promptOverride = null) => {
-    const model = asset.imageModel || imageModel;
-    const resolution = asset.imageResolution || imageResolution;
+    const resolvedAsset = resolveAssetModelSettings(asset);
+    const model = resolvedAsset.model;
+    const resolution = resolvedAsset.resolution || imageResolution;
     const composed = promptOverride
       ? buildAssetPrompt({ ...asset, imagePrompt: promptOverride })
       : buildAssetPrompt(asset);
@@ -1477,16 +2547,34 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider: model,
-          providerFamily: getImageModel(model)?.provider || null,
+          // A custom path may declare its host as `fal:` / `higgsfield:`;
+          // a catalog model carries its provider in the catalog itself.
+          providerFamily: parseModelId(model).family || getImageModel(model)?.provider || null,
           prompt: composed.prompt,
           resolution,
-          inputImagePaths: composed.inputImagePaths
+          inputImagePaths: composed.inputImagePaths,
+          safetyChecker: atlasSafetyChecker
         })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Image API request failed');
 
       attachImageToAsset(asset.id, data.filePath);
+      // The board indexes everything the resolver can auto-attach, so a
+      // generated asset image registers itself — linked, kinded and tagged.
+      // Shot outputs deliberately do not (they would flood the board with
+      // takes); the gallery's "Add to ref board" action covers those.
+      setReferenceImages(prev => {
+        if (prev.some(r => r.path === data.filePath)) return prev;
+        return [...prev, normalizeReference({
+          path: data.filePath,
+          name: `${asset.name || asset.tag} ${(asset.images || []).length + 1}`,
+          kind: KIND_BY_ASSET_TYPE[asset.type] || 'other',
+          assetId: asset.id,
+          tags: asset.tag ? [asset.tag] : [],
+          source: 'generated'
+        })];
+      });
       setImageGallery(prev => [{
         id: `img_asset_${Date.now()}`,
         path: data.filePath,
@@ -1658,10 +2746,13 @@ export default function App() {
           const { description, imagePrompt } = await writeAssetPromptWithLlm(asset);
           promptOverride = imagePrompt;
           const filledDescription = asset.description?.trim() ? asset.description : (description || asset.description);
+          const descriptionChanged = (filledDescription || '') !== (asset.description || '');
           asset = { ...asset, imagePrompt, description: filledDescription };
-          setAssetLibrary(prev => prev.map(a => (
-            a.id === asset.id ? { ...a, imagePrompt, description: filledDescription } : a
-          )));
+          setAssetLibrary(prev => prev.map(a => {
+            if (a.id !== asset.id) return a;
+            const next = { ...a, imagePrompt, description: filledDescription };
+            return descriptionChanged ? touchAsset(next) : next;
+          }));
         } catch (err) {
           console.error(err);
           showToast(`<${asset.tag}>: prompt failed (${err.message}) — using the auto-built one.`, 'warning');
@@ -1723,6 +2814,16 @@ export default function App() {
       promptWrap: assetEditor.promptWrap || (assetEditor.applyGlobalPrompts ? 'image' : 'asset')
     };
 
+    // Bump updatedAt only when a shot-visible field moved; otherwise carry the
+    // old stamp so saving cosmetic settings never dirties every shot.
+    const previous = assetLibrary.find(a => a.id === record.id) || null;
+    const shotVisibleChange = !previous
+      || previous.tag !== record.tag
+      || (previous.name || '') !== record.name
+      || (previous.description || '') !== record.description
+      || assetPrimaryImage(previous) !== assetPrimaryImage(record);
+    record.updatedAt = shotVisibleChange ? new Date().toISOString() : (previous?.updatedAt || null);
+
     setAssetLibrary(prev => (
       prev.some(a => a.id === record.id) ? prev.map(a => (a.id === record.id ? record : a)) : [...prev, record]
     ));
@@ -1781,16 +2882,14 @@ export default function App() {
     }
   };
 
-  /** Insert <Tag> at the end of the generation modal prompt. */
+  /**
+   * Insert <Tag> at the caret in the generation modal prompt.
+   *
+   * No decoration: a tag is highlighted wherever it appears, whether it was
+   * typed or inserted, because it is the text itself that is special.
+   */
   const appendAssetTagToModalPrompt = (tag) => {
-    setGenModalPrompt(prev => {
-      const next = prev.trim() ? `${prev.trim()} <${tag}>` : `<${tag}>`;
-      if (generationModal && !generationModal.existingPromptId) {
-        const field = generationModal.type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt';
-        handleUpdateShotField(generationModal.shotId, field, next);
-      }
-      return next;
-    });
+    insertIntoModalPrompt(`<${tag}>`, { decorate: false, joiner: ' ' });
   };
 
   // --- PROJECTS -------------------------------------------------------------
@@ -1820,6 +2919,13 @@ export default function App() {
 
   /** Static build: adopt a folder from the picker or the recents list. */
   const adoptStaticProject = async (handle = null) => {
+    // Whatever is on screen right now and has never been written anywhere.
+    // Since the app opens without a folder, this is the normal way a project
+    // starts: poke around, make something, then say where it lives.
+    const unsavedWork = !projectFs.getActiveHandle() && (
+      scenes.length > 0 || imageGallery.length > 0 || videoGallery.length > 0 || assetLibrary.length > 0
+    );
+
     setLoadingStates(prev => ({ ...prev, project: true }));
     try {
       const result = handle
@@ -1828,11 +2934,28 @@ export default function App() {
 
       projectFs.clearAssetUrlCache(); // old blob: URLs point at the previous folder
       const state = await projectFs.readProjectState();
-      applyLoadedState(state || {});
-      if (!state) await projectFs.writeProjectState(buildStatePayload([]));
+
+      if (!state) {
+        // An empty folder becomes the home of what is already open, rather
+        // than resetting it — otherwise picking a folder late would throw away
+        // the very work that made you pick one.
+        await projectFs.writeProjectState(buildStatePayload());
+      } else if (unsavedWork && !window.confirm(
+        `"${result.name}" already holds a project. Opening it replaces what you have on screen, ` +
+        `which has never been saved. Open it anyway?`
+      )) {
+        // Backing out has to un-adopt the folder as well, or autosave would
+        // quietly write the scratch work over the project we just declined.
+        await projectFs.clearActiveProject();
+        showToast('Kept what you had. Pick an empty folder to save it into.', 'info');
+        return;
+      } else {
+        applyLoadedState(state);
+      }
 
       await fetchProject();
       setNeedsFolderPermission(false);
+      setFolderNoticeDismissed(false);
       setActiveOverlay(null);
       showToast(`Project folder "${result.name}" ready.`, 'success');
     } catch (err) {
@@ -1848,9 +2971,16 @@ export default function App() {
   const handleReconnectFolder = async () => {
     try {
       if (await projectFs.reconnectProject()) {
+        const state = await projectFs.readProjectState();
+        // Nothing was saved while the folder was out of reach, so anything on
+        // screen would vanish under the project we are about to load.
+        if (state && scenes.length > 0 && !window.confirm(
+          `Loading "${projectFs.getActiveName()}" replaces what you have on screen, which has not been saved. Continue?`
+        )) return;
+
         setNeedsFolderPermission(false);
         projectFs.clearAssetUrlCache();
-        applyLoadedState((await projectFs.readProjectState()) || {});
+        if (state) applyLoadedState(state);
         await fetchProject();
         showToast('Project folder reconnected.', 'success');
       } else {
@@ -1981,6 +3111,7 @@ export default function App() {
       add(shot.selectedImage);
       add(shot.selectedVideo);
       add(shot.lipSyncAudio);
+      (shot.audioRefs || []).forEach(add);
       [...(shot.imagePrompts || []), ...(shot.videoPrompts || [])].forEach(group => {
         (group.outputs || []).forEach(out => add(out.path));
         (group.inputImagePaths || []).forEach(add);
@@ -2091,13 +3222,13 @@ export default function App() {
             })
             .map(asset => {
               const images = (asset.images || []).map(p => mapping.get(p)).filter(Boolean);
-              return {
+              return touchAsset({
                 ...asset,
                 id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
                 images,
                 primaryImage: mapping.get(asset.primaryImage) || images[0] || null,
                 inputImages: assetInputImages(asset).map(p => mapping.get(p)).filter(Boolean)
-              };
+              });
             });
           return [...prev, ...additions];
         });
@@ -2135,11 +3266,13 @@ export default function App() {
       // Skip tags this project already defines rather than creating duplicates.
       let skipped = 0;
       setAssetLibrary(prev => {
-        const additions = incoming.filter(asset => {
-          const clash = prev.some(existing => normalizeTag(existing.tag) === normalizeTag(asset.tag));
-          if (clash) skipped += 1;
-          return !clash;
-        });
+        const additions = incoming
+          .filter(asset => {
+            const clash = prev.some(existing => normalizeTag(existing.tag) === normalizeTag(asset.tag));
+            if (clash) skipped += 1;
+            return !clash;
+          })
+          .map(touchAsset);
         return [...prev, ...additions];
       });
 
@@ -2154,8 +3287,284 @@ export default function App() {
 
   // --- SHOT LIST IMPORT / LLM PROMPT ---------------------------------------
 
+  // --- IDEA → SCRIPT (in-app) ----------------------------------------------
+
+  const handleGenerateScript = async () => {
+    setScriptGenBusy(true);
+    setScriptGenPreview(null);
+    try {
+      const result = await generateShotListFromIdea({
+        idea: scriptGenIdea,
+        assetLibrary,
+        llm: { provider: activeLlm, model: llmModel },
+        apiFetch,
+        intro: promptText(promptSettings, 'importIntro')
+      });
+      setScriptGenPreview(result);
+    } catch (err) {
+      console.error(err);
+      showToast(`Script generation failed: ${err.message}`, 'error');
+    } finally {
+      setScriptGenBusy(false);
+    }
+  };
+
+  /** Commit the previewed document through the same path a pasted reply takes. */
+  const handleApplyGeneratedScript = (mode) => {
+    if (!scriptGenPreview?.raw) return;
+    try {
+      applyImportedDocument(scriptGenPreview.raw, mode);
+      setScriptGenOpen(false);
+      setScriptGenPreview(null);
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
+  };
+
+  // --- PIPELINE STAGES -------------------------------------------------------
+  // Everything a long-lived run touches goes through pipelineFnsRef (updated
+  // every render) and scenesRef/assetLibraryRef, because the closures captured
+  // when the run started go stale the moment the script stage replaces the
+  // project.
+
+  useEffect(() => { assetLibraryRef.current = assetLibrary; }, [assetLibrary]);
+  // No dependency array on purpose: refreshed after EVERY render so a running
+  // pipeline always calls the newest closures. (An inline render assignment
+  // would hit the temporal dead zone — applyImportedDocument is declared
+  // further down the component.)
+  useEffect(() => {
+    pipelineFnsRef.current = {
+      submitGenerationJob,
+      writeShotPrompt,
+      generateAssetImage,
+      applyImportedDocument,
+      handleUpdateShotField,
+      submitFromProducingGroup,
+      resolveShotPrompt
+    };
+  });
+
+  const freshShots = () => scenesRef.current.flatMap(s => (s.shots || []).map(shot => ({ shot, sceneName: s.name })));
+
+  /**
+   * The stage list is a straight line with skippable nodes — no DAG machinery.
+   * Candidate predicates re-derive work from live state, so a rerun after a
+   * stop (or a reload) only does what is still missing, and the dirty stages
+   * import their predicates from dirty.js rather than growing a second
+   * dirtiness implementation.
+   */
+  const buildPipelineStages = () => {
+    const fns = () => pipelineFnsRef.current;
+    const submitShot = (type) => ({ shot }) => {
+      const scene = scenesRef.current.find(sc => (sc.shots || []).some(s => s.id === shot.id)) || null;
+      const resolved = resolveModelSettings({ type, project: projectModelDefaults, scene, shot });
+      const isImage = type === 'image';
+      return fns().submitGenerationJob({
+        type,
+        shotId: shot.id,
+        shotName: shot.name,
+        rawPrompt: fns().resolveShotPrompt(shot, type),
+        model: resolved.model,
+        resolution: resolved.resolution,
+        duration: resolved.duration || videoDuration,
+        primaryImagePaths: isImage ? shotReferencePaths(shot) : (shot.selectedImage ? [shot.selectedImage] : []),
+        attachTaggedImages: isImage ? attachTagsForImages : attachTagsForVideos
+      });
+    };
+
+    return [
+      {
+        id: 'script',
+        label: 'Generate script',
+        candidates: () => (
+          freshShots().length === 0 && pipelineIdeaRef.current.trim() ? [{ id: 'script' }] : []
+        ),
+        run: async () => {
+          const result = await generateShotListFromIdea({
+            idea: pipelineIdeaRef.current,
+            assetLibrary: assetLibraryRef.current,
+            llm: { provider: activeLlm, model: llmModel },
+            apiFetch,
+            intro: promptText(promptSettings, 'importIntro')
+          });
+          fns().applyImportedDocument(result.raw, 'replace');
+          // Let React commit the new scenes before the next stage derives from them.
+          await new Promise(resolve => setTimeout(resolve, 50));
+        },
+        concurrency: 1
+      },
+      {
+        id: 'assetImages',
+        label: 'Asset reference images',
+        candidates: () => assetLibraryRef.current
+          .filter(asset => (asset.images || []).length === 0
+            && (String(asset.description || '').trim() || String(asset.imagePrompt || '').trim()))
+          .map(asset => ({ id: asset.id, asset })),
+        run: ({ asset }) => {
+          const fresh = assetLibraryRef.current.find(a => a.id === asset.id) || asset;
+          return fns().generateAssetImage(fresh);
+        },
+        concurrency: 1 // strictly serial, like the existing asset batch
+      },
+      {
+        id: 'shotPrompts',
+        label: 'Write shot prompts',
+        candidates: () => {
+          const out = [];
+          for (const { shot } of freshShots()) {
+            if (!String(shot.description || '').trim()) continue;
+            if (!String(shot.draftImagePrompt || '').trim()) out.push({ id: `${shot.id}_img`, shot, type: 'image' });
+            if (!String(shot.draftVideoPrompt || '').trim()) out.push({ id: `${shot.id}_vid`, shot, type: 'video' });
+          }
+          return out;
+        },
+        run: async ({ shot, type }) => {
+          const result = await fns().writeShotPrompt(shot, type, { withContext: true });
+          if (result.ok) {
+            fns().handleUpdateShotField(shot.id, type === 'image' ? 'draftImagePrompt' : 'draftVideoPrompt', result.text);
+          }
+          return result;
+        },
+        concurrency: 2 // LLM providers rate-limit harder than image hosts
+      },
+      {
+        id: 'shotImages',
+        label: 'Generate shot images',
+        candidates: () => freshShots().filter(({ shot }) => (
+          pipelineFnsRef.current.resolveShotPrompt(shot, 'image').trim()
+          && !(shot.imagePrompts || []).some(p => (p.outputs || []).length > 0)
+        )),
+        run: submitShot('image'),
+        concurrency: batchConcurrency
+      },
+      {
+        id: 'select',
+        label: 'Select stills',
+        candidates: () => freshShots().filter(({ shot }) => (
+          !shot.selectedImage && (shot.imagePrompts || []).some(p => (p.outputs || []).length > 0)
+        )),
+        run: ({ shot }) => {
+          const outputs = (shot.imagePrompts || []).flatMap(p => p.outputs || []);
+          const newest = [...outputs].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0];
+          if (newest) fns().handleUpdateShotField(shot.id, 'selectedImage', newest.path);
+          return { ok: Boolean(newest) };
+        },
+        concurrency: 1
+      },
+      {
+        id: 'dirtyImages',
+        label: 'Regenerate stale images',
+        candidates: () => dirtyImageCandidates(scenesRef.current, assetLibraryRef.current),
+        run: ({ shot }) => {
+          const fresh = scenesRef.current.flatMap(s => s.shots || []).find(s => s.id === shot.id) || shot;
+          return fns().submitFromProducingGroup(fresh, 'image');
+        },
+        concurrency: batchConcurrency
+      },
+      {
+        id: 'shotVideos',
+        label: 'Generate shot videos',
+        candidates: () => freshShots().filter(({ shot }) => (
+          pipelineFnsRef.current.resolveShotPrompt(shot, 'video').trim()
+          && shot.selectedImage
+          && !(shot.videoPrompts || []).some(p => (p.outputs || []).length > 0)
+        )),
+        run: submitShot('video'),
+        concurrency: Math.min(2, batchConcurrency)
+      },
+      {
+        id: 'dirtyVideos',
+        label: 'Regenerate stale videos',
+        candidates: () => dirtyVideoCandidates(scenesRef.current, assetLibraryRef.current),
+        run: ({ shot }) => {
+          const fresh = scenesRef.current.flatMap(s => s.shots || []).find(s => s.id === shot.id) || shot;
+          return fns().submitFromProducingGroup(fresh, 'video');
+        },
+        concurrency: Math.min(2, batchConcurrency)
+      },
+      {
+        id: 'timeline',
+        label: 'Build timeline',
+        candidates: () => (freshShots().some(({ shot }) => shot.selectedVideo || shot.selectedImage) ? [{ id: 'timeline' }] : []),
+        run: () => {
+          setEdit(previous => {
+            const ctx = makeContext(scenesRef.current, previous.durations, Number(videoDuration) || 5);
+            if ((previous.video || []).length === 0) {
+              const clips = deriveVideoClips(scenesRef.current);
+              const audioClips = deriveAudioClipsForShots(scenesRef.current, clips);
+              const audio = audioClips.length > 0
+                ? [...(previous.audio || []), { ...createAudioTrack('Dialogue'), clips: audioClips }]
+                : (previous.audio || []);
+              return normalize({ ...previous, video: clips, audio }, ctx);
+            }
+            // An existing cut is real work: reconcile keeps trims, transitions
+            // and linked audio, only updating the running order.
+            return reconcile(previous, scenesRef.current, ctx, { add: true, prune: true, reorder: true });
+          });
+          return { ok: true };
+        },
+        concurrency: 1
+      }
+    ];
+  };
+
+  /** Known catalog prices per candidate; null = credit-priced. LLM calls count as free. */
+  const pipelinePriceFor = (stage, candidate) => {
+    const modelPrice = (type, model) => {
+      const record = type === 'image' ? getImageModel(model) : getVideoModel(model);
+      return { price: typeof record?.price === 'number' ? record.price : null };
+    };
+    if (stage.id === 'assetImages') {
+      return modelPrice('image', resolveAssetModelSettings(candidate.asset).model);
+    }
+    if (stage.id === 'shotImages' || stage.id === 'dirtyImages') {
+      return modelPrice('image', resolveShotModelSettings('image', candidate.shot).model);
+    }
+    if (stage.id === 'shotVideos' || stage.id === 'dirtyVideos') {
+      return modelPrice('video', resolveShotModelSettings('video', candidate.shot).model);
+    }
+    return { price: 0 };
+  };
+
+  // The panel's live counts + cost estimate, recomputed while it is open.
+  useEffect(() => {
+    if (!pipelineOpen) return undefined;
+    let cancelled = false;
+    estimateRun({ stages: buildPipelineStages(), skip: pipelineSkip, priceFor: pipelinePriceFor })
+      .then(rows => { if (!cancelled) setPipelineEstimate(rows); })
+      .catch(() => { if (!cancelled) setPipelineEstimate(null); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pipelineOpen, pipelineSkip, scenes, assetLibrary, pipelineIdea]);
+
+  const handleRunPipeline = () => {
+    if (pipelineRunRef.current) return;
+    const run = createPipelineRun({
+      stages: buildPipelineStages(),
+      options: {
+        skip: pipelineSkip,
+        concurrency: batchConcurrency,
+        retry: { attempts: 2, backoffMs: 2000 }
+      }
+    });
+    pipelineRunRef.current = run;
+    run.subscribe(setPipelineRunState);
+    run.start().then(finalState => {
+      pipelineRunRef.current = null;
+      const failed = Object.values(finalState.stageStates).reduce((sum, s) => sum + (s.failed?.length || 0), 0);
+      showToast(
+        finalState.status === 'cancelled'
+          ? 'Pipeline stopped. Rerun to pick up where it left off.'
+          : failed > 0
+            ? `Pipeline finished with ${failed} failure${failed === 1 ? '' : 's'} — rerun to retry just those.`
+            : 'Pipeline complete.',
+        finalState.status === 'cancelled' || failed > 0 ? 'warning' : 'success'
+      );
+    });
+  };
+
   const handleCopyLlmPrompt = async () => {
-    const text = buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource });
+    const text = buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource, intro: promptText(promptSettings, 'importIntro') });
     try {
       await navigator.clipboard.writeText(text);
       showToast('LLM prompt copied. Paste it into any chat model with your script.', 'success');
@@ -2188,6 +3597,24 @@ export default function App() {
     reader.readAsText(file);
   };
 
+  /** The same import, from the paste box rather than a file on disk. */
+  const handleImportPastedShotList = () => {
+    if (!pasteImport) return;
+    let parsed;
+    try {
+      parsed = extractJsonDocument(pasteImport.text);
+    } catch (err) {
+      showToast(`JSON parse error: ${err.message}`, 'error');
+      return;
+    }
+    try {
+      applyImportedDocument(parsed, pasteImport.mode);
+      setPasteImport(null);
+    } catch (err) {
+      showToast(`Import failed: ${err.message}`, 'error');
+    }
+  };
+
   /**
    * Load an imported document into the studio.
    *
@@ -2196,16 +3623,33 @@ export default function App() {
    * flat settings). Throws with a readable message if the document is unusable.
    */
   const applyImportedDocument = (parsed, mode = 'replace', { restoreGalleries = false } = {}) => {
-    const { project, assets, promptSnippets: importedSnippets, scenes: importedScenes, warnings } =
+    const { project, assets, promptSnippets: importedSnippets, scenes: importedScenes, warnings, idMap, legacyShotRefs } =
       normalizeImportedShotList(parsed);
 
-    // Project-level settings
-    if (project.prePrompt !== undefined) setPrePrompt(project.prePrompt);
-    if (project.postPrompt !== undefined) setPostPrompt(project.postPrompt);
-    if (project.videoPrePrompt !== undefined) setVideoPrePrompt(project.videoPrePrompt);
-    if (project.videoPostPrompt !== undefined) setVideoPostPrompt(project.videoPostPrompt);
-    if (project.imageSystemPrompt) setImageSystemPrompt(project.imageSystemPrompt);
-    if (project.videoSystemPrompt) setVideoSystemPrompt(project.videoSystemPrompt);
+    // Project-level settings.
+    //
+    // The pre/post and system prompts have no state of their own any more —
+    // they are slots in `promptSettings`. Writing them through the setters they
+    // used to have threw a ReferenceError that the import handlers caught and
+    // reported as a plain "Import failed", so any document carrying a pre-prompt
+    // could not be imported at all.
+    const importedSlots = {};
+    [
+      'prePrompt', 'postPrompt', 'videoPrePrompt', 'videoPostPrompt',
+      'imageSystemPrompt', 'videoSystemPrompt'
+    ].forEach(slot => {
+      if (typeof project[slot] === 'string') importedSlots[slot] = project[slot];
+    });
+    // A full state export carries the whole bag, including the slots that have
+    // no flat mirror (asset templates, the import intro). The flat six win, so a
+    // hand-written shot list still overrides what the bag happens to hold.
+    const importedBag = parsed.promptSettings && typeof parsed.promptSettings === 'object'
+      ? parsed.promptSettings
+      : {};
+    if (Object.keys(importedSlots).length > 0 || Object.keys(importedBag).length > 0) {
+      setPromptSettings(prev => ({ ...prev, ...importedBag, ...importedSlots }));
+    }
+
     if (project.activeLlm) setActiveLlm(project.activeLlm);
     if (project.llmModel) setLlmModel(project.llmModel);
     if (project.imageModel) setImageModel(project.imageModel);
@@ -2218,10 +3662,38 @@ export default function App() {
     if (restoreGalleries) {
       setImageGallery(parsed.imageGallery || []);
       setVideoGallery(parsed.videoGallery || []);
-      setReferenceImages(parsed.referenceImages || []);
+      const restoredRefs = (parsed.referenceImages || []).map(normalizeReference);
+      setReferenceImages(restoredRefs);
+      // Assignments in the export point at the exporter's scene/shot ids; the
+      // normaliser mints fresh ids, so remap every edge target through its
+      // idMap. Legacy pre-v2 exports carried per-shot refId arrays instead —
+      // those become shot-scope edges here, because the schema migration only
+      // runs at project load and can never see an imported document.
+      const knownRefIds = new Set(restoredRefs.map(r => r.id));
+      let restoredEdges = (parsed.refAssignments || [])
+        .map(normalizeAssignment)
+        .filter(edge => edge && knownRefIds.has(edge.refId))
+        .map(edge => (edge.scope === 'project' ? edge : { ...edge, targetId: idMap[edge.targetId] || edge.targetId }));
+      legacyShotRefs.forEach(({ shotId, refIds }) => {
+        const usable = refIds.filter(id => knownRefIds.has(id));
+        if (usable.length > 0) restoredEdges = assignReferences(restoredEdges, usable, [{ scope: 'shot', targetId: shotId }]);
+      });
+      setRefAssignments(restoredEdges);
       setConcatenatedVideo(parsed.concatenatedVideo || null);
       // A shot list on its own carries no edit; a full state export does.
       if (parsed.edit) setEdit(migrateEdit(parsed.edit));
+    } else if (legacyShotRefs.length > 0) {
+      // Shot-list import into an existing project: legacy per-shot refIds can
+      // only mean references already on this project's board.
+      setRefAssignments(prev => {
+        const known = new Set(referenceImages.map(r => r.id));
+        let next = prev;
+        legacyShotRefs.forEach(({ shotId, refIds }) => {
+          const usable = refIds.filter(id => known.has(id));
+          if (usable.length > 0) next = assignReferences(next, usable, [{ scope: 'shot', targetId: shotId }]);
+        });
+        return next;
+      });
     }
 
     // Assets merge by tag: an imported asset never clobbers reference images
@@ -2233,7 +3705,7 @@ export default function App() {
           const existingIndex = merged.findIndex(a => normalizeTag(a.tag) === normalizeTag(incoming.tag));
           if (existingIndex >= 0) {
             const existing = merged[existingIndex];
-            merged[existingIndex] = {
+            const next = {
               ...existing,
               type: incoming.type || existing.type,
               name: incoming.name || existing.name,
@@ -2242,8 +3714,12 @@ export default function App() {
               primaryImage: existing.primaryImage || incoming.primaryImage,
               inputImages: assetInputImages(existing).length ? assetInputImages(existing) : assetInputImages(incoming)
             };
+            const shotVisibleChange = (existing.name || '') !== (next.name || '')
+              || (existing.description || '') !== (next.description || '')
+              || assetPrimaryImage(existing) !== assetPrimaryImage(next);
+            merged[existingIndex] = shotVisibleChange ? touchAsset(next) : next;
           } else {
-            merged.push(incoming);
+            merged.push(touchAsset(incoming));
           }
         });
         return merged;
@@ -2311,7 +3787,8 @@ export default function App() {
         imagePrompt: '',
         imageModel: null,
         imageResolution: null,
-        applyGlobalPrompts: false
+        applyGlobalPrompts: false,
+        updatedAt: new Date().toISOString()
       }));
     if (additions.length === 0) return;
     setAssetLibrary(prev => [...prev, ...additions]);
@@ -2611,6 +4088,7 @@ export default function App() {
       selectedVideo: null,
       referenceImages: [],
       lipSyncAudio: null,
+      audioRefs: [],
       imagePrompts: [],
       videoPrompts: [],
       draftImagePrompt: '',
@@ -2746,6 +4224,63 @@ export default function App() {
       showToast(`Upload failed: ${err.message}`, 'error');
     } finally {
       setLoadingStates(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  /**
+   * Attach reference audio to a shot.
+   *
+   * Deliberately not the same field as `lipSyncAudio`: that one is a track to
+   * sync an *already generated* video against, while these are inputs the model
+   * generates *from* — Seedance 2.0 will sing to them, speak to them or cut to
+   * their beat, addressed from the prompt as @audio1..@audio3.
+   */
+  const handleAudioRefUpload = async (shotId, e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length) return;
+
+    const shot = shots.find(s => s.id === shotId);
+    const capacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
+    const room = capacity - (shot?.audioRefs || []).length;
+    if (room <= 0) {
+      showToast(`This shot already has the ${capacity} reference clip${capacity === 1 ? '' : 's'} the model accepts.`, 'warning');
+      return;
+    }
+    if (files.length > room) {
+      showToast(`Only the first ${room} of ${files.length} will fit — the model takes ${capacity}.`, 'warning');
+    }
+
+    const key = `audioref_${shotId}`;
+    setLoadingStates(prev => ({ ...prev, [key]: true }));
+    try {
+      const paths = [];
+      for (const file of files.slice(0, room)) {
+        const formData = new FormData();
+        formData.append('file', file);
+        const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Upload failed');
+        paths.push(data.filePath);
+      }
+      handleUpdateShotField(shotId, 'audioRefs', [...(shot?.audioRefs || []), ...paths]);
+      showToast(`${paths.length} audio reference${paths.length === 1 ? '' : 's'} attached.`, 'success');
+    } catch (err) {
+      console.error(err);
+      showToast(`Upload failed: ${err.message}`, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  // Removal renumbers everything after it, so a prompt pointing at @audio2
+  // starts addressing a different clip. Worth saying out loud.
+  const handleRemoveAudioRef = (shotId, path) => {
+    const shot = shots.find(s => s.id === shotId);
+    const remaining = (shot?.audioRefs || []).filter(p => p !== path);
+    handleUpdateShotField(shotId, 'audioRefs', remaining);
+    if (remaining.length > 0) {
+      showToast('Removed — the clips after it have shifted up a slot, so check any @audio pointers in the prompt.', 'info');
     }
   };
 
@@ -2888,23 +4423,36 @@ export default function App() {
     }
   };
 
-  const openProjectImageSelector = async (target) => {
+  /**
+   * Re-read the project's assets folder.
+   *
+   * This is the catch-all image source — captured frames, hand-copied files,
+   * anything the named galleries never learned about. Split out from the
+   * selector below so the shot picker can refresh it without also opening a
+   * different dialog. Resolves either way; a failure just means the picker
+   * shows the sources it does know about.
+   */
+  const fetchProjectImages = async () => {
     setLoadingStates(prev => ({ ...prev, project_images: true }));
     try {
       const res = await apiFetch(`/api/project-images`);
-      if (res.ok) {
-        const list = await res.json();
-        setProjectImagesList(list);
-        setProjectImagesSelector({ target });
-      } else {
+      if (!res.ok) {
         showToast('Failed to load project images', 'error');
+        return false;
       }
+      setProjectImagesList(await res.json());
+      return true;
     } catch (err) {
       console.error(err);
       showToast('Error loading project images', 'error');
+      return false;
     } finally {
       setLoadingStates(prev => ({ ...prev, project_images: false }));
     }
+  };
+
+  const openProjectImageSelector = async (target) => {
+    if (await fetchProjectImages()) setProjectImagesSelector({ target });
   };
 
   const selectProjectImage = (image) => {
@@ -3048,6 +4596,39 @@ export default function App() {
     setRefAssignments(prev => setEdgeEnabled(prev, entry.edge.id, !entry.enabled));
   };
 
+  /**
+   * One-click "Add to ref board" for gallery stills. Shot outputs are never
+   * auto-registered (they would flood the board with takes); this is the
+   * deliberate opt-in for the keepers.
+   */
+  const handleAddPathToBoard = (path, name = '') => {
+    if (!path) return;
+    if (referenceImages.some(r => r.path === path)) {
+      showToast('Already on the reference board.', 'warning');
+      return;
+    }
+    setReferenceImages(prev => [normalizeReference({
+      path,
+      name: String(name).replace(/\.[^.]+$/, '') || 'Still',
+      source: 'generated'
+    }), ...prev]);
+    showToast('Added to the reference board.', 'success');
+  };
+
+  /** Promote an auto/inherited reference to a shot-scope edge — it survives model swaps and batches. */
+  const handlePinReferenceToShot = (shotId, refId) => {
+    setRefAssignments(prev => assignReferences(prev, [refId], [{ scope: 'shot', targetId: shotId }]));
+    showToast('Reference pinned to this shot.', 'success');
+  };
+
+  /** Opt this shot out of a board-contributed reference (auto-attached or inherited). */
+  const handleExcludeReferenceFromShot = (shot, refId) => {
+    const current = shot.refExclusions || [];
+    if (!current.includes(refId)) {
+      handleUpdateShotField(shot.id, 'refExclusions', [...current, refId]);
+    }
+  };
+
   const toggleSceneReferenceEntry = (entry) => {
     // A project-wide reference is only shown here for context. Toggling it from
     // a scene header would quietly switch it off for the whole film, which is
@@ -3149,6 +4730,27 @@ export default function App() {
       return;
     }
     showToast('Asset deleted');
+  };
+
+  /**
+   * Open the picker, and refresh the assets-folder listing while it loads.
+   *
+   * That listing is the catch-all source — captured frames, hand-copied files,
+   * anything the named galleries never learned about — so it has to be current
+   * rather than whatever was fetched the last time some other dialog needed it.
+   */
+  const openMediaPicker = (shotId, kind) => {
+    setMediaPicker({ shotId, kind });
+    if (kind === 'image') fetchProjectImages();
+  };
+
+  const handlePickShotMedia = (path) => {
+    if (!mediaPicker) return;
+    const { shotId, kind } = mediaPicker;
+    const field = kind === 'video' ? 'selectedVideo' : 'selectedImage';
+    handleUpdateShotField(shotId, field, path);
+    setMediaPicker(null);
+    showToast(`${kind === 'video' ? 'Clip' : 'Image'} set${path ? '' : ' — slot cleared'}.`, 'success');
   };
 
   const handleSetSelect = (galleryType, assetPath) => {
@@ -3294,14 +4896,20 @@ export default function App() {
   const activeScene = scenes.find(s => s.id === activeSceneId) || scenes[0];
   const activeSceneShots = activeScene ? (activeScene.shots || []) : [];
 
-  // Hosted build, no usable folder yet: everything else is pointless until the
-  // user grants access, so gate the whole app behind one clear choice.
-  const showStartupGate = runtimeMode === 'static'
-    && (needsFolderPermission || project.needsFolder || !projectFs.isFileSystemAccessSupported());
+  // Hosted build, no usable folder yet. This used to gate the whole app behind
+  // a folder picker on first paint, which meant you had to commit to a place on
+  // disk before you could even look around. Nothing here needs a folder until
+  // something is written, so it is a banner now — the picker comes when the
+  // work does.
+  const folderNotice = runtimeMode !== 'static' || folderNoticeDismissed ? null
+    : !projectFs.isFileSystemAccessSupported() ? 'unsupported'
+    : needsFolderPermission ? 'reconnect'
+    : project.needsFolder ? 'none'
+    : null;
 
   // The editor is a separate view, not an overlay: it unmounts the creation UI
   // entirely so the two never have to share layout or keyboard shortcuts.
-  if (view === 'edit' && !showStartupGate) {
+  if (view === 'edit') {
     return (
       <EditView
         scenes={scenes}
@@ -3311,72 +4919,6 @@ export default function App() {
         onToast={showToast}
         onClose={() => setView('create')}
       />
-    );
-  }
-
-  if (showStartupGate) {
-    const unsupported = !projectFs.isFileSystemAccessSupported();
-    return (
-      <div className="app-container">
-        {toast && (
-          <div className="toast"><Sparkles size={16} /><span>{toast.message}</span></div>
-        )}
-        <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}>
-          <div className="glass-panel" style={{ padding: '32px', maxWidth: '560px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <div className="header-logo">MM</div>
-              <div>
-                <h1 style={{ fontSize: '1.5rem' }}>MovieMaker Studio</h1>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>Hosted build — your files stay on your machine</span>
-              </div>
-            </div>
-
-            {unsupported ? (
-              <>
-                <div style={{ display: 'flex', gap: '8px', color: 'var(--accent)', fontSize: '0.9rem' }}>
-                  <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: '2px' }} />
-                  <span>This browser can't open local folders.</span>
-                </div>
-                <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                  MovieMaker stores your projects as real files on your own disk, which needs the File System
-                  Access API — currently Chrome, Edge and other Chromium browsers. Firefox and Safari don't
-                  implement it. Open this page in Chrome or Edge to continue.
-                </p>
-              </>
-            ) : needsFolderPermission ? (
-              <>
-                <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                  Welcome back. Your browser needs one click to re-grant access to
-                  {' '}<strong style={{ color: 'var(--text-main)' }}>{projectFs.getActiveName()}</strong>.
-                </p>
-                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                  <button className="btn btn-primary" onClick={handleReconnectFolder}>
-                    <FolderOpen size={16} /> Reconnect "{projectFs.getActiveName()}"
-                  </button>
-                  <button className="btn btn-secondary" onClick={() => adoptStaticProject()}>
-                    Choose a different folder…
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                  Pick a folder to work in. The project file and every generated image and video are written
-                  straight into it — nothing is uploaded to this site, and there's no server involved.
-                  An empty folder starts a new project; a folder you've used before reopens it.
-                </p>
-                <button className="btn btn-primary" style={{ alignSelf: 'flex-start' }} disabled={loadingStates.project} onClick={() => adoptStaticProject()}>
-                  {loadingStates.project ? <RefreshCw className="spinner" size={16} /> : <FolderOpen size={16} />} Choose Project Folder…
-                </button>
-                <span style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
-                  You'll also need API keys — add them under Settings once you're in. They're stored in this
-                  browser only.
-                </span>
-              </>
-            )}
-          </div>
-        </div>
-      </div>
     );
   }
 
@@ -3398,8 +4940,10 @@ export default function App() {
             <h1>MovieMaker Studio</h1>
             <button
               onClick={() => setActiveOverlay(activeOverlay === 'projects' ? null : 'projects')}
-              title={project.path || 'No project file — using the loose project_state.json'}
-              style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.75rem', color: project.isLegacy ? 'var(--accent)' : 'var(--text-dim)', fontFamily: 'inherit' }}
+              title={project.needsFolder
+                ? 'No folder chosen yet — nothing is being saved. Click to pick one.'
+                : project.path || 'No project file — using the loose project_state.json'}
+              style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.75rem', color: project.isLegacy || project.needsFolder ? 'var(--accent)' : 'var(--text-dim)', fontFamily: 'inherit' }}
             >
               <FolderOpen size={11} />
               <span style={{ maxWidth: '320px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -3424,6 +4968,23 @@ export default function App() {
               neither is a command, so neither belongs in a dropdown. */}
           <nav className="menu-bar">
             <Menu label="Project" icon={FolderOpen}>
+              <MenuItem
+                icon={Undo2}
+                disabled={!historyCanUndo(history)}
+                hint="Ctrl+Z"
+                onClick={handleUndo}
+              >
+                {historyCanUndo(history) ? `Undo ${historyUndoLabel(history)}` : 'Undo'}
+              </MenuItem>
+              <MenuItem
+                icon={Redo2}
+                disabled={!historyCanRedo(history)}
+                hint="Ctrl+Shift+Z"
+                onClick={handleRedo}
+              >
+                {historyCanRedo(history) ? `Redo ${historyRedoLabel(history)}` : 'Redo'}
+              </MenuItem>
+              <MenuSeparator />
               <MenuItem icon={Plus} onClick={() => { setActiveOverlay('projects'); setNewProjectDraft({ directory: '', name: '' }); }}>
                 New project…
               </MenuItem>
@@ -3447,15 +5008,23 @@ export default function App() {
                 Copy LLM prompt
               </MenuItem>
               <MenuItem
+                icon={ClipboardPaste}
+                onClick={() => setPasteImport({ text: '', mode: 'replace' })}
+                title="Paste an LLM's reply straight in, fence and all"
+              >
+                Paste shot list…
+              </MenuItem>
+              <MenuItem
                 icon={Upload}
                 onClick={() => { shotListInputRef.current.dataset.mode = 'replace'; shotListInputRef.current.click(); }}
+                hint="file"
               >
                 Import shot list…
               </MenuItem>
               <MenuItem
                 icon={Plus}
                 onClick={() => { shotListInputRef.current.dataset.mode = 'append'; shotListInputRef.current.click(); }}
-                hint="append"
+                hint="file, append"
               >
                 Import and add after…
               </MenuItem>
@@ -3501,6 +5070,16 @@ export default function App() {
 
             <Menu label="Generate" icon={Zap}>
               <MenuItem
+                icon={Zap}
+                disabled={Boolean(batchRunner)}
+                onClick={() => setPipelineOpen(true)}
+                badge={pipelineRunRef.current && <span className="menu-badge">running</span>}
+                title="One button: idea → script → assets → prompts → images → videos → timeline"
+              >
+                Pipeline…
+              </MenuItem>
+              <MenuSeparator />
+              <MenuItem
                 icon={ImageIcon}
                 disabled={Boolean(batchRunner)}
                 onClick={() => setBatchDialog({ type: 'image', scope: 'scene' })}
@@ -3520,6 +5099,59 @@ export default function App() {
                 onClick={() => setAssetBatchDialog({ onlyMissing: true, useLlm: true, rewriteExisting: false })}
               >
                 Batch asset references…
+              </MenuItem>
+
+              <MenuSeparator />
+              <MenuItem
+                icon={Sparkles}
+                disabled={Boolean(batchRunner)}
+                onClick={() => handleWriteAllPrompts('image', 'all')}
+                title="LLM-writes an image prompt for every shot that has a description but no draft prompt yet"
+              >
+                Write all image prompts
+              </MenuItem>
+              <MenuItem
+                icon={Sparkles}
+                disabled={Boolean(batchRunner)}
+                onClick={() => handleWriteAllPrompts('video', 'all')}
+                title="LLM-writes a video prompt for every shot that has a description but no draft prompt yet"
+              >
+                Write all video prompts
+              </MenuItem>
+              <MenuItem
+                icon={FileText}
+                disabled={Boolean(batchRunner)}
+                onClick={() => setScriptGenOpen(true)}
+                title="Describe the film in a few sentences; the LLM writes the scenes, shots and assets"
+              >
+                Idea → Script…
+              </MenuItem>
+
+              <MenuSeparator />
+              {(() => {
+                const staleImages = [...dirtyMap.values()].filter(d => d.image.dirty).length;
+                const staleVideos = [...dirtyMap.values()].filter(d => d.video.dirty).length;
+                const total = staleImages + staleVideos;
+                return (
+                  <MenuItem
+                    icon={RefreshCw}
+                    disabled={Boolean(batchRunner) || total === 0}
+                    onClick={handleRegenerateStale}
+                    badge={total > 0 && <span className="menu-badge">{total}</span>}
+                    title="Regenerate every shot whose assets changed since it was made: images first, then the videos that depended on them"
+                  >
+                    Regenerate stale
+                  </MenuItem>
+                );
+              })()}
+              <MenuSeparator />
+              <MenuItem
+                icon={Moon}
+                onClick={() => setDreamOpen(true)}
+                badge={dreamRun?.active && <span className="menu-badge">{dreamRun.completed}/{dreamRun.total}</span>}
+                title="One continuous shot: each clip animates the last frame of the one before it"
+              >
+                Dream…
               </MenuItem>
 
               <MenuSeparator />
@@ -3582,6 +5214,27 @@ export default function App() {
             </span>
           </div>
 
+          <div style={{ display: 'flex', gap: '2px' }}>
+            <button
+              className="btn btn-secondary"
+              style={{ padding: '8px', borderRadius: '50%' }}
+              disabled={!historyCanUndo(history)}
+              onClick={handleUndo}
+              title={historyCanUndo(history) ? `Undo ${historyUndoLabel(history)} (Ctrl+Z)` : 'Nothing to undo'}
+            >
+              <Undo2 size={17} />
+            </button>
+            <button
+              className="btn btn-secondary"
+              style={{ padding: '8px', borderRadius: '50%' }}
+              disabled={!historyCanRedo(history)}
+              onClick={handleRedo}
+              title={historyCanRedo(history) ? `Redo ${historyRedoLabel(history)} (Ctrl+Shift+Z)` : 'Nothing to redo'}
+            >
+              <Redo2 size={17} />
+            </button>
+          </div>
+
           <button
             className={`btn btn-secondary ${referencePanelOpen ? 'active' : ''}`}
             style={{ padding: '8px', borderRadius: '50%' }}
@@ -3610,6 +5263,65 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* Hosted build, folder not settled yet. Informational, never blocking:
+          look around all you like, the picker is one click away when you have
+          something worth keeping. */}
+      {folderNotice && (
+        <div
+          className="glass-panel"
+          style={{
+            margin: '12px 24px 0', padding: '10px 14px', display: 'flex', alignItems: 'center',
+            gap: '12px', flexWrap: 'wrap', background: 'rgba(139,92,246,0.08)',
+            border: '1px solid var(--border-light)'
+          }}
+        >
+          <AlertTriangle size={15} style={{ flexShrink: 0, color: 'var(--accent)' }} />
+          <span style={{ flex: 1, minWidth: '260px', fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            {folderNotice === 'unsupported' ? (
+              <>
+                This browser can't open local folders, so nothing can be saved. MovieMaker keeps projects as
+                real files on your disk via the File System Access API — Chrome, Edge and other Chromium
+                browsers. Open this page there when you're ready to work for real.
+              </>
+            ) : folderNotice === 'reconnect' ? (
+              <>
+                <strong style={{ color: 'var(--text-main)' }}>{projectFs.getActiveName()}</strong> is waiting —
+                your browser needs one click to re-grant access before it loads and saves again.
+              </>
+            ) : (
+              <>
+                Nothing is being saved yet. Choose a folder when you're ready — the project file and every
+                generated image and video are written straight into it, with nothing uploaded to this site.
+              </>
+            )}
+          </span>
+          {folderNotice === 'reconnect' && (
+            <button className="btn btn-primary" style={{ fontSize: '0.78rem', padding: '5px 12px' }} onClick={handleReconnectFolder}>
+              <FolderOpen size={13} /> Reconnect
+            </button>
+          )}
+          {folderNotice !== 'unsupported' && (
+            <button
+              className={folderNotice === 'reconnect' ? 'btn btn-secondary' : 'btn btn-primary'}
+              style={{ fontSize: '0.78rem', padding: '5px 12px' }}
+              disabled={loadingStates.project}
+              onClick={() => adoptStaticProject()}
+            >
+              {loadingStates.project ? <RefreshCw className="spinner" size={13} /> : <FolderOpen size={13} />}
+              {folderNotice === 'reconnect' ? 'Different folder…' : 'Choose project folder…'}
+            </button>
+          )}
+          <button
+            className="btn btn-secondary"
+            title="Hide this — the project name in the header always says where you stand"
+            style={{ padding: '5px', borderRadius: '50%' }}
+            onClick={() => setFolderNoticeDismissed(true)}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
 
       {/* SINGLE COLUMN TIMELINE */}
       <main className="main-grid">
@@ -3712,6 +5424,23 @@ export default function App() {
                   />
                 </label>
 
+                {/* Scene-level model defaults: shots inherit these unless they
+                    carry their own override. */}
+                <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                  <ModelPill
+                    type="image"
+                    resolved={resolveModelSettings({ type: 'image', project: projectModelDefaults, scene: activeScene })}
+                    value={activeScene.imageModel}
+                    onChange={(v) => handleUpdateSceneField(activeScene.id, 'imageModel', v)}
+                  />
+                  <ModelPill
+                    type="video"
+                    resolved={resolveModelSettings({ type: 'video', project: projectModelDefaults, scene: activeScene })}
+                    value={activeScene.videoModel}
+                    onChange={(v) => handleUpdateSceneField(activeScene.id, 'videoModel', v)}
+                  />
+                </div>
+
                 {/* References the whole scene carries, and whether each is
                     actually sent. Shots inherit these unless they opt out. */}
                 <ReferenceStrip
@@ -3767,10 +5496,21 @@ export default function App() {
             </div>
           )}
 
+          {/* Stale-only display filter, shown only when something is stale. */}
+          {[...dirtyMap.values()].some(d => d.image.dirty || d.video.dirty) && (
+            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '0.78rem', color: 'var(--warning, #f59e0b)', alignSelf: 'flex-start' }}>
+              <input type="checkbox" checked={showOnlyStale} onChange={(e) => setShowOnlyStale(e.target.checked)} />
+              Stale only ({[...dirtyMap.values()].filter(d => d.image.dirty || d.video.dirty).length} shot{[...dirtyMap.values()].filter(d => d.image.dirty || d.video.dirty).length === 1 ? '' : 's'} whose assets changed since generation)
+            </label>
+          )}
+
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             {activeSceneShots.map((shot, index) => {
               const isCollapsed = isShotCollapsed(shot.id);
               const isActive = shot.id === activeShotId;
+              const shotDirty = dirtyMap.get(shot.id);
+              const isStale = Boolean(shotDirty?.image.dirty || shotDirty?.video.dirty);
+              if (showOnlyStale && !isStale) return null;
 
               return (
                 <div
@@ -3823,6 +5563,17 @@ export default function App() {
                       </div>
                       <span className="shot-number">#{index + 1}</span>
                       <span className="shot-collapsed-title">{shot.name || `Shot ${index + 1}`}</span>
+                      {isStale && (
+                        <span
+                          style={{ fontSize: '0.65rem', background: 'rgba(245, 158, 11, 0.15)', color: 'var(--warning, #f59e0b)', padding: '2px 6px', borderRadius: '999px', whiteSpace: 'nowrap' }}
+                          title={[
+                            ...(shotDirty.image.dirty ? shotDirty.image.reasons.map(r => `image: ${r}`) : []),
+                            ...(shotDirty.video.dirty ? shotDirty.video.reasons.map(r => `video: ${r}`) : [])
+                          ].join('\n')}
+                        >
+                          stale
+                        </span>
+                      )}
                       <span className="shot-collapsed-desc">{shot.description || '(No description)'}</span>
                     </div>
 
@@ -3966,14 +5717,95 @@ export default function App() {
                           were previously invisible here — you could attach one and
                           never see it again outside the generation modal. Each tick
                           persists, so a batch run sends exactly this set. */}
+                      {/* Which models this shot resolves to and why; click to
+                          override on the shot, pick Inherit to clear. */}
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '10px' }}>
+                        <ModelPill
+                          type="image"
+                          resolved={resolveShotModelSettings('image', shot)}
+                          value={shot.imageModel}
+                          onChange={(v) => handleUpdateShotField(shot.id, 'imageModel', v)}
+                        />
+                        <ModelPill
+                          type="video"
+                          resolved={resolveShotModelSettings('video', shot)}
+                          value={shot.videoModel}
+                          onChange={(v) => handleUpdateShotField(shot.id, 'videoModel', v)}
+                        />
+                      </div>
+
                       <div style={{ marginTop: '12px' }}>
                         <ReferenceStrip
                           entries={shotReferenceEntries(shot)}
-                          capacity={refImageCapacity('image', shot.imageModel || imageModel)}
+                          capacity={refImageCapacity('image', resolveShotModelSettings('image', shot).model)}
                           onToggleEntry={(entry) => toggleShotReferenceEntry(shot, entry)}
                           onOpenPanel={() => { setActiveShotId(shot.id); setReferencePanelOpen(true); }}
                         />
                       </div>
+
+                      {/* Reference audio, shown only where the shot's video model
+                          takes it. Slots are positional and the prompt names them,
+                          so each clip wears its own @audioN. */}
+                      {(() => {
+                        const audioCapacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
+                        if (audioCapacity === 0) return null;
+                        const clips = shot.audioRefs || [];
+                        return (
+                          <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                              Audio refs {clips.length}/{audioCapacity}
+                            </span>
+                            {clips.map((path, audioIndex) => (
+                              <span
+                                key={path}
+                                title={pathBaseName(path)}
+                                style={{
+                                  display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.7rem',
+                                  padding: '3px 6px', borderRadius: 'var(--radius-sm)',
+                                  border: '1px solid var(--border-light)', background: 'var(--bg-card)'
+                                }}
+                              >
+                                <Music size={10} style={{ color: 'var(--accent)' }} />
+                                <code style={{ color: 'var(--accent)' }}>@audio{audioIndex + 1}</code>
+                                <span style={{ maxWidth: '130px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
+                                  {pathBaseName(path)}
+                                </span>
+                                <button
+                                  className="btn btn-danger"
+                                  style={{ padding: '1px 3px' }}
+                                  onClick={() => handleRemoveAudioRef(shot.id, path)}
+                                >
+                                  <X size={9} />
+                                </button>
+                              </span>
+                            ))}
+                            <input
+                              type="file"
+                              accept="audio/*"
+                              multiple
+                              ref={el => audioRefInputRefs.current[shot.id] = el}
+                              onChange={(e) => handleAudioRefUpload(shot.id, e)}
+                              style={{ display: 'none' }}
+                            />
+                            <button
+                              className="btn btn-secondary"
+                              style={{ padding: '2px 8px', fontSize: '0.68rem' }}
+                              disabled={clips.length >= audioCapacity || loadingStates[`audioref_${shot.id}`]}
+                              onClick={() => audioRefInputRefs.current[shot.id]?.click()}
+                              title={clips.length >= audioCapacity
+                                ? `${audioCapacity} is all this model takes`
+                                : 'mp3 or wav, 15 seconds across all clips'}
+                            >
+                              {loadingStates[`audioref_${shot.id}`] ? <RefreshCw className="spinner" size={10} /> : <Plus size={10} />} Add audio
+                            </button>
+                            {clips.length > 0 && (
+                              <span style={{ fontSize: '0.66rem', color: 'var(--text-dim)' }}>
+                                Point the prompt at them by name, e.g. "she sings @audio1".
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })()}
 
                       {/* Active Previews and Generate Actions Grid */}
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginTop: '12px', marginBottom: '12px' }}>
@@ -3998,21 +5830,20 @@ export default function App() {
                                 </button>
                               </>
                             ) : (
-                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
-                                <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>Double click iteration output to preview/set</span>
-                                <button
-                                  className="btn btn-secondary"
-                                  style={{ fontSize: '0.75rem', padding: '4px 8px' }}
-                                  onClick={() => {
-                                    setActiveShotId(shot.id);
-                                    setActiveOverlay('images');
-                                  }}
-                                >
-                                  Choose from Library...
-                                </button>
-                              </div>
+                              <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>
+                                Double click an iteration output to set it, or choose from the project below
+                              </span>
                             )}
                           </div>
+                          {/* Always offered, filled or not — swapping a still that
+                              is already set was previously impossible. */}
+                          <button
+                            className="btn btn-secondary"
+                            style={{ width: '100%', fontSize: '0.78rem' }}
+                            onClick={() => openMediaPicker(shot.id, 'image')}
+                          >
+                            <Layers size={13} /> {shot.selectedImage ? 'Replace from project…' : 'Choose from project…'}
+                          </button>
                           <button className="btn btn-primary" style={{ width: '100%' }} onClick={() => openGenerationModal('image', shot.id)}>
                             <ImageIcon size={14} /> Generate Image Variation
                           </button>
@@ -4050,21 +5881,18 @@ export default function App() {
                                 </button>
                               </>
                             ) : (
-                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
-                                <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>Select a video iteration to make active</span>
-                                <button
-                                  className="btn btn-secondary"
-                                  style={{ fontSize: '0.75rem', padding: '4px 8px' }}
-                                  onClick={() => {
-                                    setActiveShotId(shot.id);
-                                    setActiveOverlay('videos');
-                                  }}
-                                >
-                                  Choose from Library...
-                                </button>
-                              </div>
+                              <span style={{ color: 'var(--text-dim)', fontSize: '0.8rem', textAlign: 'center' }}>
+                                Select a video iteration to make active, or choose from the project below
+                              </span>
                             )}
                           </div>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ width: '100%', fontSize: '0.78rem' }}
+                            onClick={() => openMediaPicker(shot.id, 'video')}
+                          >
+                            <Layers size={13} /> {shot.selectedVideo ? 'Replace from project…' : 'Choose from project…'}
+                          </button>
                           <button className="btn btn-accent" style={{ width: '100%' }} onClick={() => openGenerationModal('video', shot.id)}>
                             <Film size={14} /> Generate Video Variation
                           </button>
@@ -4140,6 +5968,14 @@ export default function App() {
                                               onClick={() => handleUpdateShotField(shot.id, 'selectedImage', out.path)}
                                             >
                                               Select
+                                            </button>
+                                            <button
+                                              className="btn btn-secondary"
+                                              style={{ padding: '2px 6px', fontSize: '0.7rem' }}
+                                              onClick={() => handleAddPathToBoard(out.path, `${shot.name} ${out.name}`)}
+                                              title="Add to ref board"
+                                            >
+                                              + Board
                                             </button>
                                             <button
                                               className="btn btn-danger"
@@ -4271,13 +6107,60 @@ export default function App() {
       </main>
 
       {/* --- A. GENERATION PROMPT MODAL (IMAGE / VIDEO) --- */}
-      {generationModal && (
+      {generationModal && (() => {
+        // Composed once for the whole modal: the prompt field, the image list
+        // and the counters all have to describe the same request.
+        const preview = buildPrompt(
+          generationModal.type,
+          genModalPrompt,
+          genModalModel,
+          genModalInputImages,
+          genModalAttachTags,
+          genModalExcludedImages,
+          {
+            usePrePrompt: genModalUsePre, usePostPrompt: genModalUsePost, promptOverride: genModalOverride,
+            shot: shots.find(s => s.id === generationModal.shotId) || null
+          }
+        );
+        const modalPre = genModalUsePre
+          ? (generationModal.type === 'image' ? prePrompt : videoPrePrompt)
+          : '';
+        const modalPost = genModalUsePost
+          ? (generationModal.type === 'image' ? postPrompt : videoPostPrompt)
+          : '';
+        // <Tag> highlighting is derived from the text, not stored: a tag typed
+        // by hand and one dropped in by a chip are the same thing.
+        const tagMarks = scanPromptTags(genModalPrompt, assetLibrary).occurrences.map((occurrence, index) => {
+          const slot = occurrence.asset
+            ? preview.imageSources.findIndex(source => source.asset && source.asset.id === occurrence.asset.id)
+            : -1;
+          const pointer = preview.usesRefTags && slot >= 0 ? preview.imageSources[slot].token : '';
+          return {
+            id: `tag_${index}_${occurrence.start}`,
+            kind: occurrence.asset ? 'tag' : 'missing-tag',
+            start: occurrence.start,
+            end: occurrence.end,
+            removable: false,
+            label: occurrence.asset
+              ? `<${occurrence.asset.tag}> → ${pointer || assetPromptText(occurrence.asset)}`
+              : `<${occurrence.raw}> — no such asset`
+          };
+        });
+
+        return (
         <div className="modal-overlay">
           <div className="modal-window">
             <div className="modal-header">
               <h2 style={{ fontSize: '1.25rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {generationModal.type === 'image' ? <ImageIcon size={20} /> : <Film size={20} />}
                 Generate {generationModal.type === 'image' ? 'Image' : 'Video'} Variation for {shots.find(s => s.id === generationModal.shotId)?.name}
+                {(() => {
+                  const shot = shots.find(s => s.id === generationModal.shotId);
+                  if (!shot) return null;
+                  const resolved = resolveShotModelSettings(generationModal.type, shot);
+                  // Read-only provenance: the dropdown below is the override.
+                  return <ModelPill type={generationModal.type} resolved={resolved} />;
+                })()}
               </h2>
               <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setGenerationModal(null)}>
                 <X size={16} />
@@ -4285,7 +6168,7 @@ export default function App() {
             </div>
 
             <div className="modal-body">
-              <div style={{ alignSelf: 'flex-end' }}>
+              <div className="auto-prompt-bar">
                 <button
                   type="button"
                   className="btn btn-accent"
@@ -4295,26 +6178,151 @@ export default function App() {
                   {loadingStates.modal_llm ? <RefreshCw className="spinner" size={14} /> : <Sparkles size={14} />}
                   Auto Prompt
                 </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: '6px 10px', fontSize: '0.75rem' }}
+                  onClick={() => setGenModalAutoOpen(open => !open)}
+                  title="Steer what Auto Prompt is told"
+                >
+                  {genModalAutoOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                  Auto Prompt options
+                  {(genModalAutoInstructions.trim() || genModalAutoContext || genModalAutoBare) && (
+                    <span className="auto-prompt-dot" title="Options are set" />
+                  )}
+                </button>
               </div>
 
+              {genModalAutoOpen && (
+                <div className="auto-prompt-panel">
+                  <label className="form-label" style={{ fontSize: '0.75rem' }}>Extra instructions for the prompt writer</label>
+                  <textarea
+                    className="input-field"
+                    style={{ minHeight: '64px', fontSize: '0.82rem' }}
+                    value={genModalAutoInstructions}
+                    onChange={(e) => setGenModalAutoInstructions(e.target.value)}
+                    placeholder="e.g. keep it under 40 words, shoot it from below, no dialogue, lean harder on <Rex>"
+                  />
+
+                  <label className="auto-prompt-check">
+                    <input
+                      type="checkbox"
+                      checked={genModalAutoContext}
+                      onChange={(e) => setGenModalAutoContext(e.target.checked)}
+                    />
+                    <span>
+                      <strong>Include all context</strong>
+                      <em>
+                        Sends every asset tag and its description, plus the shots either side of this one,
+                        so the writer can stay continuous and use tags instead of inventing descriptions.
+                      </em>
+                    </span>
+                  </label>
+
+                  <label className="auto-prompt-check">
+                    <input
+                      type="checkbox"
+                      checked={genModalAutoBare}
+                      onChange={(e) => setGenModalAutoBare(e.target.checked)}
+                    />
+                    <span>
+                      <strong>Instructions only</strong>
+                      <em>
+                        Drops the system prompt and the shot template — the model gets your instructions
+                        {genModalAutoContext ? ' and the context above' : ''}, nothing else.
+                      </em>
+                    </span>
+                  </label>
+                </div>
+              )}
+
               <div className="form-group">
-                <label className="form-label">Visual Model Prompt</label>
-                <textarea
-                  className="input-field"
-                  style={{ minHeight: '120px' }}
+                <label className="form-label">
+                  Prompt Sent to Model
+                  <span style={{ marginLeft: '8px', fontWeight: 'normal', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
+                    everything below goes to the model, colour-coded by where it came from
+                  </span>
+                </label>
+                <PromptEditor
                   value={genModalPrompt}
-                  onChange={(e) => {
-                    setGenModalPrompt(e.target.value);
-                    updateDraftPrompt(e.target.value);
+                  onChange={(next) => updateModalPrompt(next)}
+                  decorations={genModalDecorations}
+                  marks={tagMarks}
+                  prePrompt={modalPre}
+                  postPrompt={modalPost}
+                  usePre={genModalUsePre && Boolean(modalPre)}
+                  usePost={genModalUsePost && Boolean(modalPost)}
+                  onTogglePre={() => setGenModalUsePre(false)}
+                  onTogglePost={() => setGenModalUsePost(false)}
+                  onInlinePre={() => inlineAffix('pre')}
+                  onInlinePost={() => inlineAffix('post')}
+                  inputRef={genModalInputRef}
+                  caretRequest={genModalCaret}
+                  onSelectionChange={(selection) => { genModalSelection.current = selection; }}
+                  onUndecorate={(id) => setGenModalDecorations(prev => undecorate(prev, id))}
+                  onRemoveDecoration={(id) => {
+                    const result = removeDecoration(genModalPrompt, genModalDecorations, id);
+                    updateModalPrompt(result.text, result.decorations);
                   }}
                   placeholder="Cinematic visual setup description..."
+                  footer={(
+                    <div className="prompt-editor-footer">
+                      <span>{preview.prompt.length} chars</span>
+                      {preview.promptOverflow && (
+                        <span style={{ color: 'var(--warning, #f59e0b)', fontWeight: 600 }}
+                          title={`This model documents a ${preview.promptOverflow.limit}-character prompt limit; the composed prompt is ${preview.promptOverflow.length}. It will be sent as-is — expect the provider to reject or truncate it.`}>
+                          ⚠ over the {preview.promptOverflow.limit}-char limit
+                        </span>
+                      )}
+                      <span>
+                        {preview.inputImagePaths.length}/{preview.capacity} reference image{preview.capacity === 1 ? '' : 's'}
+                      </span>
+                      {genModalDecorations.some(d => d.kind === 'snippet') && (
+                        <span className="prompt-legend">
+                          <span className="prompt-legend-swatch" style={{ background: 'var(--mark-snippet)' }} /> snippet
+                        </span>
+                      )}
+                      {tagMarks.length > 0 && (
+                        <span className="prompt-legend">
+                          <span className="prompt-legend-swatch" style={{ background: 'var(--mark-tag)' }} />
+                          {preview.usesRefTags ? 'tag → @imageN' : 'tag → description'}
+                        </span>
+                      )}
+                      {/* Turned off pre/post is offered back rather than lost. */}
+                      {!genModalUsePre && (generationModal.type === 'image' ? prePrompt : videoPrePrompt) && (
+                        <button type="button" className="prompt-affix-restore" onClick={() => setGenModalUsePre(true)}>
+                          + pre-prompt
+                        </button>
+                      )}
+                      {!genModalUsePost && (generationModal.type === 'image' ? postPrompt : videoPostPrompt) && (
+                        <button type="button" className="prompt-affix-restore" onClick={() => setGenModalUsePost(true)}>
+                          + post-prompt
+                        </button>
+                      )}
+                    </div>
+                  )}
+                />
+
+                {/* The result of all of the above, always on screen. The field
+                    higher up holds <Sara>; this is the "@image2" the model
+                    actually receives, and the two cannot be the same box. */}
+                <EffectivePrompt
+                  text={preview.prompt}
+                  overridden={preview.overridden}
+                  expanded={genModalEffectiveOpen}
+                  onToggleExpanded={() => setGenModalEffectiveOpen(open => !open)}
+                  onEdit={(current) => setGenModalOverride(current)}
+                  onChange={(next) => setGenModalOverride(next)}
+                  onRevert={() => setGenModalOverride(null)}
+                  capacity={preview.capacity}
+                  imageCount={preview.inputImagePaths.length}
                 />
               </div>
 
               {/* Asset tags — click to insert <Tag> into the prompt */}
               {assetLibrary.length > 0 && (
                 <div className="form-group">
-                  <label className="form-label">Insert Asset Tag (adds &lt;Tag&gt; + its reference image)</label>
+                  <label className="form-label">Insert Asset Tag at the cursor (adds &lt;Tag&gt; + its reference image)</label>
                   <div className="snippet-chips-container">
                     {assetLibrary.map(asset => (
                       <button
@@ -4332,14 +6340,15 @@ export default function App() {
               )}
 
               <div className="form-group">
-                <label className="form-label">Concatenate Prompt Snippets (Click to Add)</label>
+                <label className="form-label">Insert Prompt Snippet at the cursor</label>
                 <div className="snippet-chips-container">
                   {promptSnippets.map(snip => (
                     <button
                       key={snip.id}
                       type="button"
                       className="snippet-chip"
-                      onClick={() => appendSnippetToModalPrompt(snip.text)}
+                      title={snip.text}
+                      onClick={() => appendSnippetToModalPrompt(snip.text, snip.name)}
                     >
                       + {snip.name}
                     </button>
@@ -4347,28 +6356,10 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Exactly what the model will receive, after pre/post + tags */}
-              {(() => {
-                const preview = buildPrompt(
-                  generationModal.type,
-                  genModalPrompt,
-                  genModalModel,
-                  generationModal.type === 'image' ? genModalInputImages : (genModalImageInput ? [genModalImageInput] : []),
-                  genModalAttachTags,
-                  genModalExcludedImages
-                );
-                return (
+              {/* Which images go with the request. The prompt itself is no
+                  longer previewed here — it is the field above, in place. */}
+              {(
                   <div className="form-group">
-                    <label className="form-label">
-                      Effective Prompt Sent to Model
-                      <span style={{ marginLeft: '8px', fontWeight: 'normal', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
-                        {preview.prompt.length} chars · {preview.inputImagePaths.length}/{preview.capacity} reference image{preview.capacity === 1 ? '' : 's'}
-                      </span>
-                    </label>
-                    <div style={{ background: 'rgba(0,0,0,0.28)', border: '1px solid var(--border-light)', borderRadius: '6px', padding: '10px', fontSize: '0.8rem', color: 'var(--text-muted)', whiteSpace: 'pre-wrap', maxHeight: '110px', overflowY: 'auto' }}>
-                      {preview.prompt || <em style={{ color: 'var(--text-dim)' }}>Empty — nothing will be generated.</em>}
-                    </div>
-
                     {preview.missingTags.length > 0 && (
                       <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px', alignItems: 'center' }}>
                         <AlertTriangle size={12} style={{ color: 'var(--accent)' }} />
@@ -4407,13 +6398,39 @@ export default function App() {
                         </span>
                       ) : (
                         <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                          {preview.imageSources.map((entry, index) => (
+                          {preview.imageSources.map((entry, index) => {
+                            const modalShot = shots.find(s => s.id === generationModal.shotId);
+                            const originColor = {
+                              primary: 'var(--success)',
+                              pinned: 'var(--primary)',
+                              inherited: '#38bdf8',
+                              'auto-tag': 'var(--warning, #f59e0b)',
+                              tag: 'var(--warning, #f59e0b)'
+                            }[entry.origin] || 'var(--primary)';
+                            const boardEntry = Boolean(entry.refId);
+                            return (
                             <div key={entry.path} style={{ width: '86px', textAlign: 'center', position: 'relative' }}>
-                              <div style={{ position: 'relative', height: '58px', borderRadius: '4px', overflow: 'hidden', border: `2px solid ${entry.origin === 'primary' ? 'var(--success)' : 'var(--primary)'}`, background: '#000' }}>
+                              <div style={{ position: 'relative', height: '58px', borderRadius: '4px', overflow: 'hidden', border: `2px solid ${originColor}`, background: '#000' }}>
                                 <AssetImage path={entry.path} alt={entry.label} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                                <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '0.6rem', fontWeight: 'bold', background: 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '0 4px' }}>
-                                  {index + 1}
+                                {/* On a pointer model this badge is not
+                                    decoration — it is the name the prompt
+                                    calls this image by. */}
+                                <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '0.6rem', fontWeight: 'bold', background: entry.token ? 'var(--primary)' : 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '0 4px' }}>
+                                  {entry.token || index + 1}
                                 </span>
+                                {/* Pin: turn an automatic or inherited pick into
+                                    a shot-scope edge that survives everything. */}
+                                {boardEntry && modalShot && (entry.origin === 'auto-tag' || entry.origin === 'inherited') && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    style={{ position: 'absolute', bottom: '2px', left: '2px', padding: '1px 4px', fontSize: '0.6rem', zIndex: 3, cursor: 'pointer' }}
+                                    onClick={(e) => { e.stopPropagation(); handlePinReferenceToShot(modalShot.id, entry.refId); }}
+                                    title="Pin to this shot"
+                                  >
+                                    📌
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="btn btn-danger"
@@ -4433,18 +6450,28 @@ export default function App() {
                                   }}
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleDeselectSentImage(entry.path, entry.origin);
+                                    // Board-contributed entries opt out per shot
+                                    // (persists); recipe-only ones just leave
+                                    // this generation.
+                                    if (boardEntry && modalShot && entry.origin !== 'primary') {
+                                      handleExcludeReferenceFromShot(modalShot, entry.refId);
+                                    } else {
+                                      handleDeselectSentImage(entry.path, entry.origin);
+                                    }
                                   }}
                                   title={`Deselect ${entry.label}`}
                                 >
                                   <X size={10} />
                                 </button>
                               </div>
-                              <span style={{ fontSize: '0.62rem', color: entry.origin === 'primary' ? 'var(--success)' : 'var(--primary-hover)', display: 'block', marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                {entry.label}
+                              <span
+                                title={`${entry.label} — ${entry.origin}`}
+                                style={{ fontSize: '0.62rem', color: originColor, display: 'block', marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                              >
+                                {entry.origin === 'primary' ? '' : `${entry.origin} · `}{entry.label}
                               </span>
                             </div>
-                          ))}
+                          ); })}
                         </div>
                       )}
 
@@ -4466,8 +6493,7 @@ export default function App() {
                       )}
                     </div>
                   </div>
-                );
-              })()}
+              )}
 
               <div className="control-grid">
                 <div className="form-group">
@@ -4500,7 +6526,7 @@ export default function App() {
                     value={genModalRes}
                     onChange={(e) => setGenModalRes(e.target.value)}
                   >
-                    {(generationModal.type === 'image' ? IMAGE_ASPECT_RATIOS : VIDEO_RESOLUTIONS).map(opt => (
+                    {sizeOptions(generationModal.type, genModalModel, genModalRes).map(opt => (
                       <option key={opt.value} value={opt.value}>{opt.label}</option>
                     ))}
                   </select>
@@ -4508,18 +6534,16 @@ export default function App() {
               </div>
 
               {!(generationModal.type === 'image' ? isKnownImageModel(genModalModel) : isKnownVideoModel(genModalModel)) && (
-                <div className="form-group" style={{ marginTop: '10px' }}>
-                  <label className="form-label">Custom Model Path</label>
-                  <input
-                    type="text"
-                    className="input-field"
+                <div style={{ marginTop: '10px' }}>
+                  <CustomModelPath
+                    label="Custom Model Path"
                     value={genModalModel}
-                    onChange={(e) => {
-                      setGenModalModel(e.target.value);
-                      if (generationModal.type === 'image') setImageModel(e.target.value);
-                      else setVideoModel(e.target.value);
+                    onChange={(next) => {
+                      setGenModalModel(next);
+                      if (generationModal.type === 'image') setImageModel(next);
+                      else setVideoModel(next);
                     }}
-                    placeholder="e.g. fal-ai/flux-lora or higgsfield-ai/soul/standard"
+                    placeholder={generationModal.type === 'image' ? 'e.g. fal-ai/flux-lora' : 'e.g. bytedance/seedance-2.0/image-to-video'}
                   />
                 </div>
               )}
@@ -4578,17 +6602,22 @@ export default function App() {
                       value={genModalDuration}
                       onChange={(e) => setGenModalDuration(e.target.value)}
                     >
-                      <option value="5">5 Seconds</option>
-                      <option value="10">10 Seconds</option>
+                      {durationOptions(genModalModel, genModalDuration).map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
                     </select>
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Input Context (Image-to-Video - Select Single)</label>
+                    <label className="form-label">
+                      Input Context ({genModalInputImages.length}/{refImageCapacity('video', genModalModel)})
+                    </label>
                     <span className="input-help" style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-dim)', marginBottom: '8px' }}>
-                      Choose an image to guide video generation, or click Add Reference to select a project asset. Leave unselected for Text-to-Video.
+                      {refImageCapacity('video', genModalModel) > 1
+                        ? 'Pick as many references as this model takes — order matters, slot 1 is the strongest. Leave empty for text-to-video.'
+                        : 'Choose an image to guide video generation, or click Add Reference to select a project asset. Leave unselected for Text-to-Video.'}
                     </span>
-                    
+
                     <div className="generation-reference-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: '8px', marginTop: '4px' }}>
                       {(() => {
                         const activeShot = shots.find(s => s.id === generationModal.shotId);
@@ -4614,13 +6643,29 @@ export default function App() {
                         return (
                           <>
                             {allGridImages.map(img => {
-                              const isSelected = genModalImageInput === img.path;
+                              const isSelected = genModalInputImages.includes(img.path)
+                                && !genModalExcludedImages.includes(img.path);
                               return (
                                 <button
                                   key={img.id}
                                   type="button"
                                   className={`generation-reference-card ${isSelected ? 'selected' : ''}`}
-                                  onClick={() => setGenModalImageInput(isSelected ? '' : img.path)}
+                                  onClick={() => {
+                                    setGenModalExcludedImages(prev => prev.filter(p => p !== img.path));
+                                    setGenModalInputImages(prev => {
+                                      if (prev.includes(img.path)) return prev.filter(p => p !== img.path);
+                                      const capacity = refImageCapacity('video', genModalModel);
+                                      // One slot means picking a second one is a
+                                      // swap, not an error — that is what the
+                                      // single-select control always did.
+                                      if (capacity <= 1) return [img.path];
+                                      if (prev.length >= capacity) {
+                                        showToast(`This model accepts up to ${capacity} input image${capacity === 1 ? '' : 's'}.`, 'warning');
+                                        return prev;
+                                      }
+                                      return [...prev, img.path];
+                                    });
+                                  }}
                                   style={{ position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', border: '1px solid var(--border-color)', borderRadius: '6px', overflow: 'hidden', padding: 0, height: '110px', background: 'rgba(255,255,255,0.02)' }}
                                   title={img.name}
                                 >
@@ -4666,7 +6711,8 @@ export default function App() {
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* --- A0. FLOATING OVERLAY: STORYBOARD --- */}
       {activeOverlay === 'storyboard' && (() => {
@@ -5280,7 +7326,7 @@ export default function App() {
 
               {/* Generate reference art — same iterate-and-pick loop as a shot */}
               {(() => {
-                const modelId = assetEditor.imageModel || imageModel;
+                const modelId = assetEditorModel(assetEditor);
                 const preview = buildAssetPrompt(assetEditor);
                 const capacity = refImageCapacity('image', modelId);
                 const picked = assetInputImages(assetEditor).filter(p => (assetEditor.images || []).includes(p));
@@ -5337,22 +7383,18 @@ export default function App() {
                           value={assetEditor.imageResolution || imageResolution}
                           onChange={(e) => setAssetEditor({ ...assetEditor, imageResolution: e.target.value })}
                         >
-                          {IMAGE_ASPECT_RATIOS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                          {sizeOptions('image', modelId, assetEditor.imageResolution).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                         </select>
                       </div>
                     </div>
 
                     {!isKnownImageModel(modelId) && (
-                      <div className="form-group">
-                        <label className="form-label">Custom Model Path</label>
-                        <input
-                          type="text"
-                          className="input-field"
-                          value={assetEditor.imageModel || ''}
-                          onChange={(e) => setAssetEditor({ ...assetEditor, imageModel: e.target.value })}
-                          placeholder="e.g. higgsfield-ai/soul/standard"
-                        />
-                      </div>
+                      <CustomModelPath
+                        label="Custom Model Path"
+                        value={assetEditor.imageModel || ''}
+                        onChange={(next) => setAssetEditor({ ...assetEditor, imageModel: next })}
+                        placeholder="e.g. higgsfield-ai/soul/standard"
+                      />
                     )}
 
                     {/* Three-way rather than a checkbox: reference art usually
@@ -5694,7 +7736,7 @@ export default function App() {
 
       {/* --- A4. BATCH GENERATION DIALOG --- */}
       {batchDialog && (() => {
-        const candidates = batchCandidates(batchDialog.type, batchDialog.scope, batchOnlyMissing);
+        const candidates = batchCandidates(batchDialog.type, batchDialog.scope, batchOnlyMissing, batchOnlyDirty);
         const allInScope = shotsForScope(batchDialog.scope);
         const noPrompt = allInScope.filter(({ shot }) => !resolveShotPrompt(shot, batchDialog.type).trim()).length;
         const model = batchDialog.type === 'image' ? getImageModel(imageModel) : getVideoModel(videoModel);
@@ -5723,11 +7765,22 @@ export default function App() {
 
                 <div className="form-group">
                   <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.9rem' }}>
-                    <input type="checkbox" checked={batchOnlyMissing} onChange={(e) => setBatchOnlyMissing(e.target.checked)} />
+                    <input type="checkbox" checked={batchOnlyMissing} disabled={batchOnlyDirty} onChange={(e) => setBatchOnlyMissing(e.target.checked)} />
                     Skip shots that already have output
                   </label>
                   <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
                     Leave this on for the first sweep, turn it off to re-roll everything.
+                  </span>
+                </div>
+
+                <div className="form-group">
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '0.9rem' }}>
+                    <input type="checkbox" checked={batchOnlyDirty} onChange={(e) => setBatchOnlyDirty(e.target.checked)} />
+                    Only stale shots
+                  </label>
+                  <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                    Shots whose tagged assets changed since their selected {batchDialog.type} was made.
+                    Regenerates from the original recipe with the fresh asset material.
                   </span>
                 </div>
 
@@ -5805,6 +7858,286 @@ export default function App() {
                 <button className="btn btn-secondary" onClick={() => setBatchDialog(null)}>Cancel</button>
                 <button className="btn btn-primary" onClick={handleRunBatch} disabled={candidates.length === 0}>
                   <Zap size={14} /> Run Batch ({candidates.length})
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* --- A4a. SHOT MEDIA PICKER --- */}
+      {mediaPicker && (() => {
+        const shot = shots.find(s => s.id === mediaPicker.shotId);
+        return (
+          <MediaPickerDialog
+            kind={mediaPicker.kind}
+            shotName={shot?.name || ''}
+            currentPath={mediaPicker.kind === 'video' ? shot?.selectedVideo : shot?.selectedImage}
+            groups={collectShotMedia({
+              kind: mediaPicker.kind,
+              shot,
+              imageGallery,
+              videoGallery,
+              referenceImages,
+              assetLibrary,
+              projectFiles: projectImagesList
+            })}
+            onPick={handlePickShotMedia}
+            onClear={() => handlePickShotMedia(null)}
+            onClose={() => setMediaPicker(null)}
+          />
+        );
+      })()}
+
+      {/* --- A4b. DREAM --- */}
+      {dreamOpen && (
+        <DreamDialog
+          settings={dreamSettings}
+          onChange={setDreamSettings}
+          scenes={scenes}
+          assetLibrary={assetLibrary}
+          defaults={{ imageModel, imageResolution, videoModel, videoResolution, videoDuration }}
+          run={dreamRun}
+          onRun={handleRunDream}
+          onStop={handleStopDream}
+          onClose={() => setDreamOpen(false)}
+        />
+      )}
+
+      {/* --- A4b1. PIPELINE --- */}
+      {pipelineOpen && (
+        <PipelinePanel
+          stages={buildPipelineStages().map(stage => ({ id: stage.id, label: stage.label }))}
+          estimate={pipelineEstimate}
+          skip={pipelineSkip}
+          onToggleSkip={(stageId) => setPipelineSkip(prev => {
+            const next = new Set(prev);
+            if (next.has(stageId)) next.delete(stageId); else next.add(stageId);
+            return next;
+          })}
+          runState={pipelineRunState}
+          running={Boolean(pipelineRunRef.current)}
+          idea={pipelineIdea}
+          onIdeaChange={setPipelineIdea}
+          showIdeaBox={shots.length === 0}
+          llmControls={(
+            <div style={{ display: 'flex', gap: '10px', marginTop: '6px' }}>
+              <select className="select-field" value={activeLlm} onChange={(e) => setActiveLlm(e.target.value)}>
+                {LLM_PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+              </select>
+              <select className="select-field" value={llmModel} onChange={(e) => setLlmModel(e.target.value)}>
+                {llmModelsList.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
+          )}
+          onRun={handleRunPipeline}
+          onPause={() => pipelineRunRef.current?.pause()}
+          onResume={() => pipelineRunRef.current?.resume()}
+          onCancel={() => pipelineRunRef.current?.cancel()}
+          onClose={() => setPipelineOpen(false)}
+        />
+      )}
+
+      {/* --- A4b2. IDEA → SCRIPT --- */}
+      {scriptGenOpen && (() => {
+        const previewCounts = scriptGenPreview && {
+          scenes: scriptGenPreview.scenes.length,
+          shots: scriptGenPreview.scenes.reduce((sum, s) => sum + s.shots.length, 0),
+          assets: scriptGenPreview.assets.length
+        };
+        const existingTagSet = new Set(assetLibrary.map(a => normalizeTag(a.tag)));
+        const newTags = scriptGenPreview
+          ? scriptGenPreview.assets.filter(a => !existingTagSet.has(normalizeTag(a.tag))).map(a => a.tag)
+          : [];
+        return (
+          <div className="modal-overlay" onClick={() => setScriptGenOpen(false)}>
+            <div className="modal-window" style={{ maxWidth: '720px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <FileText size={20} /> Idea → Script
+                </h2>
+                <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setScriptGenOpen(false)}>
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div className="form-group">
+                  <label className="form-label">
+                    Idea, logline, treatment or full script
+                    <span style={{ marginLeft: '8px', fontWeight: 'normal', color: 'var(--text-dim)', fontSize: '0.75rem' }}>
+                      the LLM writes the scenes, shots and assets; nothing is applied until you review it
+                    </span>
+                  </label>
+                  <textarea
+                    className="input-field"
+                    style={{ minHeight: '140px' }}
+                    value={scriptGenIdea}
+                    onChange={(e) => setScriptGenIdea(e.target.value)}
+                    placeholder="Two paragraphs are plenty. e.g. A retired mechanic discovers his junkyard robot has been rebuilding itself at night…"
+                  />
+                </div>
+
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">LLM</label>
+                    <select className="select-field" value={activeLlm} onChange={(e) => setActiveLlm(e.target.value)}>
+                      {LLM_PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+                    </select>
+                  </div>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label">Model</label>
+                    <select className="select-field" value={llmModel} onChange={(e) => setLlmModel(e.target.value)}>
+                      {llmModelsList.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                    </select>
+                  </div>
+                  <button
+                    className="btn btn-primary"
+                    disabled={scriptGenBusy || !scriptGenIdea.trim()}
+                    onClick={handleGenerateScript}
+                  >
+                    {scriptGenBusy ? <><RefreshCw className="spinner" size={14} /> Writing…</> : <><Sparkles size={14} /> Generate script</>}
+                  </button>
+                  <button
+                    className="btn btn-secondary"
+                    title="Fallback: copy the full import prompt to use in any chat model, then paste the reply via Import > Paste"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(buildLlmImportPrompt({
+                          assetLibrary, sourceMaterial: scriptGenIdea, intro: promptText(promptSettings, 'importIntro')
+                        }));
+                        showToast('Import prompt copied — paste it into any chat model.', 'success');
+                      } catch { showToast('Clipboard blocked by the browser.', 'error'); }
+                    }}
+                  >
+                    <Copy size={14} /> Copy prompt instead
+                  </button>
+                </div>
+
+                {scriptGenPreview && (
+                  <div className="glass-panel" style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <strong style={{ fontSize: '0.9rem' }}>
+                      Parsed: {previewCounts.scenes} scene{previewCounts.scenes === 1 ? '' : 's'} · {previewCounts.shots} shot{previewCounts.shots === 1 ? '' : 's'} · {previewCounts.assets} asset{previewCounts.assets === 1 ? '' : 's'}
+                    </strong>
+                    <span style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                      {newTags.length > 0
+                        ? <>New tags: &lt;{newTags.join('>, <')}&gt;{scriptGenPreview.assets.length > newTags.length ? ` — ${scriptGenPreview.assets.length - newTags.length} reuse existing assets` : ''}</>
+                        : 'All tags reuse existing assets.'}
+                    </span>
+                    {scriptGenPreview.warnings.length > 0 && (
+                      <span style={{ fontSize: '0.78rem', color: 'var(--warning, #f59e0b)' }}>
+                        ⚠ {scriptGenPreview.warnings.join(' · ')}
+                      </span>
+                    )}
+                    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                      <button className="btn btn-primary" onClick={() => handleApplyGeneratedScript('replace')}>
+                        Replace project with this script
+                      </button>
+                      <button className="btn btn-secondary" onClick={() => handleApplyGeneratedScript('append')}>
+                        Append to project
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* --- A4c. PASTE SHOT LIST --- */}
+      {pasteImport && (() => {
+        // Validate as you paste rather than on submit: the whole point of the
+        // box is that you can see the document was understood before it
+        // replaces the project.
+        let preview = null;
+        let problem = null;
+        if (pasteImport.text.trim()) {
+          try {
+            const normalized = normalizeImportedShotList(extractJsonDocument(pasteImport.text));
+            preview = {
+              scenes: normalized.scenes.length,
+              shots: normalized.scenes.reduce((sum, s) => sum + s.shots.length, 0),
+              assets: normalized.assets.length,
+              snippets: normalized.promptSnippets.length,
+              warnings: normalized.warnings
+            };
+          } catch (err) {
+            problem = err.message;
+          }
+        }
+
+        return (
+          <div className="modal-overlay" onClick={() => setPasteImport(null)}>
+            <div className="modal-window" style={{ maxWidth: '720px' }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <ClipboardPaste size={20} /> Paste Shot List
+                </h2>
+                <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setPasteImport(null)}>
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="modal-body">
+                <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginTop: 0, lineHeight: 1.6 }}>
+                  Paste the JSON an LLM gave you. A <code>```json</code> fence or a sentence either side of it is
+                  fine — the document is found and read out of whatever you paste.
+                </p>
+
+                <div className="form-group">
+                  <textarea
+                    autoFocus
+                    className="input-field"
+                    style={{ fontFamily: 'monospace', fontSize: '0.72rem', minHeight: '280px', width: '100%' }}
+                    placeholder={'{\n  "schemaVersion": 1,\n  "project": { … },\n  "assets": [ … ],\n  "scenes": [ … ]\n}'}
+                    value={pasteImport.text}
+                    onChange={(e) => setPasteImport({ ...pasteImport, text: e.target.value })}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">On import</label>
+                  <select
+                    className="select-field"
+                    value={pasteImport.mode}
+                    onChange={(e) => setPasteImport({ ...pasteImport, mode: e.target.value })}
+                  >
+                    <option value="replace">Replace every scene in the project</option>
+                    <option value="append">Add after the existing scenes</option>
+                  </select>
+                </div>
+
+                {problem && (
+                  <div className="glass-panel" style={{ padding: '12px', background: 'rgba(244,63,94,0.07)', display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
+                    <AlertTriangle size={14} style={{ marginTop: '2px', flexShrink: 0, color: 'var(--accent)' }} />
+                    <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{problem}</span>
+                  </div>
+                )}
+
+                {preview && (
+                  <div className="glass-panel" style={{ padding: '14px', background: 'rgba(139,92,246,0.06)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <div style={{ fontSize: '0.9rem', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <Check size={14} color="var(--success)" />
+                      {preview.scenes} scene{preview.scenes === 1 ? '' : 's'}, {preview.shots} shot{preview.shots === 1 ? '' : 's'},
+                      {' '}{preview.assets} asset{preview.assets === 1 ? '' : 's'}
+                      {preview.snippets > 0 ? `, ${preview.snippets} snippet${preview.snippets === 1 ? '' : 's'}` : ''}
+                    </div>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                      {pasteImport.mode === 'replace'
+                        ? `Replaces the ${scenes.length} scene${scenes.length === 1 ? '' : 's'} currently in this project.`
+                        : `Added after the ${scenes.length} scene${scenes.length === 1 ? '' : 's'} already here.`}
+                    </div>
+                    {preview.warnings.map((warning, i) => (
+                      <div key={i} style={{ fontSize: '0.78rem', color: 'var(--accent)' }}>• {warning}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="modal-footer">
+                <button className="btn btn-secondary" onClick={() => setPasteImport(null)}>Cancel</button>
+                <button className="btn btn-primary" onClick={handleImportPastedShotList} disabled={!preview}>
+                  <ClipboardPaste size={14} /> Import
                 </button>
               </div>
             </div>
@@ -5941,6 +8274,13 @@ export default function App() {
                               Apply
                             </button>
                           </div>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ padding: '4px', width: '100%', fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}
+                            onClick={() => handleAddPathToBoard(img.path, img.name)}
+                          >
+                            + Add to ref board
+                          </button>
                           <button
                             className="btn btn-danger"
                             style={{ padding: '4px', width: '100%', fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}
@@ -6195,8 +8535,27 @@ export default function App() {
           videoResolution={videoResolution} setVideoResolution={setVideoResolution}
           videoDuration={videoDuration} setVideoDuration={setVideoDuration}
           batchConcurrency={batchConcurrency} setBatchConcurrency={setBatchConcurrency}
+          customModelCaps={customModelCaps}
+          setCustomModelCap={(id, refImages) => setCustomModelCaps(prev => {
+            if (!id) return prev;
+            if (refImages === null || refImages === undefined) {
+              const { [id]: _, ...rest } = prev;
+              return rest;
+            }
+            return { ...prev, [id]: { ...prev[id], refImages } };
+          })}
+          assetTypeModels={assetTypeModels}
+          setAssetTypeModel={(typeId, model) => setAssetTypeModels(prev => {
+            if (!model) {
+              const { [typeId]: _, ...rest } = prev;
+              return rest;
+            }
+            return { ...prev, [typeId]: model };
+          })}
           attachTagsForImages={attachTagsForImages} setAttachTagsForImages={setAttachTagsForImages}
           attachTagsForVideos={attachTagsForVideos} setAttachTagsForVideos={setAttachTagsForVideos}
+          autoAttachRefs={autoAttachRefs} setAutoAttachRefs={setAutoAttachRefs}
+          atlasSafetyChecker={atlasSafetyChecker} setAtlasSafetyChecker={setAtlasSafetyChecker}
           theme={theme} onToggleTheme={handleToggleTheme}
           promptSettings={promptSettings}
           setPromptSetting={setPromptSetting}
@@ -6245,8 +8604,10 @@ export default function App() {
                 <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '12px', lineHeight: 1.6 }}>
                   Paste your script or treatment below, hit <strong>Copy LLM Prompt</strong>, and give the result to
                   any chat model. It returns a JSON document covering scenes, shots, prompts, assets, global
-                  pre/post prompts, system prompts and model choices — import it with <strong>Import Shot List</strong>.
-                  The prompt is generated from this project's live model catalog and existing asset tags.
+                  pre/post prompts, system prompts and model choices — bring it back with <strong>Paste Shot
+                  List</strong> (straight from the chat window, fence and all) or save it and use <strong>Import
+                  from File</strong>. The prompt is generated from this project's live model catalog and existing
+                  asset tags.
                 </p>
 
                 <div className="form-group" style={{ marginBottom: '12px' }}>
@@ -6264,7 +8625,7 @@ export default function App() {
                   readOnly
                   className="input-field"
                   style={{ fontFamily: 'monospace', fontSize: '0.72rem', minHeight: '220px', width: '100%', background: 'rgba(0,0,0,0.3)', color: '#a8ffb2' }}
-                  value={buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource })}
+                  value={buildLlmImportPrompt({ assetLibrary, sourceMaterial: llmPromptSource, intro: promptText(promptSettings, 'importIntro') })}
                 />
 
                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '10px' }}>
@@ -6273,9 +8634,15 @@ export default function App() {
                   </button>
                   <button
                     className="btn btn-secondary"
+                    onClick={() => { setActiveOverlay(null); setPasteImport({ text: '', mode: 'replace' }); }}
+                  >
+                    <ClipboardPaste size={14} /> Paste Shot List
+                  </button>
+                  <button
+                    className="btn btn-secondary"
                     onClick={() => { shotListInputRef.current.dataset.mode = 'replace'; shotListInputRef.current.click(); }}
                   >
-                    <Upload size={14} /> Import Shot List
+                    <Upload size={14} /> Import from File
                   </button>
                 </div>
               </div>

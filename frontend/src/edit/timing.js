@@ -96,8 +96,10 @@ export function clipLength(clip, ctx) {
   return Math.max(MIN_CLIP_SECONDS, stillSeconds(clip, ctx) - inPoint);
 }
 
-/** How long to hold a shot that only has a still image. */
+/** How long to hold a still: the clip's own setting, then the shot's, then the default. */
 function stillSeconds(clip, ctx) {
+  const perClip = Number(clip.stillSeconds);
+  if (Number.isFinite(perClip) && perClip > 0) return perClip;
   if (clip.source?.kind === 'shot') {
     const shot = findShot(ctx.scenes, clip.source.shotId);
     const perShot = Number(shot?.videoDuration);
