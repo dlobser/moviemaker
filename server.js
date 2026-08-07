@@ -1354,9 +1354,17 @@ if (fs.existsSync(DIST_DIR)) {
   app.use(express.static(DIST_DIR));
   // SPA fallback. Registered as plain middleware rather than a wildcard route:
   // Express 5 changed the path syntax and `app.get('*')` throws outright.
+  //
+  // `root` is not decoration: given one absolute path, send applies its
+  // dotfiles:'ignore' rule to every segment of it, so a checkout living under
+  // any dot-directory (~/.local/src/..., a git worktree under .claude/) makes
+  // this 404 instead of serving the app. With a root, only 'index.html' is
+  // checked.
   app.use((req, res, next) => {
     if (req.method !== 'GET' || req.path.startsWith('/api')) return next();
-    res.sendFile(path.join(DIST_DIR, 'index.html'));
+    res.sendFile('index.html', { root: DIST_DIR }, (err) => {
+      if (err) next(err);
+    });
   });
 }
 
