@@ -9,7 +9,6 @@
 import { describeFalError } from './fal.js';
 
 const ATLAS_BASE = 'https://api.atlascloud.ai/api/v1/model';
-const ATLAS_ASSETS = 'https://console.atlascloud.ai/api/v1/sd/assets';
 
 /**
  * Submit to Atlas, then poll to completion.
@@ -27,27 +26,54 @@ export async function callAtlasModel(endpoint, candidates, ctx) {
 
   let submitBody = '';
   let lastStatus = 0;
-  let accepted = false;
-  for (const body of bodies) {
+  let acceptedIndex = -1;
+  for (const [index, body] of bodies.entries()) {
     const submit = await ctx.fetch(`${ATLAS_BASE}/${endpoint}`, {
       method: 'POST', headers, body: JSON.stringify(body)
     }, 'Atlas Cloud');
     submitBody = await submit.text();
     lastStatus = submit.status;
-    if (submit.ok) { accepted = true; break; }
+    if (submit.ok) { acceptedIndex = index; break; }
     if (lastStatus >= 500) break; // Atlas is unwell; reshaping will not help.
   }
-  if (!accepted) throw new Error(`Atlas Cloud submission failed (${lastStatus}): ${describeFalError(submitBody)}`);
+  if (acceptedIndex < 0) throw new Error(`Atlas Cloud submission failed (${lastStatus}): ${describeFalError(submitBody)}`);
 
   const predictionId = JSON.parse(submitBody)?.data?.id;
   if (!predictionId) throw new Error('Atlas Cloud returned no prediction id.');
+
+  // Which body Atlas took. A ladder that reshapes the request until one is
+  // accepted is only debuggable if the failure can say what was accepted —
+  // "it took the one with reference_audio as a bare string" is the whole
+  // answer to a class of confusing downstream errors.
+  const acceptedFields = Object.keys(bodies[acceptedIndex])
+    .filter(key => key !== 'model' && key !== 'prompt')
+    .join(', ');
+
+  // Field names alone are not enough for the fields whose *value* is the thing
+  // in dispute. ByteDance rejects an audio reference with a bare "invalid url"
+  // that names neither the clip nor the reason, and a stale server sending the
+  // previous build's data: URL looks identical from here — so the value goes in
+  // the error, truncated, rather than being guessed at from the outside.
+  const audioValues = [bodies[acceptedIndex].reference_audio].flat().filter(Boolean);
+  const audioSummary = audioValues.length
+    ? `; audio ${audioValues.map(value => `"${String(value).slice(0, 72)}${String(value).length > 72 ? '…' : ''}"`).join(', ')}`
+    : '';
 
   for (let attempt = 0; attempt < 150; attempt++) {
     await new Promise(resolve => setTimeout(resolve, 4000));
     const poll = await ctx.fetch(`${ATLAS_BASE}/prediction/${predictionId}`, {
       headers: { Authorization: `Bearer ${apiKey}` }
     }, 'Atlas Cloud');
-    if (!poll.ok) throw new Error(`Atlas Cloud status check failed: ${poll.status}`);
+    if (!poll.ok) {
+      // The status code alone says nothing actionable. Atlas explains itself in
+      // the body, and a rejected *poll* on an accepted submission usually means
+      // the submission was only shallowly validated — so the request that was
+      // taken matters as much as the complaint.
+      throw new Error(
+        `Atlas Cloud status check failed (${poll.status}): ${describeFalError(await poll.text())} ` +
+        `[prediction ${predictionId}; submitted with ${acceptedFields || 'no extra fields'}${audioSummary}]`
+      );
+    }
     const data = (await poll.json())?.data || {};
     if (data.status === 'completed') {
       const url = Array.isArray(data.outputs) ? data.outputs[0] : data.outputs;
@@ -55,67 +81,13 @@ export async function callAtlasModel(endpoint, candidates, ctx) {
       return url;
     }
     if (data.status === 'failed' || data.status === 'canceled') {
-      throw new Error(`Atlas Cloud generation ${data.status}: ${data.error || 'no reason given'}`);
+      throw new Error(
+        `Atlas Cloud generation ${data.status}: ${data.error || 'no reason given'}` +
+        `${audioSummary ? ` [submitted with${audioSummary.slice(1)}]` : ''}`
+      );
     }
   }
   throw new Error('Atlas Cloud generation timed out.');
-}
-
-// --- the asset library -----------------------------------------------------
-//
-// Images go into a generation request inline as data: URLs. Audio and video do
-// not: Atlas requires them registered in its Asset Library first, from a URL it
-// can fetch, and the request then points at `asset://<id>`.
-//
-// "A URL it can fetch" is the awkward part, because the studio's audio is a
-// file on your own disk. Fal storage is already the studio's uploader for
-// exactly this problem (image-to-video on Fal needs it too), so a Fal key is
-// what makes Atlas audio references possible — the clip is uploaded there and
-// Atlas reads it from that address.
-
-/**
- * Register one local asset with Atlas and wait for it to be usable.
- * Returns the `asset://<id>` reference a generation request wants.
- */
-export async function registerAtlasAsset(assetPath, type, ctx) {
-  if (!ctx.credentials.falKey) {
-    throw new Error(
-      `Atlas will not accept ${type.toLowerCase()} inline — it has to be registered in the Atlas Asset Library ` +
-      `from a public URL first. The studio hosts it on Fal storage to do that, so a Fal.ai key is required ` +
-      `alongside your Atlas key. Add one in Settings, or drop the audio reference from this shot.`
-    );
-  }
-  const apiKey = ctx.credentials.atlasKey;
-  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
-  const publicUrl = await ctx.uploadPublicUrl(assetPath);
-
-  const created = await ctx.fetch(ATLAS_ASSETS, {
-    method: 'POST', headers, body: JSON.stringify({ type, url: publicUrl })
-  }, 'Atlas Cloud');
-  const createdBody = await created.text();
-  if (!created.ok) {
-    throw new Error(`Atlas asset registration failed (${created.status}): ${describeFalError(createdBody)}`);
-  }
-  const asset = JSON.parse(createdBody)?.data || JSON.parse(createdBody) || {};
-  const assetId = asset.id;
-  if (!assetId) throw new Error('Atlas registered the asset but returned no id.');
-
-  // Atlas transcodes before an asset is usable. Sending asset://<id> too early
-  // is refused, so this waits rather than letting the generation fail.
-  for (let attempt = 0; attempt < 60; attempt++) {
-    const poll = await ctx.fetch(`${ATLAS_ASSETS}/${assetId}`, {
-      headers: { Authorization: `Bearer ${apiKey}` }
-    }, 'Atlas Cloud');
-    if (!poll.ok) throw new Error(`Atlas asset status check failed: ${poll.status}`);
-    const body = await poll.json();
-    const status = String((body?.data || body)?.status || '').toLowerCase();
-    if (status === 'active') return `asset://${assetId}`;
-    if (status === 'failed' || status === 'error') {
-      throw new Error(`Atlas could not process ${assetPath.split('/').pop()} — it rejected the file.`);
-    }
-    await new Promise(resolve => setTimeout(resolve, 2000));
-  }
-  throw new Error(`Atlas is still processing ${assetPath.split('/').pop()} after two minutes.`);
 }
 
 // --- request shaping (pure) ------------------------------------------------
@@ -179,14 +151,63 @@ export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration,
 
   if (audioAssetRefs.length === 0) return candidates;
 
-  // Atlas documents `reference_audio` singular while the model takes up to
-  // three clips, so both shapes are tried. Every candidate carries the audio:
-  // dropping it would produce a silent video that cost full price and looked
-  // like the model simply ignoring the prompt.
-  const shapes = audioAssetRefs.length === 1
-    ? [{ reference_audio: audioAssetRefs }, { reference_audio: audioAssetRefs[0] }]
-    : [{ reference_audio: audioAssetRefs }];
-  return shapes.flatMap(shape => candidates.map(body => ({ ...body, ...shape })));
+  // One shape, not a ladder. Reshaping until something is accepted works for
+  // the aspect fields, where a wrong guess is rejected outright — but Atlas
+  // accepts a `reference_audio` it cannot use and only fails once the
+  // prediction runs. A ladder there would keep picking the body that submits
+  // and then dies, so audio gets the shape the evidence supports and nothing
+  // else. Every candidate still carries it: a body that quietly dropped the
+  // audio would produce a silent video at full price.
+  return candidates.map(body => ({ ...body, reference_audio: audioAssetRefs }));
+}
+
+// --- audio references ------------------------------------------------------
+//
+// Images and audio look symmetrical and are not. Handed an inline data: URL,
+// Atlas ingests the image into its own library and rewrites the field to
+// `asset://…`. It does no such thing for `reference_audio`: that string is
+// forwarded verbatim to ByteDance, which puts it in `content[].audio_url.url`
+// and requires a URL it can fetch — a data: URL comes back "invalid url".
+//
+// So audio is the one input the studio cannot carry for you. It has to live at
+// an address the model host can reach, which is why the shot takes a URL
+// rather than a file.
+
+/** Check an audio reference is something ByteDance can actually fetch. */
+export async function resolveAudioReference(audioRef, ctx) {
+  // A clip already in Atlas's own Asset Library, uploaded through their
+  // dashboard. Nothing to verify and nothing that could be verified — the id
+  // only resolves inside Atlas — but it is the sturdiest form of all, because
+  // the file then sits on storage the model host is known to reach.
+  if (/^asset:\/\//i.test(audioRef)) return audioRef;
+
+  if (!/^https?:\/\//i.test(audioRef)) {
+    throw new Error(
+      `Audio reference "${audioRef}" is not a URL. Unlike images, audio is not uploaded with the ` +
+      `request — the model fetches it itself — so the clip has to be hosted somewhere public and ` +
+      `added to the shot as an https:// link, or uploaded to the Atlas Asset Library and added ` +
+      `here as its asset:// id.`
+    );
+  }
+
+  // One cheap read before anything is billed. ByteDance's own complaint for a
+  // dead or wrong link is "invalid url", which says nothing about which of the
+  // three clips was wrong or why.
+  const res = await ctx.fetch(audioRef, {}, 'the audio host');
+  if (!res.ok) {
+    throw new Error(
+      `Could not read the audio reference (${res.status}): ${audioRef} — it has to be reachable ` +
+      `without a login. On GitHub that means the raw.githubusercontent.com address, not /blob/.`
+    );
+  }
+  const contentType = res.headers?.get?.('content-type') || '';
+  if (contentType && !/^(audio|application\/octet-stream)/i.test(contentType)) {
+    throw new Error(
+      `${audioRef} served "${contentType}" rather than audio. If that is a GitHub link, ` +
+      `use the raw.githubusercontent.com address instead of the /blob/ page.`
+    );
+  }
+  return audioRef;
 }
 
 // --- generation ------------------------------------------------------------
@@ -201,13 +222,15 @@ export async function generateImage({ modelPath, prompt, resolution, inputImageP
 export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths = [] }, ctx) {
   // Atlas takes frames inline, so unlike Fal there is no upload step.
   const imageDataUrls = await Promise.all(inputImagePaths.map(ctx.readAssetDataUrl));
-  // Audio does need one, and it is slow (upload, register, transcode), so it
-  // runs before a single generation credit is spent.
-  const audioAssetRefs = [];
-  for (const audioPath of inputAudioPaths) {
-    audioAssetRefs.push(await registerAtlasAsset(audioPath, 'Audio', ctx));
+  // Audio does not: it is forwarded to ByteDance as a URL to fetch, so all
+  // that happens here is checking each link is real before anything is billed.
+  const audioUrls = [];
+  for (const audioRef of inputAudioPaths) {
+    audioUrls.push(await resolveAudioReference(audioRef, ctx));
   }
-  const bodies = buildAtlasVideoBodies(modelPath, { prompt, resolution, duration, imageDataUrls, audioAssetRefs });
+  const bodies = buildAtlasVideoBodies(modelPath, {
+    prompt, resolution, duration, imageDataUrls, audioAssetRefs: audioUrls
+  });
   const url = await callAtlasModel('generateVideo', bodies, ctx);
   return ctx.saveRemote(url, 'vid', '.mp4');
 }

@@ -48,22 +48,23 @@ export const IMAGE_MODELS = [
   // prices below are the rates Higgsfield/its resellers advertise where known
   // and flagged as approximate everywhere else. Check the Models Gallery at
   // https://cloud.higgsfield.ai for the authoritative number before a big batch.
+  // Verified against GET platform.higgsfield.ai/models, which answers with the
+  // slugs the calling key can actually reach. Anything Higgsfield markets but
+  // does not return there is per-plan, and asking for it gets a 404
+  // `model_not_found` that reads like a misspelling rather than a plan limit.
   { id: 'higgsfield-ai/soul/standard', label: 'Higgsfield Soul (flagship t2i)', provider: 'higgsfield', priceNote: '~$0.09-0.12 / image (credits)', refImages: 0 },
-  { id: 'higgsfield-ai/soul/turbo', label: 'Higgsfield Soul Turbo', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
-  { id: 'higgsfield-ai/soul/image-to-image', label: 'Higgsfield Soul Image-to-Image', provider: 'higgsfield', priceNote: '~$0.09 / run (credits)', refImages: 1, refMode: 'required' },
-  { id: 'higgsfield-ai/soul-id', label: 'Higgsfield Soul ID (character consistency)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 4, refKinds: ['character'] },
-  { id: 'reve/text-to-image', label: 'Reve Text-to-Image', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
-  // Counts below follow higgsfield-ai/cli MODELS.md ("At most N image_references
-  // are allowed"): nano_banana_2 14, nano_banana 8, openai 16, seedream_v4_5 14,
-  // kling_omni_image 10. FLUX.2 has no Higgsfield-published number, so it takes
-  // Black Forest Labs' own API ceiling of 8.
-  { id: 'google/nano-banana-pro', label: 'Nano Banana Pro (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 14 },
-  { id: 'google/nano-banana', label: 'Nano Banana (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 8 },
-  { id: 'openai/gpt-image-1.5', label: 'GPT Image 1.5 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 16 },
-  { id: 'bytedance/seedream/v4', label: 'Seedream 4 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 10 },
-  { id: 'black-forest-labs/flux.2', label: 'FLUX.2 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 8 },
-  { id: 'kling/o1/image', label: 'Kling O1 Image (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 10 },
-  { id: 'alibaba/z-image', label: 'Z-Image (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
+  { id: 'higgsfield-ai/soul/v2/standard', label: 'Higgsfield Soul 2', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
+  { id: 'higgsfield-ai/soul/cinema', label: 'Higgsfield Soul Cinema', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
+  { id: 'higgsfield-ai/soul/character', label: 'Higgsfield Soul Character', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
+  { id: 'higgsfield-ai/soul/reference', label: 'Higgsfield Soul Reference', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'higgsfield-ai/popcorn/auto', label: 'Higgsfield Popcorn Auto', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
+  { id: 'soul-id', label: 'Higgsfield Soul ID (character consistency)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 4, refKinds: ['character'] },
+  // The vendor-branded models Higgsfield resells — Nano Banana, Seedream,
+  // GPT Image, FLUX.2, Kling, Z-Image, Reve — are gone from this list. They were
+  // never reachable on the tested key and answered `model_not_found` on every id
+  // spelling. Reach those vendors through Fal or Atlas instead, where the studio
+  // already routes to them. If a Higgsfield plan does expose one, a custom
+  // model path with the Higgsfield host still sends it.
 
   // --- Atlas Cloud ---
   // An aggregator: one key, one endpoint, models re-served from many vendors.
@@ -94,30 +95,38 @@ export const VIDEO_MODELS = [
   { id: 'fal-ai/veo3.1', label: 'Fal.ai - Google Veo 3.1', provider: 'fal-ai', priceNote: '~$0.40 / s', refImages: 1, durations: ['5', '8'] },
   { id: 'fal-ai/veo2', label: 'Fal.ai - Google Veo 2', provider: 'fal-ai', priceNote: '~$0.50 / s', refImages: 1, durations: ['5', '8'] },
   { id: 'fal-ai/luma-dream-machine', label: 'Fal.ai - Luma Dream Machine', provider: 'fal-ai', priceNote: '~$0.50 / 5s', refImages: 1 },
+  // Seedance 2.0's reference endpoint on Fal rather than Atlas. Same model,
+  // and the difference that matters is where the audio lives: Fal uploads it
+  // to its own storage and hands the model a fal.media URL, where Atlas
+  // forwards whatever string you gave it and ByteDance refuses anything it
+  // does not already trust.
+  // The `fal:` host is load-bearing twice over. Fal's own id for these carries
+  // no `fal-ai/` prefix — it is `bytedance/seedance-2.0/…`, and prefixing it
+  // makes falQueueBase read `fal-ai/bytedance` as the app, so the result fetch
+  // 404s on the remainder after the generation has already been paid for. But
+  // a bare `bytedance/…` is exactly what the prefix heuristic routes to
+  // Higgsfield. Only the explicit host gets both right.
+  { id: 'fal:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Fal) — up to 9 refs + audio', provider: 'fal-ai', priceNote: 'per Fal rates', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'fal:bytedance/seedance-2.0/fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Fal) — up to 9 refs + audio', provider: 'fal-ai', priceNote: 'per Fal rates', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
 
   // --- Direct provider APIs ---
   { id: 'runway', label: 'RunwayML Gen-3', provider: 'runway', priceNote: 'per Runway credit rates', refImages: 1 },
   { id: 'kling', label: 'Kling AI Developer API', provider: 'kling', priceNote: 'per Kling credit rates', refImages: 1 },
 
   // --- Higgsfield ---
-  { id: 'higgsfield-ai/dop/preview', label: 'Higgsfield DoP (preview)', provider: 'higgsfield', priceNote: '~$0.86 / video (credits)', refImages: 1 },
-  { id: 'higgsfield-ai/dop/standard', label: 'Higgsfield DoP (standard)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'higgsfield-ai/dop/turbo', label: 'Higgsfield DoP (turbo)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'higgsfield-ai/cinema-studio', label: 'Higgsfield Cinema Studio', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'bytedance/seedance/v1/pro/image-to-video', label: 'Seedance 1 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
-  { id: 'bytedance/seedance/v1/pro/text-to-video', label: 'Seedance 1 Pro t2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 0 },
-  { id: 'bytedance/seedance/v1.5/pro/image-to-video', label: 'Seedance 1.5 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
-  { id: 'kling-video/v2.1/pro/image-to-video', label: 'Kling 2.1 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
-  { id: 'kling-video/v2.5/pro/image-to-video', label: 'Kling 2.5 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
-  { id: 'kling-video/v2.6/pro/image-to-video', label: 'Kling 2.6 Pro i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
-  { id: 'kling-video/o1/image-to-video', label: 'Kling O1 i2v (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
-  { id: 'google/veo/3.1', label: 'Google Veo 3.1 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'google/veo/3', label: 'Google Veo 3 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'openai/sora-2', label: 'Sora 2 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'minimax/hailuo', label: 'Minimax Hailuo (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'alibaba/wan/2.5', label: 'Wan 2.5 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'alibaba/wan/2.6', label: 'Wan 2.6 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
-  { id: 'alibaba/wan/2.2', label: 'Wan 2.2 (via Higgsfield)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1 },
+  // DoP is what Higgsfield actually serves for video. The `/first-last-frame`
+  // pair takes a closing frame as well as an opening one, which is the only
+  // endpoint here that does.
+  { id: 'higgsfield-ai/dop/lite', label: 'Higgsfield DoP Lite', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'higgsfield-ai/dop/standard', label: 'Higgsfield DoP (standard)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'higgsfield-ai/dop/turbo', label: 'Higgsfield DoP (turbo)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 1, refMode: 'required' },
+  { id: 'higgsfield-ai/dop/lite/first-last-frame', label: 'Higgsfield DoP Lite (first + last frame)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 2, refMode: 'required' },
+  { id: 'higgsfield-ai/dop/standard/first-last-frame', label: 'Higgsfield DoP Standard (first + last frame)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 2, refMode: 'required' },
+  { id: 'higgsfield-ai/dop/turbo/first-last-frame', label: 'Higgsfield DoP Turbo (first + last frame)', provider: 'higgsfield', priceNote: 'credit based - see gallery', refImages: 2, refMode: 'required' },
+  // Seedance, Kling, Veo, Sora, Hailuo and Wan used to be listed here as
+  // Higgsfield resells. None resolved on the tested key. Seedance and Kling
+  // reach the studio through Atlas and Fal already; the rest have no route
+  // here and listing them only produced a 404 at generation time.
 
   // --- Atlas Cloud ---
   // Atlas publishes each model's ranges on its API tab. Seedance 2.0 documents
@@ -131,10 +140,16 @@ export const VIDEO_MODELS = [
   //
   // `refAudio` is the same idea for sound: Seedance 2.0 will take up to three
   // clips (mp3/wav, 15s combined) and sing, speak or cut to them, addressed
-  // from the prompt as @audio1..@audio3. Atlas will not take audio inline the
-  // way it takes images — see registerAtlasAsset in providers/atlas.js.
-  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refAudio: 3, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refAudio: 3, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  // from the prompt as @audio1..@audio3.
+  //
+  // It is on ref2v alone, and that is Atlas's rule rather than a cautious
+  // guess: a first-frame image cannot be combined with reference media of any
+  // kind in one request (error 1013032). Since i2v exists to animate a first
+  // frame, and requires one, audio can never ride along with it — so the two
+  // i2v entries declare no audio capacity and the studio refuses the
+  // combination locally instead of letting Atlas fail it a second later.
+  { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/text-to-video', label: 'Seedance 2.0 t2v (Atlas)', provider: 'atlas', priceNote: '$0.112 / s', refImages: 0, durations: ['4', '5', '6', '8', '10', '12', '15'] },

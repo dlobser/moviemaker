@@ -64,8 +64,8 @@ const shotFor = (over = {}) => ({ id: 'shot1', refExclusions: [], ...over });
 const composeWired = (over = {}) => composeGenerationPrompt({
   prompt: '<Ralph> in <Garage>',
   assetLibrary: [ralph, garage],
-  type: 'image',
-  modelId: 'google/nano-banana', // 8 slots
+  type: 'video',
+  modelId: 'atlas:bytedance/seedance-2.0/reference-to-video', // 9 slots
   references: refs,
   assignments: [],
   shot: shotFor(),
@@ -75,7 +75,7 @@ const composeWired = (over = {}) => composeGenerationPrompt({
 test('auto-attach: every tagged asset lands its primary before any second image', () => {
   // 3-slot Gemini with two tagged assets: both primaries in, remaining slot
   // goes to the first asset's rank-1 candidate.
-  const composed = composeWired({ modelId: 'google-gemini-image' });
+  const composed = composeWired({ type: 'image', modelId: 'google-gemini-image' });
   assert.deepEqual(composed.inputImagePaths, [
     'assets/ralph_1.png', 'assets/garage_1.png', 'assets/ralph_closeup.png'
   ]);

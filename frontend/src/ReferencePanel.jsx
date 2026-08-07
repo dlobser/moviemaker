@@ -14,6 +14,7 @@ import {
   Trash2,
   Upload,
   Users,
+  Wand2,
   X
 } from 'lucide-react';
 
@@ -57,6 +58,8 @@ export default function ReferencePanel({
   onAddToAssets,
   onUnassign,
   onUpdateReferences,
+  onAutoAssign,
+  onApplyAutoAssign,
   onDeleteReferences,
   onLinkToAsset,
   onCreateAssetFrom,
@@ -65,6 +68,9 @@ export default function ReferencePanel({
   onPreview,
   busy
 }) {
+  // Filename guesses awaiting review, and the ones ticked off.
+  const [proposals, setProposals] = useState(null);
+  const [rejected, setRejected] = useState(new Set());
   const [fullscreen, setFullscreen] = useState(false);
   const [search, setSearch] = useState('');
   const [kinds, setKinds] = useState([]);
@@ -403,8 +409,89 @@ export default function ReferencePanel({
         <button className="btn btn-secondary" onClick={onAddFromProject} disabled={busy}>
           <FolderOpen size={13} /> From project folder
         </button>
+        {onAutoAssign && (
+          <button
+            className="btn btn-secondary"
+            disabled={busy}
+            title="Read the filenames and guess which asset each unlinked reference belongs to"
+            onClick={() => setProposals(onAutoAssign())}
+          >
+            <Wand2 size={13} /> Link by filename
+          </button>
+        )}
         <span className="reference-hint">or drop images here</span>
       </footer>
+
+      {/* The guesses go in front of you before anything is written: a wrong
+          link is invisible afterwards, riding along with every generation of
+          that character until you notice it in an output. */}
+      {proposals && (
+        <div className="modal-overlay" onClick={() => setProposals(null)}>
+          <div className="modal-window" style={{ maxWidth: '620px' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2 style={{ fontSize: '1.1rem' }}>Link by filename</h2>
+              <button className="btn btn-secondary" style={{ padding: '6px', borderRadius: '50%' }} onClick={() => setProposals(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 0 }}>
+                {proposals.length} guess{proposals.length === 1 ? '' : 'es'} from filenames. Untick anything wrong —
+                a bad link travels with every future generation of that asset.
+              </p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '320px', overflowY: 'auto' }}>
+                {proposals.map(proposal => (
+                  <label
+                    key={proposal.refId}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px',
+                      borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-light)',
+                      background: 'var(--bg-card)', cursor: 'pointer', fontSize: '0.78rem'
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!rejected.has(proposal.refId)}
+                      onChange={() => setRejected(prev => {
+                        const next = new Set(prev);
+                        if (next.has(proposal.refId)) next.delete(proposal.refId); else next.add(proposal.refId);
+                        return next;
+                      })}
+                    />
+                    <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {proposal.refName}
+                    </span>
+                    <span style={{ color: 'var(--text-dim)' }}>→</span>
+                    <code style={{ color: 'var(--accent)' }}>&lt;{proposal.assetTag}&gt;</code>
+                    {proposal.ambiguous && (
+                      <span
+                        title={`Nearly matched <${proposal.alternative}> too — worth a look`}
+                        style={{ fontSize: '0.68rem', color: 'var(--warning, #f59e0b)' }}
+                      >
+                        also &lt;{proposal.alternative}&gt;?
+                      </span>
+                    )}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="modal-footer" style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', padding: '12px 16px' }}>
+              <button className="btn btn-secondary" onClick={() => setProposals(null)}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                disabled={proposals.every(p => rejected.has(p.refId))}
+                onClick={() => {
+                  onApplyAutoAssign(proposals.filter(p => !rejected.has(p.refId)));
+                  setProposals(null);
+                  setRejected(new Set());
+                }}
+              >
+                Link {proposals.filter(p => !rejected.has(p.refId)).length}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {assignTarget && (
         <AssignDialog

@@ -103,10 +103,18 @@ test('a model with recorded lengths offers exactly those', () => {
 // badly — and the shot would be billed either way.
 test('only the models that document reference audio report any', () => {
   assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0/reference-to-video').maxRefAudio, 3);
-  assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0/image-to-video').maxRefAudio, 3);
+  assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0-fast/reference-to-video').maxRefAudio, 3);
   assert.equal(modelCapabilities('video', 'fal-ai/kling-video').maxRefAudio, 0);
   assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0/text-to-video').maxRefAudio, 0);
   assert.equal(modelCapabilities('video', 'atlas:something/brand/new').maxRefAudio, 0);
+});
+
+// Atlas refuses a first-frame image combined with reference media of any kind
+// (error 1013032), and image-to-video exists to animate a first frame — so
+// audio can never ride with it, however much the model family supports.
+test('the image-to-video endpoints take no audio, first frame or nothing', () => {
+  assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0/image-to-video').maxRefAudio, 0);
+  assert.equal(modelCapabilities('video', 'atlas:bytedance/seedance-2.0-fast/image-to-video').maxRefAudio, 0);
 });
 
 test('a model with nothing recorded keeps the studio defaults', () => {
@@ -142,7 +150,7 @@ test('video sizes fall back to the resolution list, not the aspect list', () => 
 });
 
 test('capacity still reads through the descriptor', () => {
-  assert.equal(refImageCapacity('image', 'google/nano-banana-pro'), 14);
+  assert.equal(refImageCapacity('video', 'atlas:bytedance/seedance-2.0/reference-to-video'), 9);
   assert.equal(refImageCapacity('image', 'fal-ai/flux/schnell'), 0);
   assert.equal(refImageCapacity('video', 'some/unknown/path'), 1);
 });
@@ -160,9 +168,9 @@ test('image models carry no duration axis at all', () => {
 
 test('refMode defaults from refImages when unset', () => {
   assert.equal(modelCapabilities('image', 'fal-ai/flux/schnell').refMode, 'none');
-  assert.equal(modelCapabilities('image', 'google/nano-banana').refMode, 'optional');
+  assert.equal(modelCapabilities('image', 'higgsfield-ai/soul/character').refMode, 'optional');
   assert.equal(modelCapabilities('image', 'fal-ai/flux/dev/redux').refMode, 'required');
-  assert.equal(modelCapabilities('video', 'kling-video/v2.5/pro/image-to-video').refMode, 'required');
+  assert.equal(modelCapabilities('video', 'higgsfield-ai/dop/turbo').refMode, 'required');
   // Unknown paths assume one optional input, as before.
   assert.equal(modelCapabilities('image', 'some/unknown/path').refMode, 'optional');
 });
@@ -174,7 +182,7 @@ test('promptLimit is only reported where documented', () => {
 
 test('refKinds is null (all kinds) unless a model narrows it', () => {
   assert.equal(modelCapabilities('image', 'fal-ai/flux/dev').refKinds, null);
-  assert.deepEqual(modelCapabilities('image', 'higgsfield-ai/soul-id').refKinds, ['character']);
+  assert.deepEqual(modelCapabilities('image', 'soul-id').refKinds, ['character']);
 });
 
 test('custom-path overrides lift the one-input assumption, catalog models ignore them', async () => {
@@ -184,8 +192,8 @@ test('custom-path overrides lift the one-input assumption, catalog models ignore
     assert.equal(refImageCapacity('image', 'higgsfield:vendor/multi-ref'), 8);
     assert.equal(refImageCapacity('image', 'vendor/other-path'), 1);
     // A known catalog id never reads the override table.
-    setCustomModelOverrides({ 'google/nano-banana': { refImages: 99 } });
-    assert.equal(refImageCapacity('image', 'google/nano-banana'), 8);
+    setCustomModelOverrides({ 'soul-id': { refImages: 99 } });
+    assert.equal(refImageCapacity('image', 'soul-id'), 4);
   } finally {
     setCustomModelOverrides({});
   }

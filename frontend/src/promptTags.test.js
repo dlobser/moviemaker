@@ -33,22 +33,24 @@ const compose = (overrides) => composeGenerationPrompt({
 
 const paths = (n) => Array.from({ length: n }, (_, i) => `assets/ref_${i}.png`);
 
-test('a 14-reference model keeps all fourteen', () => {
-  const composed = compose({ modelId: 'google/nano-banana-pro', primaryImagePaths: paths(14) });
-  assert.equal(composed.capacity, 14);
-  assert.equal(composed.inputImagePaths.length, 14);
+test('a 9-reference model keeps all nine', () => {
+  const composed = compose({ modelId: 'atlas:bytedance/seedance-2.0/reference-to-video', type: 'video', primaryImagePaths: paths(9) });
+  assert.equal(composed.capacity, 9);
+  assert.equal(composed.inputImagePaths.length, 9);
   assert.deepEqual(composed.droppedImagePaths, []);
 });
 
-test('the fifteenth is dropped rather than sent to a model that will reject it', () => {
-  const composed = compose({ modelId: 'google/nano-banana-pro', primaryImagePaths: paths(15) });
-  assert.equal(composed.inputImagePaths.length, 14);
-  assert.deepEqual(composed.droppedImagePaths, ['assets/ref_14.png']);
+test('the tenth is dropped rather than sent to a model that will reject it', () => {
+  const composed = compose({ modelId: 'atlas:bytedance/seedance-2.0/reference-to-video', type: 'video', primaryImagePaths: paths(10) });
+  assert.equal(composed.inputImagePaths.length, 9);
+  assert.deepEqual(composed.droppedImagePaths, ['assets/ref_9.png']);
 });
 
 test('the same model served by a stricter host keeps that host\'s smaller ceiling', () => {
-  // Gemini 2.5 Flash Image: 8 through Higgsfield, 3 direct from Google.
-  assert.equal(compose({ modelId: 'google/nano-banana', primaryImagePaths: paths(9) }).inputImagePaths.length, 8);
+  // Seedance 2.0's reference endpoint takes 9; the same family's first-frame
+  // endpoint takes 1, and Gemini direct takes 3.
+  assert.equal(compose({ modelId: 'atlas:bytedance/seedance-2.0/reference-to-video', type: 'video', primaryImagePaths: paths(9) }).inputImagePaths.length, 9);
+  assert.equal(compose({ modelId: 'atlas:bytedance/seedance-2.0/image-to-video', type: 'video', primaryImagePaths: paths(9) }).inputImagePaths.length, 1);
   assert.equal(compose({ modelId: 'google-gemini-image', primaryImagePaths: paths(9) }).inputImagePaths.length, 3);
 });
 
@@ -236,7 +238,7 @@ test('a model with no pointer convention still gets descriptions', () => {
     prompt: '<Ralph> waits',
     assetLibrary: [ralph],
     type: 'video',
-    modelId: 'kling-video/v2.6/pro/image-to-video'
+    modelId: 'fal-ai/kling-video'
   });
   assert.equal(composed.prompt, 'Ralph (grizzled mechanic) waits');
   assert.equal(composed.usesRefTags, false);

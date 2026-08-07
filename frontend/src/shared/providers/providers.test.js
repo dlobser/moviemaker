@@ -10,9 +10,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { resolveRouting, routesToHiggsfield, routesToFal } from './routing.js';
-import { buildFalImageRequest, buildFalVideoRequest, resolveFalVideoModel, falImageSize } from './fal.js';
+import { buildFalImageRequest, buildFalVideoRequest, resolveFalVideoModel, falImageSize, isFalReferenceEndpoint, falQueueBase, describeFalError } from './fal.js';
 import { buildHiggsfieldImageRequest, buildHiggsfieldVideoRequest } from './higgsfield.js';
-import { buildAtlasImageBodies, buildAtlasVideoBodies, atlasImageSize } from './atlas.js';
+import { buildAtlasImageBodies, buildAtlasVideoBodies, atlasImageSize, resolveAudioReference } from './atlas.js';
+import { buildGeminiImageBodies, geminiAspectRatio } from './google.js';
 import { dalleSize } from './openai.js';
 import { generateImage, generateVideo, generateText } from './index.js';
 
@@ -86,11 +87,11 @@ test('Veo duration coerces to 5s/8s, everything else passes through', () => {
 
 test('Higgsfield sends all three image field aliases', () => {
   const { input } = buildHiggsfieldImageRequest('google/nano-banana', {
-    prompt: 'x', resolution: '16:9', imageDataUrls: ['data:a', 'data:b']
+    prompt: 'x', resolution: '16:9', imageUrls: ['https://fal.media/a.png', 'https://fal.media/b.png']
   });
-  assert.equal(input.image_url, 'data:a');
-  assert.deepEqual(input.reference_images, ['data:a', 'data:b']);
-  assert.deepEqual(input.image_references, ['data:a', 'data:b']);
+  assert.equal(input.image_url, 'https://fal.media/a.png');
+  assert.deepEqual(input.reference_images, ['https://fal.media/a.png', 'https://fal.media/b.png']);
+  assert.deepEqual(input.image_references, ['https://fal.media/a.png', 'https://fal.media/b.png']);
 });
 
 test('Higgsfield aspect vs resolution field choice', () => {
@@ -100,17 +101,17 @@ test('Higgsfield aspect vs resolution field choice', () => {
 
 test('bare higgsfield ids resolve to the flagship endpoints', () => {
   assert.equal(buildHiggsfieldImageRequest('higgsfield', { prompt: 'x' }).modelId, 'higgsfield-ai/soul/standard');
-  assert.equal(buildHiggsfieldVideoRequest('higgsfield', { prompt: 'x' }).modelId, 'higgsfield-ai/dop/preview');
+  assert.equal(buildHiggsfieldVideoRequest('higgsfield', { prompt: 'x' }).modelId, 'higgsfield-ai/dop/standard');
 });
 
 test('Higgsfield video carries both image aliases and numeric duration', () => {
   const { input } = buildHiggsfieldVideoRequest('kling-video/o1/image-to-video', {
-    prompt: 'x', resolution: '720x1280', duration: '5', imageDataUrls: ['data:a']
+    prompt: 'x', resolution: '720x1280', duration: '5', imageUrls: ['https://fal.media/a.png']
   });
   assert.equal(input.aspect_ratio, '9:16');
   assert.equal(input.duration, 5);
-  assert.equal(input.image_url, 'data:a');
-  assert.deepEqual(input.input_images, ['data:a']);
+  assert.equal(input.image_url, 'https://fal.media/a.png');
+  assert.deepEqual(input.input_images, ['https://fal.media/a.png']);
 });
 
 // --- Atlas -----------------------------------------------------------------
@@ -171,15 +172,60 @@ test('every Atlas candidate carries the reference audio it was given', () => {
   bodies.forEach(body => assert.deepEqual(body.reference_audio, ['asset://1', 'asset://2']));
 });
 
-test('a lone audio clip is offered as both an array and a bare string', () => {
+// Atlas accepts a reference_audio it cannot use and only fails once the
+// prediction runs, so reshaping until something submits would keep choosing the
+// body that dies. Audio gets one shape; only the aspect fields ladder.
+test('audio does not multiply the candidate ladder', () => {
   const bodies = buildAtlasVideoBodies('bytedance/seedance-2.0/image-to-video', {
     prompt: 'x', resolution: '1280x720', duration: '5',
-    imageDataUrls: ['data:a'], audioAssetRefs: ['asset://1']
+    imageDataUrls: ['data:a'], audioAssetRefs: ['data:audio/mpeg;base64,AAA']
   });
-  assert.equal(bodies.length, 6);
-  assert.deepEqual(bodies[0].reference_audio, ['asset://1']);
-  assert.equal(bodies[3].reference_audio, 'asset://1');
-  bodies.forEach(body => assert.ok(body.reference_audio));
+  assert.equal(bodies.length, 3);
+  bodies.forEach(body => assert.deepEqual(body.reference_audio, ['data:audio/mpeg;base64,AAA']));
+});
+
+// Atlas ingests an inline image into its own library and rewrites the field to
+// asset://…, but forwards reference_audio verbatim to ByteDance, which wants a
+// URL it can fetch. So audio travels as a link and everything else is refused
+// locally with a reason, rather than as ByteDance's bare "invalid url".
+test('a reachable audio URL passes through untouched', async () => {
+  const ctx = {
+    fetch: async () => ({ ok: true, headers: { get: () => 'audio/mpeg' } })
+  };
+  assert.equal(await resolveAudioReference('https://example.com/vo.mp3', ctx), 'https://example.com/vo.mp3');
+});
+
+test('a project file cannot be an audio reference, and says why', async () => {
+  await assert.rejects(() => resolveAudioReference('assets/vo.wav', {}), /not a URL/);
+});
+
+// A clip already in Atlas's own library needs no check and admits none — the
+// id resolves only inside Atlas — and it is the sturdiest form, since the file
+// then sits on storage the model host is known to reach.
+test('an Atlas asset id passes through without a fetch', async () => {
+  const ctx = { fetch: () => { throw new Error('should not be fetched'); } };
+  assert.equal(await resolveAudioReference('asset://atlas-asset-abc123', ctx), 'asset://atlas-asset-abc123');
+});
+
+test('an inlined clip is refused — ByteDance calls a data: URL invalid', async () => {
+  await assert.rejects(() => resolveAudioReference('data:audio/mpeg;base64,AQID', {}), /not a URL/);
+});
+
+// The /blob/ page is the mistake everyone makes, and ByteDance's only word for
+// it would be "invalid url" without naming which clip or why.
+test('a URL serving a web page is refused', async () => {
+  const ctx = {
+    fetch: async () => ({ ok: true, headers: { get: () => 'text/html; charset=utf-8' } })
+  };
+  await assert.rejects(
+    () => resolveAudioReference('https://github.com/u/r/blob/main/vo.mp3', ctx),
+    /rather than audio/
+  );
+});
+
+test('an unreachable clip names the URL that failed', async () => {
+  const ctx = { fetch: async () => ({ ok: false, status: 404 }) };
+  await assert.rejects(() => resolveAudioReference('https://example.com/gone.mp3', ctx), /404.*gone\.mp3/s);
 });
 
 test('no audio means the body ladder is untouched', () => {
@@ -198,6 +244,185 @@ test('a model that cannot take audio refuses rather than dropping it', async () 
     ),
     /does not take reference audio/
   );
+});
+
+// --- moderation refusals ----------------------------------------------------
+//
+// A refusal aimed at the reference images used to be reported with "rewording
+// the prompt is the only route through", which sends you to rewrite text that
+// was never the problem while the offending picture stays attached.
+
+test('a refusal about the references does not blame the prompt', () => {
+  const body = JSON.stringify({
+    detail: [{
+      type: 'content_policy_violation',
+      msg: 'The images or videos provided may contain likenesses of real people or other private information that cannot be processed.'
+    }]
+  });
+  const described = describeFalError(body);
+  assert.match(described, /refusing your reference images, not the prompt/);
+  assert.doesNotMatch(described, /Rewording the prompt is the only route/);
+});
+
+test('a refusal about the prompt still says so', () => {
+  const body = JSON.stringify({
+    detail: [{ type: 'content_policy_violation', msg: 'The generated content was withheld.' }]
+  });
+  const described = describeFalError(body);
+  assert.match(described, /Rewording the prompt is the only route/);
+});
+
+test('an ordinary error carries no moderation advice at all', () => {
+  const body = JSON.stringify({ detail: [{ type: 'value_error', msg: 'duration must be a string' }] });
+  assert.equal(describeFalError(body), 'duration must be a string');
+});
+
+// --- Fal's Seedance reference endpoint --------------------------------------
+//
+// Where Atlas forwards an audio string untouched and ByteDance refuses any host
+// it does not trust, Fal uploads the clip to its own storage first. That is the
+// whole reason a file on disk can be an audio reference here and not there.
+
+test('the reference endpoint is recognised, the first-frame ones are not', () => {
+  assert.equal(isFalReferenceEndpoint('bytedance/seedance-2.0/reference-to-video'), true);
+  assert.equal(isFalReferenceEndpoint('bytedance/seedance-2.0/image-to-video'), false);
+  assert.equal(isFalReferenceEndpoint('fal-ai/kling-video'), false);
+});
+
+// Fal's own id for Seedance carries no `fal-ai/` prefix. Adding one makes the
+// queue base `fal-ai/bytedance`, and the result fetch then 404s on the
+// remainder — after the video has been generated and billed.
+test('Seedance on Fal is polled at its app, not at a fal-ai namespace', () => {
+  assert.equal(falQueueBase('bytedance/seedance-2.0/reference-to-video'), 'bytedance/seedance-2.0');
+  assert.equal(falQueueBase('bytedance/seedance-2.0/fast/reference-to-video'), 'bytedance/seedance-2.0');
+  assert.equal(
+    resolveRouting('fal:bytedance/seedance-2.0/reference-to-video', null).path,
+    'bytedance/seedance-2.0/reference-to-video'
+  );
+  // Without the explicit host that same path would bill Higgsfield instead.
+  assert.equal(routesToHiggsfield(null, 'bytedance/seedance-2.0/reference-to-video'), true);
+  assert.equal(routesToFal('fal-ai', 'bytedance/seedance-2.0/reference-to-video'), true);
+});
+
+test('the reference endpoint asks for 720p, the others leave resolution alone', () => {
+  const ref = buildFalVideoRequest('bytedance/seedance-2.0/reference-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '8', hasImage: true
+  });
+  assert.equal(ref.input.resolution, '720p');
+  assert.equal(ref.input.aspect_ratio, '16:9');
+  assert.equal(ref.input.duration, '8');
+
+  const kling = buildFalVideoRequest('fal-ai/kling-video', {
+    prompt: 'x', resolution: '1280x720', duration: '5', hasImage: true
+  });
+  assert.equal('resolution' in kling.input, false);
+});
+
+test('every reference travels, as arrays rather than a single frame', async () => {
+  const seen = {};
+  const ctx = {
+    credentials: { falKey: 'k' },
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    // Refused at submission on purpose: the request body is what these pin
+    // down, and letting it reach the queue would cost the suite a poll cycle.
+    fetch: async (url, options) => {
+      seen.input = JSON.parse(options.body);
+      return { ok: false, status: 400, text: async () => 'inspected' };
+    }
+  };
+  await assert.rejects(() => generateVideo({
+    provider: 'fal:bytedance/seedance-2.0/reference-to-video',
+    providerFamily: null,
+    prompt: '@image1 sings @audio1',
+    imageUrls: ['assets/a.png', 'assets/b.png'],
+    audioUrls: ['assets/vo.mp3'],
+    resolution: '1280x720',
+    duration: '8'
+  }, ctx));
+  assert.deepEqual(seen.input.image_urls, ['https://fal.media/assets/a.png', 'https://fal.media/assets/b.png']);
+  assert.deepEqual(seen.input.audio_urls, ['https://fal.media/assets/vo.mp3']);
+  assert.equal('image_url' in seen.input, false);
+});
+
+test('an already-hosted clip is not re-uploaded', async () => {
+  const seen = {};
+  const ctx = {
+    credentials: { falKey: 'k' },
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    // Refused at submission on purpose: the request body is what these pin
+    // down, and letting it reach the queue would cost the suite a poll cycle.
+    fetch: async (url, options) => {
+      seen.input = JSON.parse(options.body);
+      return { ok: false, status: 400, text: async () => 'inspected' };
+    }
+  };
+  await assert.rejects(() => generateVideo({
+    provider: 'fal:bytedance/seedance-2.0/reference-to-video',
+    providerFamily: null,
+    prompt: 'x',
+    imageUrls: ['assets/a.png'],
+    audioUrls: ['https://example.com/vo.mp3'],
+    resolution: '1280x720'
+  }, ctx));
+  assert.deepEqual(seen.input.audio_urls, ['https://example.com/vo.mp3']);
+});
+
+test('an Atlas asset id is refused on Fal, where it means nothing', async () => {
+  const ctx = {
+    credentials: { falKey: 'k' },
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    fetch: async () => ({ ok: true, json: async () => ({ request_id: 'r', status: 'COMPLETED' }) })
+  };
+  await assert.rejects(() => generateVideo({
+    provider: 'fal:bytedance/seedance-2.0/reference-to-video',
+    providerFamily: null,
+    prompt: 'x',
+    imageUrls: ['assets/a.png'],
+    audioUrls: ['asset://atlas-asset-abc'],
+    resolution: '1280x720'
+  }, ctx), /Atlas Asset Library id and means nothing to Fal/);
+});
+
+// --- Gemini Image ----------------------------------------------------------
+//
+// The adapter dropped `resolution` entirely, so every generation was made at
+// whatever shape the model felt like. These pin down that a ratio is now asked
+// for, and that an unrecognised one asks for nothing rather than inventing.
+
+test('studio ratios pass through to Gemini unchanged', () => {
+  assert.equal(geminiAspectRatio('16:9'), '16:9');
+  assert.equal(geminiAspectRatio('9:16'), '9:16');
+  assert.equal(geminiAspectRatio('1:1'), '1:1');
+  assert.equal(geminiAspectRatio('21:9'), '21:9');
+});
+
+test('pixel dimensions reduce to the ratio they are closest to', () => {
+  assert.equal(geminiAspectRatio('1344x768'), '16:9');
+  assert.equal(geminiAspectRatio('768*1344'), '9:16');
+  assert.equal(geminiAspectRatio('1024x1024'), '1:1');
+});
+
+test('a shape Gemini has no ratio for constrains nothing', () => {
+  assert.equal(geminiAspectRatio('7:5'), null);
+  assert.equal(geminiAspectRatio(''), null);
+  assert.equal(geminiAspectRatio(undefined), null);
+  assert.equal(geminiAspectRatio('1000x137'), null);
+});
+
+test('both documented ratio fields are offered, then a body without one', () => {
+  const bodies = buildGeminiImageBodies([{ text: 'x' }], '16:9');
+  assert.equal(bodies.length, 3);
+  assert.equal(bodies[0].generationConfig.imageConfig.aspectRatio, '16:9');
+  assert.equal(bodies[1].generationConfig.responseFormat.image.aspectRatio, '16:9');
+  assert.equal('imageConfig' in bodies[2].generationConfig, false);
+  assert.equal('responseFormat' in bodies[2].generationConfig, false);
+  bodies.forEach(body => assert.deepEqual(body.generationConfig.responseModalities, ['IMAGE']));
+});
+
+test('no ratio means one body, exactly as before', () => {
+  const bodies = buildGeminiImageBodies([{ text: 'x' }], null);
+  assert.equal(bodies.length, 1);
+  assert.deepEqual(bodies[0].generationConfig, { responseModalities: ['IMAGE'] });
 });
 
 // --- DALL-E ----------------------------------------------------------------

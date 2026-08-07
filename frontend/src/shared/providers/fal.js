@@ -39,9 +39,20 @@ export function describeFalError(body) {
     if (messages.length === 0) return body;
 
     const policy = entries.some(entry => entry && entry.type === 'content_policy_violation');
-    return policy
-      ? `${messages.join('; ')} This is the model host's own moderation refusing the finished result — it ran, then was withheld. Rewording the prompt is the only route through.`
-      : messages.join('; ');
+    if (!policy) return messages.join('; ');
+
+    // Two unrelated refusals arrive wearing the same type. One is about what
+    // the prompt asked for; the other is about the reference images — and
+    // "reword the prompt" sent people to rewrite text that was never the
+    // problem while the offending picture stayed attached.
+    const aboutInputs = /likeness|real (people|person|individual)|private information|images or videos provided/i
+      .test(messages.join(' '));
+    return `${messages.join('; ')} ${aboutInputs
+      ? 'This is moderation refusing your reference images, not the prompt — rewording will not help. '
+        + 'Swap the reference for a less photoreal or clearly synthetic image. Note that a face and a '
+        + 'voice together trip this far more readily than either alone.'
+      : 'This is the model host\'s own moderation refusing the finished result — it ran, then was '
+        + 'withheld. Rewording the prompt is the only route through.'}`;
   } catch {
     return body; // not JSON after all
   }
@@ -137,6 +148,16 @@ export function resolveFalVideoModel(modelPath, hasImage) {
   return modelId;
 }
 
+/**
+ * Seedance 2.0's reference endpoints take arrays — `image_urls` for up to nine
+ * stills and `audio_urls` for up to three clips — where every other video model
+ * here takes a single `image_url` first frame. The prompt addresses both by
+ * position, as @image1 and @audio1.
+ */
+export function isFalReferenceEndpoint(modelId) {
+  return /reference-to-video/.test(String(modelId));
+}
+
 export function buildFalVideoRequest(modelPath, { prompt, resolution, duration, hasImage }) {
   const modelId = resolveFalVideoModel(modelPath, hasImage);
 
@@ -145,14 +166,16 @@ export function buildFalVideoRequest(modelPath, { prompt, resolution, duration, 
   // catalog offered those two still hold 10, so both round to the nearest.
   if (modelId.startsWith('fal-ai/veo')) durationValue = Number(durationValue) >= 8 ? '8s' : '5s';
 
-  return {
-    modelId,
-    input: {
-      prompt,
-      duration: durationValue,
-      aspect_ratio: resolution === '720x1280' ? '9:16' : '16:9'
-    }
+  const input = {
+    prompt,
+    duration: durationValue,
+    aspect_ratio: resolution === '720x1280' ? '9:16' : '16:9'
   };
+  // Seedance documents resolution separately from aspect; without it Fal picks
+  // its own default rather than the 720p the studio prices against.
+  if (isFalReferenceEndpoint(modelId)) input.resolution = '720p';
+
+  return { modelId, input };
 }
 
 // --- generation ------------------------------------------------------------
@@ -171,10 +194,39 @@ export async function generateImage({ modelPath, prompt, resolution, inputImageP
   return ctx.saveRemote(result.images[0].url, 'img', '.png');
 }
 
-export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths }, ctx) {
+/**
+ * An audio reference as a URL Fal can hand the model.
+ *
+ * A file in the project is uploaded to Fal storage, which is the whole reason
+ * audio works here and not on Atlas: the model is given a fal.media address
+ * rather than whatever host you happened to have.
+ */
+async function falAudioUrl(audioRef, ctx) {
+  if (/^asset:\/\//i.test(audioRef)) {
+    throw new Error(
+      `"${audioRef}" is an Atlas Asset Library id and means nothing to Fal. Add the clip as a file ` +
+      `or an https:// URL, or point this shot at one of the Atlas Seedance models.`
+    );
+  }
+  if (/^https?:\/\//i.test(audioRef)) return audioRef;
+  return ctx.uploadPublicUrl(audioRef);
+}
+
+export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths = [] }, ctx) {
   const hasImage = inputImagePaths.length > 0;
   const { modelId, input } = buildFalVideoRequest(modelPath, { prompt, resolution, duration, hasImage });
-  if (hasImage) input.image_url = await ctx.uploadPublicUrl(inputImagePaths[0]);
+
+  if (isFalReferenceEndpoint(modelId)) {
+    // Every reference goes, in slot order: the prompt points at them by
+    // position, so sending a subset silently re-aims every pointer past the gap.
+    input.image_urls = await Promise.all(inputImagePaths.map(path => ctx.uploadPublicUrl(path)));
+    if (inputAudioPaths.length > 0) {
+      input.audio_urls = [];
+      for (const audioRef of inputAudioPaths) input.audio_urls.push(await falAudioUrl(audioRef, ctx));
+    }
+  } else if (hasImage) {
+    input.image_url = await ctx.uploadPublicUrl(inputImagePaths[0]);
+  }
 
   const result = await callFalModel(modelId, input, ctx);
   const url = result.video?.url || result.videos?.[0]?.url;

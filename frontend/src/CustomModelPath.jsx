@@ -20,6 +20,19 @@ const HINTS = {
 export default function CustomModelPath({ label, value, onChange, placeholder, disabled, refImagesOverride, onRefImagesOverride }) {
   const { family, path } = parseModelId(value);
 
+  /**
+   * Take a host typed into the path box as a host, not as part of the path.
+   *
+   * The field shows the path alone while the dropdown beside it holds the
+   * host, so pasting a whole `higgsfield:higgsfield-ai/soul/standard` used to
+   * store the prefix twice — and `platform.higgsfield.ai/higgsfield:higgsfield-ai/…`
+   * answers `model_not_found`, which reads exactly like a wrong model name.
+   */
+  const handlePathChange = (typed) => {
+    const parsed = parseModelId(typed);
+    onChange(formatModelId(parsed.family || family, parsed.path));
+  };
+
   return (
     <div className="form-group">
       <label className="form-label">{label}</label>
@@ -31,7 +44,7 @@ export default function CustomModelPath({ label, value, onChange, placeholder, d
           value={path}
           disabled={disabled}
           placeholder={placeholder}
-          onChange={(e) => onChange(formatModelId(family, e.target.value))}
+          onChange={(e) => handlePathChange(e.target.value)}
         />
         <select
           className="select-field"

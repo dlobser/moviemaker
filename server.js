@@ -6,6 +6,8 @@ const os = require('os');
 const path = require('path');
 const { exec, execFile, spawn } = require('child_process');
 const { buildRenderGraph } = require('./renderGraph.js');
+const { buildWatermarkGraph } = require('./watermarkGraph.js');
+const { buildExportPlan } = require('./exportPlan.js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1047,6 +1049,169 @@ app.post('/api/concatenate', async (req, res) => {
     });
   } finally {
     try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
+// --- PROJECT EXPORT ---------------------------------------------------------
+
+/**
+ * Write the project out as a folder a person can read.
+ *
+ * The working store is content-addressed on purpose — `img_1738…png` never
+ * collides and never needs renaming — and that is exactly what makes it opaque
+ * to anyone opening the folder later. This copies rather than moves, so the
+ * project keeps working while the export is something you can zip and send.
+ *
+ * `export/` is wiped first: a stale file from a deleted shot sitting in an
+ * export is worse than no export, because nothing in it says how old it is.
+ */
+app.post('/api/export', async (req, res) => {
+  try {
+    const root = getWorkingRoot();
+    const exportRoot = path.join(root, 'export');
+
+    // A project file wraps its state; the legacy loose file is the state.
+    const activePath = getActiveProjectPath();
+    const state = activePath
+      ? (readProjectFile(activePath).state || {})
+      : readJsonFile(getStateFilePath(), {});
+
+    // The listing drops `state` to stay cheap; an export wants the whole thing.
+    const checkpointsDir = getCheckpointsDir(false);
+    const checkpoints = fs.existsSync(checkpointsDir)
+      ? fs.readdirSync(checkpointsDir)
+        .filter(name => name.endsWith('.json'))
+        .map(name => readCheckpointFile(path.join(checkpointsDir, name)))
+        .filter(Boolean)
+      : [];
+
+    const plan = buildExportPlan({
+      scenes: state.scenes || [],
+      assetLibrary: state.assetLibrary || [],
+      referenceImages: state.referenceImages || [],
+      checkpoints
+    });
+
+    fs.rmSync(exportRoot, { recursive: true, force: true });
+    fs.mkdirSync(exportRoot, { recursive: true });
+
+    const ensureDir = (relative) => {
+      const dir = path.dirname(path.join(exportRoot, relative));
+      fs.mkdirSync(dir, { recursive: true });
+    };
+
+    // A file referenced by the project but missing from disk is reported rather
+    // than aborting the run — one lost still should not cost you the export.
+    const missing = [];
+    for (const { from, to } of plan.copies) {
+      const source = path.join(root, from);
+      if (!fs.existsSync(source)) { missing.push(from); continue; }
+      ensureDir(to);
+      fs.copyFileSync(source, path.join(exportRoot, to));
+    }
+
+    for (const { to, contents } of plan.writes) {
+      ensureDir(to);
+      fs.writeFileSync(path.join(exportRoot, to), contents, 'utf8');
+    }
+
+    // The project file itself, so the export can be re-opened rather than only
+    // read.
+    fs.writeFileSync(path.join(exportRoot, 'project.json'), JSON.stringify(state, null, 2), 'utf8');
+
+    res.json({
+      folder: 'export',
+      files: plan.copies.length - missing.length,
+      sheets: plan.writes.length,
+      missing
+    });
+  } catch (error) {
+    console.error('Export error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- WATERMARK PASS ---------------------------------------------------------
+
+/**
+ * Stamp a moving mark onto a finished video.
+ *
+ * A second pass on purpose. Marking is a decision made after watching the cut,
+ * and re-encoding every shot to change the mark — or to produce a clean master
+ * beside a marked one — would be absurd. The source is left untouched and the
+ * result lands beside it as its own file.
+ */
+app.post('/api/watermark', async (req, res) => {
+  const { videoPath, markPath, motion = 'drift', seed, hold, scale, periodX, periodY } = req.body || {};
+
+  const root = getWorkingRoot();
+  const resolve = (relative) => {
+    if (!relative) return null;
+    const absolute = path.join(root, relative);
+    return fs.existsSync(absolute) ? absolute : null;
+  };
+
+  const sourcePath = resolve(videoPath);
+  const watermarkPath = resolve(markPath);
+  if (!sourcePath) return res.status(400).json({ error: 'No video to watermark — concatenate one first.' });
+  if (!watermarkPath) return res.status(400).json({ error: 'No watermark image found at that path.' });
+
+  try {
+    // The length decides how many positions jump mode lays out, and the frame
+    // size decides how big the mark is drawn — both come from the file rather
+    // than being assumed. A probe failure only stops the render for jump mode,
+    // which cannot proceed without a length.
+    let duration = 60;
+    let frameWidth = null;
+    let frameHeight = null;
+    try {
+      const probed = await runFfprobe(sourcePath);
+      const seconds = Number(probed?.format?.duration);
+      if (Number.isFinite(seconds) && seconds > 0) duration = seconds;
+      const video = (probed?.streams || []).find(stream => stream.codec_type === 'video');
+      if (Number(video?.width) > 0 && Number(video?.height) > 0) {
+        frameWidth = Number(video.width);
+        frameHeight = Number(video.height);
+      }
+    } catch (error) {
+      if (motion === 'jump') throw error;
+    }
+
+    const graph = buildWatermarkGraph({
+      motion,
+      duration,
+      frameWidth,
+      frameHeight,
+      // A stamp that cannot be reproduced is a stamp you cannot re-cut around,
+      // so the seed travels back with the response.
+      seed: Number.isFinite(Number(seed)) ? Number(seed) : Date.now() % 100000,
+      ...(Number(hold) > 0 ? { hold: Number(hold) } : {}),
+      ...(Number(scale) > 0 ? { scale: Number(scale) } : {}),
+      ...(Number(periodX) > 0 ? { periodX: Number(periodX) } : {}),
+      ...(Number(periodY) > 0 ? { periodY: Number(periodY) } : {})
+    });
+
+    const outputFilename = `marked_${Date.now()}.mp4`;
+    const outputFilePath = path.join(getAssetsDir(), outputFilename);
+
+    // The mark is a still, so it loops; -shortest in the blend ends the output
+    // with the film rather than running forever. Audio is copied untouched —
+    // nothing here has any business re-encoding it.
+    await runFfmpeg(
+      `-i "${sourcePath}" -loop 1 -i "${watermarkPath}" `
+      + `-filter_complex "${graph}" -map "[v]" -map 0:a? `
+      + `-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a copy -shortest "${outputFilePath}"`,
+      'watermark'
+    );
+
+    res.json({ filePath: `assets/${outputFilename}` });
+  } catch (error) {
+    console.error('Watermark error:', error);
+    res.status(500).json({
+      error: /not recognized|ENOENT/i.test(error.message)
+        ? 'FFmpeg is not installed or not on PATH.'
+        : error.message
+    });
   }
 });
 

@@ -60,11 +60,14 @@ export async function generateVideo({ provider, providerFamily, videoModel, prom
 
   if (family === 'atlas') return atlas.generateVideo(req, ctx);
   // Everywhere else, audio references would be dropped without a word. Say so
-  // instead: the shot asked for something this model cannot do.
-  if (inputAudioPaths.length > 0) {
+  // instead: the shot asked for something this model cannot do. Seedance 2.0's
+  // reference endpoint on Fal is the exception — it takes audio too, and
+  // uploads it to Fal storage on the way.
+  if (inputAudioPaths.length > 0 && !fal.isFalReferenceEndpoint(modelPath)) {
     throw new Error(
-      `${modelPath} does not take reference audio — only Seedance 2.0 on Atlas does. ` +
-      `Remove the audio reference from this shot, or switch the shot's video model.`
+      `${modelPath} does not take reference audio — only the Seedance 2.0 reference-to-video ` +
+      `models do, on Atlas or Fal. Remove the audio reference from this shot, or switch the ` +
+      `shot's video model.`
     );
   }
   if (routesToHiggsfield(family, modelPath)) return higgsfield.generateVideo(req, ctx);

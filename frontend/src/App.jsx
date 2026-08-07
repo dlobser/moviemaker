@@ -87,6 +87,7 @@ import {
 import { makeContext, normalize } from './edit/timing.js';
 import { reconcile } from './edit/reconcile.js';
 import { createPipelineRun, estimateRun } from './pipeline.js';
+import { autoAssignReferences } from './refAutoAssign.js';
 import PipelinePanel from './PipelinePanel.jsx';
 import EditView from './edit/EditView.jsx';
 import { AssetImage, AssetVideo, useAssetUrl } from './AssetMedia.jsx';
@@ -463,9 +464,18 @@ export default function App() {
   const [cropDragStart, setCropDragStart] = useState({ x: 0, y: 0, initialX: 0, initialY: 0 });
   const cropImgRef = useRef(null);
 
+  // --- WATERMARK ---
+  // The mark travels with the project so a re-compile can be re-stamped with
+  // the same image; `drift` wanders continuously, `jump` hops every few seconds.
+  const [watermarkImage, setWatermarkImage] = useState(null);
+  const [watermarkMotion, setWatermarkMotion] = useState('drift');
+  const watermarkInputRef = useRef(null);
+
   // refs
   const audioInputRefs = useRef({});
   const audioRefInputRefs = useRef({});
+  // Half-typed audio URLs, per shot — draft text, never saved with the project.
+  const [audioRefDrafts, setAudioRefDrafts] = useState({});
 
   // Helper: Toast Alert
   const showToast = (message, type = 'info') => {
@@ -556,6 +566,21 @@ export default function App() {
   };
 
   /**
+   * Give every prompt snippet an id on the way in.
+   *
+   * Snippets are applied straight from the saved blob, so one written before
+   * they carried ids — or edited by hand — arrives without one. React reports
+   * that as a missing key, but the real damage is in the delete handler:
+   * `filter(s => s.id !== snip.id)` with undefined on both sides matches every
+   * other id-less snippet, so removing one silently removed them all.
+   */
+  const withSnippetIds = (snippets) => (
+    Array.isArray(snippets)
+      ? snippets.map((snip, index) => (snip?.id ? snip : { ...snip, id: `snip_load_${index}` }))
+      : null
+  );
+
+  /**
    * Push a saved state blob into every piece of studio state.
    *
    * `resetHistory` is on for every real load — opening a project, restoring a
@@ -616,7 +641,9 @@ export default function App() {
       scenes: loadedScenes
     }));
     setAssetLibrary(state.assetLibrary || []);
-    setPromptSnippets(state.promptSnippets || promptSnippets);
+    setPromptSnippets(withSnippetIds(state.promptSnippets) || promptSnippets);
+    setWatermarkImage(state.watermarkImage || null);
+    setWatermarkMotion(state.watermarkMotion === 'jump' ? 'jump' : 'drift');
     setActiveLlm(state.activeLlm || 'gemini');
     setLlmModel(state.llmModel || 'gemini-2.5-flash');
     setActiveImageGenerator(state.activeImageGenerator || 'fal-ai');
@@ -716,6 +743,8 @@ export default function App() {
       imageSystemPrompt,
       videoSystemPrompt,
       concatenatedVideo: extra.concatenatedVideo !== undefined ? extra.concatenatedVideo : concatenatedVideo,
+      watermarkImage,
+      watermarkMotion,
       edit: extra.edit !== undefined ? extra.edit : edit,
       activeSceneId: extra.activeSceneId !== undefined ? extra.activeSceneId : activeSceneId,
       activeShotId: extra.activeShotId !== undefined ? extra.activeShotId : activeShotId,
@@ -1541,10 +1570,15 @@ export default function App() {
     const audioRefs = type === 'video'
       ? ((shots.find(s => s.id === shotId) || {}).audioRefs || []).filter(Boolean)
       : [];
+    // Where a clip may live depends on the host — Fal uploads a local file for
+    // you, Atlas needs it already reachable — so the adapters judge that and
+    // say which is wrong. Only the count is decidable from here.
     if (audioRefs.length > (caps.maxRefAudio || 0)) {
       const error = caps.maxRefAudio
         ? `${caps.label} takes at most ${caps.maxRefAudio} reference audio clip${caps.maxRefAudio === 1 ? '' : 's'}, and this shot has ${audioRefs.length}.`
-        : `${caps.label} does not take reference audio, and this shot has ${audioRefs.length}. Remove them, or point the shot at a Seedance 2.0 model.`;
+        : `${caps.label} does not take reference audio, and this shot has ${audioRefs.length}. `
+          + `Only the Seedance 2.0 reference-to-video models do — an image-to-video endpoint treats your still as a `
+          + `first frame, and Atlas will not combine a first frame with reference media. Switch the shot to ref2v, or remove the audio.`;
       setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error } : j)));
       showToast(error, 'error');
       return { ok: false, error };
@@ -3107,10 +3141,15 @@ export default function App() {
     const paths = new Set();
     const add = (p) => { if (typeof p === 'string' && p.startsWith('assets/')) paths.add(p); };
 
+    // The watermark is a real file in the project, so Save As has to carry it.
+    add(watermarkImage);
+
     scenes.forEach(scene => (scene.shots || []).forEach(shot => {
       add(shot.selectedImage);
       add(shot.selectedVideo);
       add(shot.lipSyncAudio);
+      // Audio references may be URLs or asset:// ids, which `add` ignores —
+      // only the ones uploaded into the project are files to copy.
       (shot.audioRefs || []).forEach(add);
       [...(shot.imagePrompts || []), ...(shot.videoPrompts || [])].forEach(group => {
         (group.outputs || []).forEach(out => add(out.path));
@@ -4228,43 +4267,80 @@ export default function App() {
   };
 
   /**
-   * Attach reference audio to a shot.
+   * Attach reference audio to a shot, as a URL you host yourself.
    *
    * Deliberately not the same field as `lipSyncAudio`: that one is a track to
    * sync an *already generated* video against, while these are inputs the model
    * generates *from* — Seedance 2.0 will sing to them, speak to them or cut to
    * their beat, addressed from the prompt as @audio1..@audio3.
+   *
+   * A URL rather than an upload because Atlas has to fetch the file itself.
+   * The studio briefly relayed local files through Fal storage to manufacture
+   * one; that needed a second API key, sent your audio to a provider that was
+   * not generating anything, and still depended on an Atlas endpoint that
+   * refused API keys. Hosting it yourself is fewer moving parts than any of it.
+   */
+  /** Room left for another clip on this shot, by its resolved video model. */
+  const audioRefRoom = (shot) => (
+    refAudioCapacity('video', resolveShotModelSettings('video', shot).model) - (shot?.audioRefs || []).length
+  );
+
+  const attachAudioRef = (shotId, ref) => {
+    const shot = shots.find(s => s.id === shotId);
+    const existing = shot?.audioRefs || [];
+    if (existing.includes(ref)) {
+      showToast('That clip is already on this shot.', 'warning');
+      return false;
+    }
+    if (audioRefRoom(shot) <= 0) {
+      const capacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
+      showToast(`This shot already has the ${capacity} reference clip${capacity === 1 ? '' : 's'} the model accepts.`, 'warning');
+      return false;
+    }
+    handleUpdateShotField(shotId, 'audioRefs', [...existing, ref]);
+    showToast(`Attached as @audio${existing.length + 1}.`, 'success');
+    return true;
+  };
+
+  const handleAddAudioRef = (shotId) => {
+    const url = String(audioRefDrafts[shotId] || '').trim();
+    if (!url) return;
+    // Either a link the model host can fetch, or an id for a clip already
+    // uploaded to Atlas's own Asset Library.
+    if (!/^(https?|asset):\/\//i.test(url)) {
+      showToast('Needs a full https:// URL, or an asset:// id from the Atlas Asset Library.', 'warning');
+      return;
+    }
+    if (attachAudioRef(shotId, url)) setAudioRefDrafts(prev => ({ ...prev, [shotId]: '' }));
+  };
+
+  /**
+   * Attach a clip from disk. Only Fal can use one: it uploads the file to its
+   * own storage and hands the model that address, where Atlas forwards the
+   * string untouched and needs somewhere already reachable.
    */
   const handleAudioRefUpload = async (shotId, e) => {
     const files = Array.from(e.target.files || []);
     e.target.value = '';
     if (!files.length) return;
 
-    const shot = shots.find(s => s.id === shotId);
-    const capacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
-    const room = capacity - (shot?.audioRefs || []).length;
+    const room = audioRefRoom(shots.find(s => s.id === shotId));
     if (room <= 0) {
-      showToast(`This shot already has the ${capacity} reference clip${capacity === 1 ? '' : 's'} the model accepts.`, 'warning');
+      showToast('No slots left for another clip on this shot.', 'warning');
       return;
-    }
-    if (files.length > room) {
-      showToast(`Only the first ${room} of ${files.length} will fit — the model takes ${capacity}.`, 'warning');
     }
 
     const key = `audioref_${shotId}`;
     setLoadingStates(prev => ({ ...prev, [key]: true }));
     try {
-      const paths = [];
       for (const file of files.slice(0, room)) {
         const formData = new FormData();
         formData.append('file', file);
         const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Upload failed');
-        paths.push(data.filePath);
+        attachAudioRef(shotId, data.filePath);
       }
-      handleUpdateShotField(shotId, 'audioRefs', [...(shot?.audioRefs || []), ...paths]);
-      showToast(`${paths.length} audio reference${paths.length === 1 ? '' : 's'} attached.`, 'success');
     } catch (err) {
       console.error(err);
       showToast(`Upload failed: ${err.message}`, 'error');
@@ -4284,6 +4360,95 @@ export default function App() {
     }
   };
 
+  /**
+   * Write the project out as a readable folder tree.
+   *
+   * Flushes first: the export reads the saved state from disk, so anything
+   * typed in the last half-second would otherwise be missing from a file that
+   * looks complete.
+   */
+  const handleExportProject = async () => {
+    setLoadingStates(prev => ({ ...prev, export: true }));
+    try {
+      await flushSave();
+      const res = await apiFetch(`/api/export`, { method: 'POST' });
+      const data = await readJsonResponse(res);
+      if (!res.ok) throw new Error(data.error || 'Export failed');
+
+      const missing = (data.missing || []).length;
+      showToast(
+        `Exported ${data.files} file${data.files === 1 ? '' : 's'} and ${data.sheets} sheet${data.sheets === 1 ? '' : 's'} to export/.`
+        + (missing > 0 ? ` ${missing} referenced file${missing === 1 ? ' was' : 's were'} missing from disk.` : ''),
+        missing > 0 ? 'warning' : 'success'
+      );
+      if (missing > 0) console.warn('Export: missing files', data.missing);
+    } catch (err) {
+      console.error(err);
+      showToast(`Export failed: ${err.message}`, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, export: false }));
+    }
+  };
+
+  // --- WATERMARK PASS ---------------------------------------------------------
+
+  const handleWatermarkUpload = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setLoadingStates(prev => ({ ...prev, watermark: true }));
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Upload failed');
+      setWatermarkImage(data.filePath);
+      showToast(`Watermark set to ${file.name}. Click Render Watermark to stamp it on.`, 'success');
+    } catch (err) {
+      console.error(err);
+      showToast(`Upload failed: ${err.message}`, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, watermark: false }));
+    }
+  };
+
+  /**
+   * Stamp the mark onto the compiled video.
+   *
+   * The result replaces the preview but not the file: the clean master stays on
+   * disk under its own name, so a marked cut is something you made rather than
+   * something that happened to the only copy.
+   */
+  const handleRenderWatermark = async () => {
+    if (!concatenatedVideo || !watermarkImage) return;
+    setLoadingStates(prev => ({ ...prev, watermark: true }));
+    try {
+      const res = await apiFetch(`/api/watermark`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ videoPath: concatenatedVideo, markPath: watermarkImage, motion: watermarkMotion })
+      });
+      const data = await readJsonResponse(res);
+      if (!res.ok) throw new Error(data.error || 'Watermark failed');
+
+      setVideoGallery(prev => [{
+        id: 'vid_' + Date.now(),
+        path: data.filePath,
+        prompt: `Watermarked with ${pathBaseName(watermarkImage)}`,
+        name: `Marked_${Date.now().toString().slice(-4)}`,
+        createdAt: new Date().toISOString()
+      }, ...prev]);
+      setConcatenatedVideo(data.filePath);
+      showToast('Watermarked. The clean master is still in your project folder.', 'success');
+    } catch (err) {
+      console.error(err);
+      showToast(`Watermark failed: ${err.message}`, 'error');
+    } finally {
+      setLoadingStates(prev => ({ ...prev, watermark: false }));
+    }
+  };
+
   const handleRunLipSync = async (shotId) => {
     const shot = shots.find(s => s.id === shotId);
     if (!shot || !shot.selectedVideo || !shot.lipSyncAudio) {
@@ -4293,6 +4458,25 @@ export default function App() {
 
     const key = `sync_${shotId}`;
     setLoadingStates(prev => ({ ...prev, [key]: true }));
+
+    // Lipsync is a minutes-long remote job like any generation, but it used to
+    // report only through a word on a tiny button and a toast that clears
+    // itself — so a run in progress and a run that failed while you looked away
+    // were indistinguishable from nothing having happened. It gets a job entry
+    // for the same reason generations do: somewhere the answer stays put.
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    setBatchJobs(prev => [{
+      id: jobId,
+      shotId,
+      shotName: shot.name || 'Shot',
+      type: 'lipsync',
+      model: 'fal-ai/sync-lipsync',
+      prompt: `Lipsync ${pathBaseName(shot.selectedVideo)} to ${pathBaseName(shot.lipSyncAudio)}`,
+      status: 'running',
+      createdAt: new Date().toISOString(),
+      error: null
+    }, ...prev]);
+    showToast('Lip-sync started — track it in the Batch Manager.', 'info');
 
     try {
       const res = await apiFetch(`/api/lipsync`, {
@@ -4339,12 +4523,37 @@ export default function App() {
         createdAt: new Date().toISOString()
       }, ...prev]);
 
+      setBatchJobs(prev => prev.map(j => (
+        j.id === jobId ? { ...j, status: 'completed', outputPath: data.filePath } : j
+      )));
       showToast('Lip-sync complete! Output added and selected.', 'success');
     } catch (err) {
       console.error(err);
+      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error: err.message } : j)));
       showToast(`Lip sync failed: ${err.message}`, 'error');
     } finally {
       setLoadingStates(prev => ({ ...prev, [key]: false }));
+    }
+  };
+
+  /**
+   * A response body, whether or not it turned out to be JSON.
+   *
+   * `await res.json()` on an Express 404 throws `Unexpected token '<'`, because
+   * the body is an HTML error page — which says nothing about the actual
+   * problem. And the actual problem is almost always the same one: the route
+   * exists in the source but not in the process still running from before the
+   * edit. Node caches modules; the backend has to be restarted.
+   */
+  const readJsonResponse = async (res) => {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      if (res.status === 404) {
+        return { error: 'The backend does not have this endpoint — it is still running the build from before this change. Restart it with "node server.js".' };
+      }
+      return { error: `The backend replied with ${res.status} and no JSON: ${text.slice(0, 160)}` };
     }
   };
 
@@ -4352,6 +4561,10 @@ export default function App() {
     if (!p) return '';
     return p.split('/').pop().split('\\').pop();
   };
+
+  // Audio references are URLs, and a signed one carries a query string longer
+  // than the filename. Show the file, keep the whole thing in the tooltip.
+  const audioRefLabel = (url) => pathBaseName(String(url || '').split(/[?#]/)[0]) || url;
 
   // --- EXTERNAL FILE UPLOADS TO GALLERY OVERLAYS ---
   const handleGalleryImageUpload = async (e, dest = 'gallery') => {
@@ -4531,6 +4744,37 @@ export default function App() {
    * Patch a set of references. `patch` may be an object applied to all of them,
    * or a function of the reference for per-item values such as merging tags.
    */
+  /**
+   * Link unassigned references to assets by reading their filenames.
+   *
+   * Proposes rather than applies. A wrong link is invisible — it rides along
+   * with every future generation of that character and only shows up in an
+   * output — so the guesses go in front of you first, with the near-ties
+   * flagged.
+   */
+  const handleAutoAssignReferences = () => {
+    if (assetLibrary.length === 0) {
+      showToast('No assets to match against — define some first.', 'warning');
+      return null;
+    }
+    const proposals = autoAssignReferences({ references: referenceImages, assetLibrary });
+    if (proposals.length === 0) {
+      showToast('No filenames matched an asset tag or name.', 'info');
+      return null;
+    }
+    return proposals;
+  };
+
+  const handleApplyRefProposals = (proposals) => {
+    const byAsset = new Map();
+    proposals.forEach(({ refId, assetId }) => {
+      if (!byAsset.has(assetId)) byAsset.set(assetId, []);
+      byAsset.get(assetId).push(refId);
+    });
+    byAsset.forEach((refIds, assetId) => handleUpdateReferences(refIds, { assetId }));
+    showToast(`Linked ${proposals.length} reference${proposals.length === 1 ? '' : 's'}.`, 'success');
+  };
+
   const handleUpdateReferences = (refIds, patch) => {
     const ids = new Set(refIds);
     setReferenceImages(prev => prev.map(ref => (
@@ -5033,6 +5277,16 @@ export default function App() {
               <MenuItem icon={FileJson} onClick={() => setActiveOverlay('settings')}>
                 Backup / export…
               </MenuItem>
+              <MenuItem
+                icon={FolderOpen}
+                disabled={isStatic() || loadingStates.export}
+                onClick={handleExportProject}
+                title={isStatic()
+                  ? 'Needs the local server build — it writes a folder tree'
+                  : 'Write export/ with readable names, one folder per scene, and a sheet per shot'}
+              >
+                {loadingStates.export ? 'Exporting…' : 'Export readable folder…'}
+              </MenuItem>
               <MenuItem icon={Upload} disabled={isStatic()} onClick={handleImportAssetsFromProject}>
                 Import assets from another project…
               </MenuItem>
@@ -5345,6 +5599,41 @@ export default function App() {
                   >
                     <ImageIcon size={11} /> Capture Frame
                   </button>
+                  {/* A second pass over the finished master, not part of the
+                      compile: the mark is a decision made after watching it,
+                      and the clean cut stays on disk beside the marked one. */}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    ref={watermarkInputRef}
+                    onChange={handleWatermarkUpload}
+                    style={{ display: 'none' }}
+                  />
+                  <button
+                    className="btn btn-secondary"
+                    style={{ padding: '2px 6px', fontSize: '0.7rem' }}
+                    disabled={loadingStates.watermark || isStatic()}
+                    title={isStatic()
+                      ? 'Needs the local server build — this is an FFmpeg pass'
+                      : (watermarkImage
+                        ? `Stamp ${pathBaseName(watermarkImage)} onto the compiled video, drifting across the frame`
+                        : 'Pick a black-and-white image to stamp onto the compiled video')}
+                    onClick={() => (watermarkImage ? handleRenderWatermark() : watermarkInputRef.current?.click())}
+                  >
+                    {loadingStates.watermark
+                      ? <><RefreshCw className="spinner" size={11} /> Marking…</>
+                      : <><Sparkles size={11} /> Render Watermark</>}
+                  </button>
+                  {watermarkImage && !loadingStates.watermark && (
+                    <button
+                      className="btn btn-secondary"
+                      style={{ padding: '2px 6px', fontSize: '0.7rem' }}
+                      title={`Using ${pathBaseName(watermarkImage)} — click to choose a different image`}
+                      onClick={() => watermarkInputRef.current?.click()}
+                    >
+                      <ImageIcon size={11} /> {pathBaseName(watermarkImage).slice(0, 14)}
+                    </button>
+                  )}
                   <button className="btn btn-secondary" style={{ padding: '2px 6px', fontSize: '0.7rem' }} onClick={() => setConcatenatedVideo(null)}>
                     Clear Preview
                   </button>
@@ -5675,12 +5964,18 @@ export default function App() {
                                 <Music size={10} />
                                 {shot.lipSyncAudio ? 'Replace Audio' : 'Upload Audio'}
                               </button>
+                              {/* Lipsync re-animates a finished clip, so it needs
+                                  one to work on. A greyed button that never says
+                                  why reads as broken rather than as waiting. */}
                               {shot.lipSyncAudio && (
                                 <button
                                   className="btn btn-primary"
                                   style={{ padding: '2px 6px', fontSize: '0.65rem', display: 'flex', alignItems: 'center', gap: '4px' }}
                                   onClick={() => handleRunLipSync(shot.id)}
                                   disabled={!shot.selectedVideo || loadingStates[`sync_${shot.id}`]}
+                                  title={shot.selectedVideo
+                                    ? `Re-animate the active clip's mouth to ${pathBaseName(shot.lipSyncAudio)}`
+                                    : 'No active video on this shot yet — generate a clip and double-click it to select it, or pick one from the project.'}
                                 >
                                   {loadingStates[`sync_${shot.id}`] ? (
                                     <>
@@ -5758,7 +6053,7 @@ export default function App() {
                             {clips.map((path, audioIndex) => (
                               <span
                                 key={path}
-                                title={pathBaseName(path)}
+                                title={path}
                                 style={{
                                   display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.7rem',
                                   padding: '3px 6px', borderRadius: 'var(--radius-sm)',
@@ -5768,7 +6063,7 @@ export default function App() {
                                 <Music size={10} style={{ color: 'var(--accent)' }} />
                                 <code style={{ color: 'var(--accent)' }}>@audio{audioIndex + 1}</code>
                                 <span style={{ maxWidth: '130px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
-                                  {pathBaseName(path)}
+                                  {audioRefLabel(path)}
                                 </span>
                                 <button
                                   className="btn btn-danger"
@@ -5779,25 +6074,44 @@ export default function App() {
                                 </button>
                               </span>
                             ))}
-                            <input
-                              type="file"
-                              accept="audio/*"
-                              multiple
-                              ref={el => audioRefInputRefs.current[shot.id] = el}
-                              onChange={(e) => handleAudioRefUpload(shot.id, e)}
-                              style={{ display: 'none' }}
-                            />
-                            <button
-                              className="btn btn-secondary"
-                              style={{ padding: '2px 8px', fontSize: '0.68rem' }}
-                              disabled={clips.length >= audioCapacity || loadingStates[`audioref_${shot.id}`]}
-                              onClick={() => audioRefInputRefs.current[shot.id]?.click()}
-                              title={clips.length >= audioCapacity
-                                ? `${audioCapacity} is all this model takes`
-                                : 'mp3 or wav, 15 seconds across all clips'}
-                            >
-                              {loadingStates[`audioref_${shot.id}`] ? <RefreshCw className="spinner" size={10} /> : <Plus size={10} />} Add audio
-                            </button>
+                            {clips.length < audioCapacity && (
+                              <>
+                                <input
+                                  type="url"
+                                  className="input-field"
+                                  style={{ width: '230px', padding: '2px 6px', fontSize: '0.68rem' }}
+                                  placeholder="https://…/vocal.mp3 or asset://…"
+                                  value={audioRefDrafts[shot.id] || ''}
+                                  onChange={(e) => setAudioRefDrafts(prev => ({ ...prev, [shot.id]: e.target.value }))}
+                                  onKeyDown={(e) => { if (e.key === 'Enter') handleAddAudioRef(shot.id); }}
+                                  title="A public mp3 or wav URL the model can fetch, or an asset:// id from the Atlas Asset Library. 15 seconds across all clips."
+                                />
+                                <button
+                                  className="btn btn-secondary"
+                                  style={{ padding: '2px 8px', fontSize: '0.68rem' }}
+                                  onClick={() => handleAddAudioRef(shot.id)}
+                                >
+                                  <Plus size={10} /> Add
+                                </button>
+                                <input
+                                  type="file"
+                                  accept="audio/*"
+                                  multiple
+                                  ref={el => audioRefInputRefs.current[shot.id] = el}
+                                  onChange={(e) => handleAudioRefUpload(shot.id, e)}
+                                  style={{ display: 'none' }}
+                                />
+                                <button
+                                  className="btn btn-secondary"
+                                  style={{ padding: '2px 8px', fontSize: '0.68rem' }}
+                                  disabled={loadingStates[`audioref_${shot.id}`]}
+                                  onClick={() => audioRefInputRefs.current[shot.id]?.click()}
+                                  title="Upload a clip from disk. Works on the Fal Seedance models, which host it for you; the Atlas ones need a URL or an asset:// id."
+                                >
+                                  {loadingStates[`audioref_${shot.id}`] ? <RefreshCw className="spinner" size={10} /> : <Upload size={10} />} File
+                                </button>
+                              </>
+                            )}
                             {clips.length > 0 && (
                               <span style={{ fontSize: '0.66rem', color: 'var(--text-dim)' }}>
                                 Point the prompt at them by name, e.g. "she sings @audio1".
@@ -6492,6 +6806,74 @@ export default function App() {
                         </div>
                       )}
                     </div>
+
+                    {/* Audio goes with a video request too, and unlike the
+                        images it leaves no trace in the prompt preview — so
+                        without this panel the only way to know it was sent was
+                        to watch the result. Capacity is read off the model
+                        chosen *here*, not the shot's, because this dropdown is
+                        what the request will actually use. */}
+                    {generationModal.type === 'video' && (() => {
+                      const modalShot = shots.find(s => s.id === generationModal.shotId);
+                      const clips = modalShot?.audioRefs || [];
+                      const capacity = refAudioCapacity('video', genModalModel);
+                      if (clips.length === 0 && capacity === 0) return null;
+                      const overCapacity = clips.length > capacity;
+                      return (
+                        <div style={{ marginTop: '10px', border: `1px solid ${overCapacity ? 'var(--accent)' : 'var(--border-light)'}`, borderRadius: '6px', padding: '10px', background: 'rgba(0,0,0,0.18)' }}>
+                          <div style={{ fontSize: '0.78rem', fontWeight: 'bold', marginBottom: clips.length ? '8px' : 0 }}>
+                            Audio sent with this request
+                            <span style={{ marginLeft: '6px', fontWeight: 'normal', color: 'var(--text-dim)' }}>
+                              {clips.length} of {capacity} slot{capacity === 1 ? '' : 's'}
+                            </span>
+                          </div>
+
+                          {clips.length === 0 ? (
+                            <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                              None — this model takes reference audio. Add clips on the shot to sing, speak or cut to them.
+                            </span>
+                          ) : (
+                            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                              {clips.map((path, audioIndex) => (
+                                <span
+                                  key={path}
+                                  title={path}
+                                  style={{
+                                    display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.72rem',
+                                    padding: '4px 7px', borderRadius: '4px', background: 'var(--bg-card)',
+                                    border: `2px solid ${audioIndex < capacity ? 'var(--primary)' : 'var(--accent)'}`
+                                  }}
+                                >
+                                  <Music size={11} style={{ color: 'var(--accent)' }} />
+                                  <code style={{ color: 'var(--accent)' }}>@audio{audioIndex + 1}</code>
+                                  <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
+                                    {audioRefLabel(path)}
+                                  </span>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+
+                          {overCapacity && (
+                            <div style={{ fontSize: '0.72rem', color: 'var(--accent)', marginTop: '8px', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
+                              <AlertTriangle size={11} style={{ marginTop: '2px', flexShrink: 0 }} />
+                              <span>
+                                {capacity === 0
+                                  ? `${modelCapabilities('video', genModalModel).label} takes no reference audio — Atlas will not combine a first frame with reference media, so only the ref2v models can carry it. This will be refused before it is billed: pick a Seedance 2.0 ref2v model above, or remove the clips.`
+                                  : `Only ${capacity} fit. This will be refused before it is billed — remove the extras on the shot.`}
+                              </span>
+                            </div>
+                          )}
+
+                          {clips.length > 0 && !overCapacity && (
+                            <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginTop: '8px' }}>
+                              Name them in the prompt to say what each is for — the model indexes them by position, so
+                              "@audio1" is the only thing that ties a clip to the action.
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
               )}
 
@@ -8402,6 +8784,8 @@ export default function App() {
           onAddToAssets={handleAddReferencesToAssets}
           onUnassign={handleUnassignReferences}
           onUpdateReferences={handleUpdateReferences}
+          onAutoAssign={handleAutoAssignReferences}
+          onApplyAutoAssign={handleApplyRefProposals}
           onDeleteReferences={handleDeleteReferences}
           onLinkToAsset={handleLinkReferencesToAsset}
           onCreateAssetFrom={handleCreateAssetFromReferences}
