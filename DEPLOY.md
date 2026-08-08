@@ -104,6 +104,50 @@ npm start
 npm run dev
 ```
 
-The frontend pings `localhost:3001` at startup and switches modes automatically.
-The badge next to the project name shows which one is live. Append `?static=1`
-to force the hosted behaviour while the backend happens to be running.
+The frontend pings the backend at startup and switches modes automatically. The
+badge next to the project name shows which one is live. Append `?static=1` to
+force the hosted behaviour while the backend happens to be running.
+
+## Docker
+
+One container: the built frontend served by the backend, with FFmpeg inside. No
+Node, no FFmpeg, no npm install needed on the host.
+
+```bash
+just up      # build the image and start it, waits until it answers
+just down    # stop it
+just logs    # follow the log
+```
+
+Then open <http://localhost:3001>. To use another port:
+
+```bash
+MOVIEMAKER_PORT=8099 just up
+```
+
+Projects live in `./projects/` on your machine, bind-mounted into the container
+alongside `config.json` (your API keys). The container itself keeps nothing, so
+rebuilding it loses no work.
+
+Two buttons cannot work in a container, the same two the hosted build disables:
+**Choose Project Folder**'s native dialog and **Show in Explorer**, both of which
+drive the host OS shell. Type the path instead — `/projects/YourFilm`, the
+container's view of `./projects/YourFilm`. Everything else, FFmpeg stitching
+included, works.
+
+## Task runner
+
+`just` with no arguments lists every recipe. The ones you want day to day:
+
+| Command | What it does |
+|---|---|
+| `just up` / `just down` | Docker container up and down |
+| `just start` / `just stop` | Local backend + Vite dev server, in the background |
+| `just tail` | Follow the local server logs in `.logs/` |
+| `just serve` / `just dev` | Backend or Vite alone, in the foreground |
+| `just test` / `just lint` | Checks |
+| `just dist` | Build `frontend/dist` for Neocities |
+
+`just start` and `just stop` are the Unix counterpart of `start.bat` and
+`stop.bat`, and work the same way: they go by port, so a stray Node process of
+yours is never killed, and starting twice is harmless.

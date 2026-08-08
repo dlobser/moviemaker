@@ -1,0 +1,22 @@
+services:
+  moviemaker:
+    build: .
+    image: moviemaker
+    container_name: moviemaker
+    # Change the left-hand port freely — the app reads its own origin, so it
+    # follows the mapping instead of assuming 3001.
+    ports:
+      - "${MOVIEMAKER_PORT:-3001}:3001"
+    # Projects and config.json. Everything you make is here on the host; the
+    # container keeps nothing of its own.
+    volumes:
+      - ./projects:/projects
+    restart: unless-stopped
+    healthcheck:
+      # Lets `docker compose up --wait` block until the app actually answers,
+      # instead of the 60-second poll the .bat launcher had to do by hand.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/config').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s

@@ -18,7 +18,20 @@ import {
 } from './static/fileSystem.js';
 import { generateText, listModels, generateImage, generateVideo, runLipSync } from './static/providers.js';
 
-export const SERVER_BASE = 'http://localhost:3001';
+// Where the backend is, if there is one.
+//
+// `npm run dev` puts the page on Vite's port with the backend beside it on
+// 3001. Every other case — the container, which serves the built app from the
+// backend itself, and a static host like Neocities, which has no backend —
+// the backend is either the page's own origin or nowhere, and the origin is
+// the right guess for both. Hardcoding 3001 broke any port mapping but 3001:3001.
+const VITE_DEV_PORT = '5173';
+export const SERVER_BASE =
+  typeof location !== 'undefined'
+  && location.protocol.startsWith('http')
+  && location.port !== VITE_DEV_PORT
+    ? location.origin
+    : 'http://localhost:3001';
 
 // Force static with `?static=1` (or VITE_STATIC=1 at build time) — handy for
 // testing the hosted behaviour while a local backend happens to be running.

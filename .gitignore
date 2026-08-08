@@ -5,3 +5,5 @@ config.json
 .claude/
 gitignore/
 assets/
+.logs/
+projects/

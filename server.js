@@ -17,8 +17,13 @@ app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
-// Config & State file paths
-const CONFIG_FILE = path.join(__dirname, 'config.json');
+// Config & State file paths.
+//
+// Both default to living next to server.js, which is right for a local install.
+// In a container that directory is a throwaway image layer, so the compose file
+// points these at the mounted volume instead.
+const CONFIG_FILE = process.env.MOVIEMAKER_CONFIG || path.join(__dirname, 'config.json');
+const DEFAULT_WORKING_ROOT = process.env.MOVIEMAKER_ROOT || __dirname;
 
 // Helper to read JSON safely
 function readJsonFile(filePath, defaultVal = {}) {
@@ -64,7 +69,7 @@ function getWorkingRoot() {
   if (config.workingFolder && fs.existsSync(config.workingFolder)) {
     return config.workingFolder;
   }
-  return __dirname;
+  return DEFAULT_WORKING_ROOT;
 }
 
 function readProjectFile(projectPath) {
@@ -1504,7 +1509,32 @@ app.post('/api/reveal', (req, res) => {
   }
 });
 
+// --- BUILT FRONTEND ---------------------------------------------------------
+//
+// Serve frontend/dist when it exists, so one port serves both the app and the
+// API. That is how the container runs. During `npm run dev` there is no dist
+// and Vite serves the app on 5173 instead, so this whole block is skipped.
+const DIST_DIR = path.join(__dirname, 'frontend', 'dist');
+if (fs.existsSync(DIST_DIR)) {
+  app.use(express.static(DIST_DIR));
+  // SPA fallback. Registered as plain middleware rather than a wildcard route:
+  // Express 5 changed the path syntax and `app.get('*')` throws outright.
+  //
+  // `root` is not decoration: given one absolute path, send applies its
+  // dotfiles:'ignore' rule to every segment of it, so a checkout living under
+  // any dot-directory (~/.local/src/..., a git worktree under .claude/) makes
+  // this 404 instead of serving the app. With a root, only 'index.html' is
+  // checked.
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' || req.path.startsWith('/api')) return next();
+    res.sendFile('index.html', { root: DIST_DIR }, (err) => {
+      if (err) next(err);
+    });
+  });
+}
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`MovieMaker backend running at http://localhost:${PORT}`);
+  if (fs.existsSync(DIST_DIR)) console.log('Serving the built frontend from frontend/dist');
 });
