@@ -7,6 +7,10 @@
 //   GET  https://api.atlascloud.ai/api/v1/model/prediction/ID  -> { data: { status, outputs } }
 
 import { describeFalError } from './fal.js';
+// Google's ratio vocabulary is Google's whether the request goes direct or
+// through an aggregator: Atlas documents exactly the same ten values for
+// `aspect_ratio` on its Gemini image endpoints. One table, not two that drift.
+import { geminiAspectRatio } from './google.js';
 
 const ATLAS_BASE = 'https://api.atlascloud.ai/api/v1/model';
 
@@ -103,7 +107,55 @@ export function atlasImageSize(resolution) {
   return '1344*768';
 }
 
-export function buildAtlasImageBodies(modelPath, { prompt, resolution, imageDataUrl, safetyChecker }) {
+// Atlas's Gemini image endpoints do not share the field vocabulary the
+// open-weight models use, and every difference fails quietly rather than
+// loudly:
+//
+//   * references go in `images`, an array of 1..10. The single `image` every
+//     other Atlas image model takes is not a first reference here, it is a
+//     field with no schema behind it.
+//   * shape is `aspect_ratio` ('16:9'), never the 'W*H' `size` string.
+//   * `num_images` and `enable_safety_checker` are not part of these
+//     endpoints at all.
+//
+// Only the /edit endpoints take images; /text-to-image is a different endpoint
+// rather than the same one with the input left out, which is why the catalog
+// lists both separately.
+const ATLAS_GEMINI_IMAGE = /^google\/nano-banana/;
+const ATLAS_EDIT_ENDPOINT = /\/edit(-developer)?$/;
+
+/** True when this Atlas image model speaks Gemini's field names. */
+export function isAtlasGeminiImage(modelPath) {
+  return ATLAS_GEMINI_IMAGE.test(String(modelPath || ''));
+}
+
+/** True when this Atlas image model takes its references in `images`. */
+export function usesAtlasImageArray(modelPath) {
+  const path = String(modelPath || '');
+  return isAtlasGeminiImage(path) && ATLAS_EDIT_ENDPOINT.test(path);
+}
+
+export function buildAtlasImageBodies(modelPath, { prompt, resolution, imageDataUrls = [], safetyChecker }) {
+  const images = (imageDataUrls || []).filter(Boolean);
+
+  if (isAtlasGeminiImage(modelPath)) {
+    const aspectRatio = geminiAspectRatio(resolution);
+    const input = { model: modelPath, prompt };
+    // An unrecognised shape sends no constraint rather than a made-up one.
+    if (aspectRatio) input.aspect_ratio = aspectRatio;
+    // A t2i endpoint gets no images however many the shot collected — sending
+    // them would be the silent-drop this whole branch exists to prevent, just
+    // one layer further in.
+    if (images.length && usesAtlasImageArray(modelPath)) input.images = images;
+
+    // The fallback drops the ratio, never the references: a body without
+    // `images` is a text-to-image request that succeeds, bills, and returns a
+    // picture that ignored every reference the prompt points at.
+    const fallback = { model: modelPath, prompt };
+    if (input.images) fallback.images = input.images;
+    return [input, fallback];
+  }
+
   const input = {
     model: modelPath,
     prompt,
@@ -114,7 +166,10 @@ export function buildAtlasImageBodies(modelPath, { prompt, resolution, imageData
   // flag. It stays on unless the project turns it off, so the default here
   // matches the provider's own.
   if (safetyChecker === false) input.enable_safety_checker = false;
-  if (imageDataUrl) input.image = imageDataUrl;
+  // Everything on this branch documents a single `image`, so extra references
+  // have nowhere to go. The catalog is where that ceiling is enforced; by here
+  // the list has already been cut to what the model accepts.
+  if (images.length) input.image = images[0];
 
   return [
     input,
@@ -144,9 +199,14 @@ export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration,
     candidates.push(refs);
   } else {
     if (imageDataUrls.length > 0) core.image = imageDataUrls[0];
-    candidates.push({ ...core, resolution: '720p', ratio: aspect }); // Seedance 2.0 and friends
-    candidates.push({ ...core, aspect_ratio: aspect });              // Seedance 1.5 / OpenAPI naming
-    candidates.push(core);                                           // last resort: the common fields
+    // Seedance 2.0 names the shape `ratio`; 1.5 names it `aspect_ratio`, and
+    // both take `resolution`. The 1.5 rung used to omit the resolution, so a
+    // 1.5 request that got past the first rung asked for no size at all and
+    // took whatever the model defaulted to.
+    candidates.push({ ...core, resolution: '720p', ratio: aspect });        // Seedance 2.0 and friends
+    candidates.push({ ...core, resolution: '720p', aspect_ratio: aspect }); // Seedance 1.5, as documented
+    candidates.push({ ...core, aspect_ratio: aspect });                     // older 1.5 shape, no resolution
+    candidates.push(core);                                                  // last resort: the common fields
   }
 
   if (audioAssetRefs.length === 0) return candidates;
@@ -213,8 +273,11 @@ export async function resolveAudioReference(audioRef, ctx) {
 // --- generation ------------------------------------------------------------
 
 export async function generateImage({ modelPath, prompt, resolution, inputImagePaths, safetyChecker }, ctx) {
-  const imageDataUrl = inputImagePaths.length > 0 ? await ctx.readAssetDataUrl(inputImagePaths[0]) : null;
-  const bodies = buildAtlasImageBodies(modelPath, { prompt, resolution, imageDataUrl, safetyChecker });
+  // Every reference travels, not just the first. Which of them the request can
+  // actually carry is the body builder's decision, and it is made from the
+  // endpoint rather than from how many happened to be picked.
+  const imageDataUrls = await Promise.all((inputImagePaths || []).map(ctx.readAssetDataUrl));
+  const bodies = buildAtlasImageBodies(modelPath, { prompt, resolution, imageDataUrls, safetyChecker });
   const url = await callAtlasModel('generateImage', bodies, ctx);
   return ctx.saveRemote(url, 'img', '.png');
 }

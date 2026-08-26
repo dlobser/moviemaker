@@ -9,7 +9,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   X, Play, Pause, SkipBack, ZoomIn, ZoomOut, RefreshCw, Wand2, Plus,
   Scissors, Trash2, RotateCcw, Music, Link2, Link2Off, Download, AlertTriangle,
-  GitCompare, FolderOpen
+  GitCompare, FolderOpen, Zap
 } from 'lucide-react';
 
 import { apiFetch, resolveAssetUrl } from '../client.js';
@@ -29,21 +29,25 @@ import {
   removeVideoClip, splitClipAtTime, maxOut,
   removeAudioTrack, addAudioClip, removeAudioClip, setTrackField,
   setAudioClipField, setAudioClipTrim, moveAudioClip, unlinkAudioClip, linkAudioClip,
-  detachClipAudio, reattachClipAudio
+  detachClipAudio, autoLinkClipAudio, companionOf, isCompanion
 } from './timing.js';
 import { probeMissing } from './durations.js';
 import { diffShots, reconcile } from './reconcile.js';
 import { buildRenderPlan, missingSources } from './renderPlan.js';
 import { PreviewEngine } from './PreviewEngine.js';
 import { createTimeStore } from './timeStore.js';
+import { createProxyCache, priorityPaths, cacheSpans } from './proxyCache.js';
 import Timeline from './Timeline.jsx';
 import MediaBin from './MediaBin.jsx';
+import CachePanel from './CachePanel.jsx';
 import './edit.css';
 
 const ZOOM_STEPS = [2, 4, 8, 16, 32, 64, 128];
 const DEFAULT_TRANSITION_SECONDS = 0.5;
 
-export default function EditView({ scenes, edit, setEdit, videoDuration, onClose, onToast }) {
+export default function EditView({
+  scenes, edit, setEdit, videoDuration, onClose, onToast, onJobStart, onJobUpdate, banner
+}) {
   const canvasRef = useRef(null);
   const engineRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -60,6 +64,35 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
   const [zoom, setZoom] = useState(16);
   const [probing, setProbing] = useState(false);
   const [binOpen, setBinOpen] = useState(false);
+  const [cacheOpen, setCacheOpen] = useState(false);
+
+  // --- preview files --------------------------------------------------------
+  //
+  // Every source gets a small, densely keyframed copy built in the background,
+  // and the monitor plays that instead. It is the difference between a scrub
+  // that follows the pointer and one that decides where to land a second later.
+  // Ordering is driven by the playhead, so what you are about to watch is what
+  // gets built. See proxyCache.js.
+
+  const [cacheTick, setCacheTick] = useState(0);
+  const proxyRef = useRef(null);
+  if (!proxyRef.current) {
+    proxyRef.current = createProxyCache({
+      onReady: (paths) => {
+        engineRef.current?.refreshSources(paths);
+        setCacheTick(value => value + 1);
+      },
+      onUpdate: () => setCacheTick(value => value + 1)
+    });
+  }
+  const proxy = proxyRef.current;
+  useEffect(() => () => proxy.destroy(), [proxy]);
+
+  /** A proxy if there is one, the original if there is not. */
+  const resolvePreviewUrl = useCallback(
+    async (assetPath) => proxy.urlFor(assetPath) || await resolveAssetUrl(assetPath),
+    [proxy]
+  );
 
   const ctx = useMemo(
     () => makeContext(scenes, edit.durations, Number(videoDuration) || 5),
@@ -81,6 +114,19 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     }
     return null;
   }, [timeline.audio, selection]);
+
+  // The sound clip belonging to the selected picture clip, if it has one.
+  // Level, fades and the link toggle all act on it rather than on the picture.
+  const selectedCompanion = useMemo(
+    () => (selectedVideo ? companionOf(edit, selectedVideo.clip.id) : null),
+    [edit, selectedVideo]
+  );
+
+  // The picture clip the selected sound belongs to, for the other direction.
+  const selectedAnchor = useMemo(() => {
+    const from = selectedAudio?.clip?.detachedFrom;
+    return from ? timeline.video.find(entry => entry.clip.id === from) || null : null;
+  }, [timeline.video, selectedAudio]);
 
   // How the shot list has drifted from the timeline. Offered rather than
   // applied: re-generating a take is picked up for free, but reordering or
@@ -119,6 +165,26 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pathKey]);
 
+  // Give every picture clip that has a soundtrack that soundtrack, on an audio
+  // track below it and pinned to it. Keyed on `ctx` rather than on a drop or an
+  // import because whether a source has audio is not known until it has been
+  // measured — a clip dropped from the bin gets its sound one probe later, and
+  // a project made before any of this existed gets it on open.
+  const saidSoRef = useRef(false);
+  useEffect(() => {
+    setEdit(previous => {
+      const next = autoLinkClipAudio(previous, ctx);
+      // Worth saying out loud the first time, because it changes the shape of a
+      // timeline the user already knows — silently growing an audio track under
+      // an edit somebody cut last week would be alarming.
+      if (next !== previous && !saidSoRef.current) {
+        saidSoRef.current = true;
+        onToast?.('Clips with sound now carry it on a linked audio track below the picture. Unlink from the inspector to break a pair.');
+      }
+      return next;
+    });
+  }, [ctx, setEdit, onToast]);
+
   // --- first run ------------------------------------------------------------
 
   // The project state arrives asynchronously, so this cannot be a mount-only
@@ -142,7 +208,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     if (!canvasRef.current) return undefined;
     const engine = new PreviewEngine({
       canvas: canvasRef.current,
-      resolveUrl: resolveAssetUrl,
+      resolveUrl: resolvePreviewUrl,
       onTime: (time) => timeStore.set(time),
       onStateChange: ({ playing: next }) => setPlaying(next)
     });
@@ -152,11 +218,43 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
       engineRef.current = null;
       engine.destroy();
     };
+    // Exactly once. A MediaElementAudioSourceNode can only be created once per
+    // element, so the slot pool cannot be rebuilt — which is why the engine
+    // outlives every dependency this closes over.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     engineRef.current?.setTimeline(timeline);
   }, [timeline]);
+
+  /**
+   * Keep the build queue pointed at the playhead.
+   *
+   * Recomputed when the timeline changes and whenever the playhead crosses into
+   * a different clip — not every frame. Crossing a boundary is the only moment
+   * the *order* can change, and the order is the whole feature.
+   */
+  useEffect(() => {
+    let lastIndex = Number.NaN;
+    const update = (time) => {
+      lastIndex = timeline.video.findIndex(entry => time >= entry.start && time < entry.end);
+      proxy.setWanted(priorityPaths(timeline, time));
+    };
+    update(timeStore.get());
+    return timeStore.subscribe((time) => {
+      const index = timeline.video.findIndex(entry => time >= entry.start && time < entry.end);
+      if (index === lastIndex) return;
+      update(time);
+    });
+  }, [timeline, proxy, timeStore]);
+
+  // What the cache bar under the ruler draws.
+  const spans = useMemo(
+    () => cacheSpans(timeline, (assetPath) => proxy.stateFor(assetPath)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [timeline, proxy, cacheTick]
+  );
 
   // A handle on the live document, for poking at from the console.
   useEffect(() => {
@@ -396,21 +494,36 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     if (engineRef.current?.playing) engineRef.current.pause();
     const gaps = missingSources(timeline);
 
+    // The render joins the same queue as everything else the project has running.
+    // Handing the queue the encoder's own job id is what lets it follow the
+    // render to the end even after this view is gone — the bar below only lives
+    // as long as the editor does, but the encode does not. The plan is what
+    // actually gets encoded, so it is also what the entry describes.
+    const plan = buildRenderPlan(timeline);
+    const entryId = onJobStart?.({
+      type: 'render',
+      shotName: 'Timeline',
+      prompt: `Render ${plan.video.length} clip${plan.video.length === 1 ? '' : 's'}`
+        + (plan.audio.length ? ` + ${plan.audio.length} audio clip${plan.audio.length === 1 ? '' : 's'}` : '')
+    });
+
     try {
       const res = await apiFetch('/api/render', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildRenderPlan(timeline))
+        body: JSON.stringify(plan)
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'render failed to start');
 
       setRender({ jobId: data.jobId, state: 'running', progress: 0 });
+      if (entryId) onJobUpdate?.(entryId, { renderJobId: data.jobId });
       if (gaps.length > 0) {
         onToast?.(`Rendering. ${gaps.length} clip${gaps.length === 1 ? '' : 's'} with no media will come out black.`, 'warning');
       }
     } catch (error) {
       setRender({ state: 'error', error: error.message });
+      if (entryId) onJobUpdate?.(entryId, { status: 'failed', error: error.message });
       onToast?.(`Could not start the render: ${error.message}`, 'error');
     }
   };
@@ -467,10 +580,23 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
     return () => window.removeEventListener('keydown', onKey);
   }, [timeStore, seek, togglePlay, handleDelete, handleSplit, onClose]);
 
+  // Selecting either half of an A/V pair lights up the other, which is the
+  // only cue that tells you a cut or a drag is about to move two clips.
+  const linkedSelection = useMemo(() => {
+    if (selectedVideo) return selectedCompanion ? selectedCompanion.clip.id : null;
+    if (selectedAudio && isCompanion(selectedAudio.clip)) return selectedAudio.clip.detachedFrom;
+    return null;
+  }, [selectedVideo, selectedCompanion, selectedAudio]);
+
   const { width, height, fps } = edit.settings;
 
   return (
     <div className="edit-view">
+      {/* Whatever the app needs to say over the top of everything — today only
+          the autosave-has-stopped bar. A row of the view rather than a layer
+          above it, so it pushes the editor down instead of hiding its header. */}
+      {banner}
+
       <header className="edit-header">
         <h2>Edit</h2>
         <span className="edit-chip">{width}×{height} · {fps}fps</span>
@@ -596,6 +722,7 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
             <VideoInspector
               entry={selectedVideo}
               ctx={ctx}
+              companion={selectedCompanion}
               onTransition={handleTransition}
               onStillSeconds={(value) => setEdit(previous => normalize({
                 ...previous,
@@ -603,16 +730,25 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
                   clip.id === selectedVideo.clip.id ? { ...clip, stillSeconds: value } : clip
                 ))
               }, ctx))}
-              onClipAudio={(patch) => setEdit(previous => ({
-                ...previous,
-                video: previous.video.map(clip => (
+              onCompanionField={(patch) => selectedCompanion && setEdit(previous =>
+                setAudioClipField(previous, selectedCompanion.clip.id, patch))}
+              onUnlink={() => selectedCompanion && setEdit(previous =>
+                unlinkAudioClip(previous, selectedCompanion.clip.id, ctx))}
+              onRelink={() => selectedCompanion && setEdit(previous =>
+                linkAudioClip(previous, selectedCompanion.clip.id, selectedVideo.clip.id, ctx))}
+              onRemoveSound={() => selectedCompanion && setEdit(previous =>
+                removeAudioClip(previous, selectedCompanion.clip.id))}
+              onRestoreSound={() => setEdit(previous => detachClipAudio(
+                { ...previous, video: previous.video.map(clip => (
                   clip.id === selectedVideo.clip.id
-                    ? { ...clip, audio: { ...clip.audio, ...patch } }
+                    ? { ...clip, audio: { ...clip.audio, detached: false } }
                     : clip
-                ))
-              }))}
-              onDetach={() => setEdit(previous => detachClipAudio(previous, selectedVideo.clip.id, ctx))}
-              onReattach={() => setEdit(previous => reattachClipAudio(previous, selectedVideo.clip.id, ctx))}
+                )) },
+                selectedVideo.clip.id,
+                ctx
+              ))}
+              onSelectCompanion={() => selectedCompanion
+                && setSelection({ kind: 'audio', id: selectedCompanion.clip.id })}
               onResetTrim={() => setEdit(previous => clearClipTrim(previous, selectedVideo.clip.id, ctx))}
               onDelete={handleDelete}
               onSplit={handleSplit}
@@ -622,10 +758,12 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
           {selectedAudio && (
             <AudioInspector
               entry={selectedAudio}
+              anchor={selectedAnchor}
               nearestVideo={nearestVideoClip(timeline, selectedAudio.start)}
               onField={(patch) => setEdit(previous => setAudioClipField(previous, selectedAudio.clip.id, patch))}
               onUnlink={() => setEdit(previous => unlinkAudioClip(previous, selectedAudio.clip.id, ctx))}
               onLink={(videoClipId) => setEdit(previous => linkAudioClip(previous, selectedAudio.clip.id, videoClipId, ctx))}
+              onSelectAnchor={() => selectedAnchor && setSelection({ kind: 'video', id: selectedAnchor.clip.id })}
               onDelete={handleDelete}
             />
           )}
@@ -650,6 +788,15 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
 
         <div className="edit-spacer" />
 
+        <CacheChip spans={spans} duration={timeline.duration} />
+        <button
+          className={`edit-btn ${cacheOpen ? 'toggle-on' : ''}`}
+          onClick={() => setCacheOpen(open => !open)}
+          title="Preview files: where they live, how big they are, and a button to bin them"
+        >
+          <Zap size={14} /> Preview cache
+        </button>
+
         <span className="edit-chip">drag to move · edges to trim · alt disables snapping</span>
         <button className="edit-btn" onClick={() => setZoom(stepZoom(zoom, -1))} title="Zoom out">
           <ZoomOut size={14} />
@@ -659,11 +806,21 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
         </button>
       </div>
 
+      {cacheOpen && (
+        <CachePanel
+          onClose={() => setCacheOpen(false)}
+          onChanged={() => { proxy.reset(); setCacheTick(value => value + 1); }}
+          onToast={onToast}
+        />
+      )}
+
       <Timeline
         timeline={timeline}
+        cacheSpans={spans}
         pixelsPerSecond={zoom}
         timeStore={timeStore}
         selection={selection}
+        linkedSelection={linkedSelection}
         smart={edit.smart}
         onSelect={setSelection}
         onSeek={seek}
@@ -677,6 +834,31 @@ export default function EditView({ scenes, edit, setEdit, videoDuration, onClose
         onRemoveTrack={handleRemoveTrack}
       />
     </div>
+  );
+}
+
+/**
+ * How much of the timeline is backed by a preview file.
+ *
+ * Worth a number as well as the bar: the bar tells you where, this tells you
+ * whether it is worth waiting before you hit play.
+ */
+function CacheChip({ spans, duration }) {
+  if (!duration || spans.length === 0) return null;
+  const covered = spans
+    .filter(span => span.state === 'ready' || span.state === 'native')
+    .reduce((total, span) => total + (span.end - span.start), 0);
+  const building = spans.some(span => span.state === 'building');
+  const percent = Math.round((covered / duration) * 100);
+
+  if (spans.every(span => span.state === 'off')) {
+    return <span className="edit-chip">preview files off</span>;
+  }
+  if (percent >= 100 && !building) return <span className="edit-chip">cached</span>;
+  return (
+    <span className="edit-chip" title="Preview files are built from the playhead forwards">
+      {building && <RefreshCw size={10} className="spinner" />} cached {percent}%
+    </span>
   );
 }
 
@@ -712,14 +894,16 @@ function RenderButton({ render, disabled, onStart, onOpen }) {
 // --- inspectors -------------------------------------------------------------
 
 function VideoInspector({
-  entry, ctx, onTransition, onStillSeconds, onClipAudio, onDetach, onReattach, onResetTrim, onDelete, onSplit
+  entry, ctx, companion, onTransition, onStillSeconds, onCompanionField, onUnlink, onRelink,
+  onRemoveSound, onRestoreSound, onSelectCompanion, onResetTrim, onDelete, onSplit
 }) {
   const limit = maxOut(entry.clip, ctx);
   const transitionType = entry.transition?.type || 'cut';
   const trimmed = entry.clip.out !== null && entry.clip.out !== undefined;
   const isFirst = entry.index === 0;
   const hasSound = entry.resolved.kind === 'video' && entry.hasAudio;
-  const detached = Boolean(entry.clip.audio?.detached);
+  const sound = companion?.clip || null;
+  const linked = Boolean(sound && isCompanion(sound));
 
   return (
     <>
@@ -788,42 +972,61 @@ function VideoInspector({
         </label>
       )}
 
-      {/* A detached clip always keeps its relink button, even if the take turns
-          out to be silent — otherwise there would be no way back. */}
+      {/* Sound lives on its own clip, below the picture. Everything here acts on
+          that clip — the picture's own soundtrack is never played directly once
+          it has been split out, or you would hear it twice. */}
       {entry.resolved.kind === 'video' && (
         <>
           <h4 className="edit-subhead">Sound</h4>
 
-          {detached && (
-            <p className="edit-note">
-              This clip's audio is on an audio track and no longer follows the picture.
-            </p>
-          )}
-
-          {!detached && !entry.hasAudio && (
+          {!sound && !hasSound && (
             <p className="edit-note">
               This take has no audio track. Import music or a voiceover to give it sound.
             </p>
           )}
 
-          {!detached && entry.hasAudio && (
+          {!sound && hasSound && (
             <>
-              <label className="edit-field">
-                <span>Level {Math.round((entry.clip.audio?.gain ?? 1) * 100)}%</span>
-                <input
-                  type="range" min="0" max="1.5" step="0.01"
-                  value={entry.clip.audio?.gain ?? 1}
-                  onChange={(event) => onClipAudio({ gain: Number(event.target.value) })}
-                />
-              </label>
-              <FadeFields audio={entry.clip.audio} onChange={onClipAudio} />
+              <p className="edit-note">This clip has no sound on the timeline.</p>
+              <button className="edit-btn" onClick={onRestoreSound}>
+                <Music size={14} /> Put its sound back on a track
+              </button>
             </>
           )}
 
-          {(detached || hasSound) && (
-            <button className="edit-btn" onClick={detached ? onReattach : onDetach}>
-              {detached ? <><Link2 size={14} /> Relink audio</> : <><Link2Off size={14} /> Unlink audio</>}
-            </button>
+          {sound && (
+            <>
+              <p className="edit-note">
+                {linked
+                  ? 'Linked to the picture: trimming, moving, splitting or deleting this clip does the same to its sound.'
+                  : 'Unlinked. The sound stays where it is when the picture moves.'}
+                {' '}
+                <button type="button" className="edit-link" onClick={onSelectCompanion}>
+                  Select the sound clip
+                </button>
+              </p>
+
+              <label className="edit-field">
+                <span>Level {Math.round((sound.gain ?? 1) * 100)}%</span>
+                <input
+                  type="range" min="0" max="1.5" step="0.01"
+                  value={sound.gain ?? 1}
+                  onChange={(event) => onCompanionField({ gain: Number(event.target.value) })}
+                />
+              </label>
+              <FadeFields audio={sound} onChange={onCompanionField} />
+
+              <div className="edit-inspector-actions">
+                <button className="edit-btn" onClick={linked ? onUnlink : onRelink}>
+                  {linked
+                    ? <><Link2Off size={14} /> Unlink</>
+                    : <><Link2 size={14} /> Relink</>}
+                </button>
+                <button className="edit-btn" onClick={onRemoveSound} title="Take this clip's sound off the timeline">
+                  <Trash2 size={14} /> Remove sound
+                </button>
+              </div>
+            </>
           )}
         </>
       )}
@@ -843,8 +1046,9 @@ function VideoInspector({
   );
 }
 
-function AudioInspector({ entry, nearestVideo, onField, onUnlink, onLink, onDelete }) {
+function AudioInspector({ entry, anchor, nearestVideo, onField, onUnlink, onLink, onSelectAnchor, onDelete }) {
   const linked = Boolean(entry.clip.link);
+  const paired = isCompanion(entry.clip);
 
   return (
     <>
@@ -857,8 +1061,37 @@ function AudioInspector({ entry, nearestVideo, onField, onUnlink, onLink, onDele
         <dt>Length</dt>
         <dd>{entry.length.toFixed(2)}s</dd>
         <dt>Follows</dt>
-        <dd>{linked ? `picture (${entry.clip.link.offset >= 0 ? '+' : ''}${entry.clip.link.offset.toFixed(2)}s)` : 'nothing'}</dd>
+        <dd>
+          {linked
+            ? `${anchor?.resolved?.name || 'picture'} (${entry.clip.link.offset >= 0 ? '+' : ''}${entry.clip.link.offset.toFixed(2)}s)`
+            : 'nothing'}
+        </dd>
       </dl>
+
+      {paired && (
+        <p className="edit-note">
+          This is the sound of a picture clip, and moves and cuts with it.{' '}
+          <button type="button" className="edit-link" onClick={onSelectAnchor}>
+            Select the picture
+          </button>
+        </p>
+      )}
+
+      {/* Nudging sync is a deliberate act, so it is a field rather than a drag —
+          dragging either half of a pair moves both, which is what you want
+          ninety-nine times out of a hundred. */}
+      {paired && (
+        <label className="edit-field">
+          <span>Slip sync {entry.clip.link.offset >= 0 ? '+' : ''}{entry.clip.link.offset.toFixed(2)}s</span>
+          <input
+            type="range" min="-2" max="2" step="0.01"
+            value={entry.clip.link.offset}
+            onChange={(event) => onField({
+              link: { ...entry.clip.link, offset: Number(event.target.value) }
+            })}
+          />
+        </label>
+      )}
 
       <label className="edit-field">
         <span>Level {Math.round((entry.gain ?? 1) * 100)}%</span>

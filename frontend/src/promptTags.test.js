@@ -12,8 +12,10 @@ import assert from 'node:assert/strict';
 
 import {
   assetInputImages,
+  assetShotDescription,
   buildAutoPromptContext,
   composeGenerationPrompt,
+  defaultAssetPrompt,
   droppedTags,
   tagPreservationRule
 } from './promptTags.js';
@@ -198,6 +200,218 @@ test('a tag trimmed off the end falls back to prose rather than dangling', () =>
   });
   assert.equal(composed.prompt, 'Ralph (grizzled mechanic) in The Garage (oil-stained bay)');
   assert.match(composed.prompt, /^(?!.*@image)/);
+});
+
+// Gemini numbers its references too, but has no @-token to do it with: the
+// prompt says "image 2" in plain English and the Google adapter numbers the
+// parts to match. Sending Seedance's syntax here would put a literal at-sign in
+// front of a word Gemini then reads as prose.
+// Gemini keeps the description and follows it with bare tokens. Three formats
+// were tried on real generations: ordinals from ai.google.dev's own examples
+// ("the first and second images") lost the character, and so did dropping the
+// pointer entirely on an asset with several references. This one holds her.
+// No @ — that is Seedance's marker, and Gemini reads it as punctuation.
+test('a Gemini tag keeps its description and follows it with bare tokens', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> steps out of <Garage>',
+    assetLibrary: [ralph, garage],
+    type: 'image',
+    modelId: 'google-gemini-image'
+  });
+  assert.equal(
+    composed.prompt,
+    'Ralph (grizzled mechanic) image1 steps out of The Garage (oil-stained bay) image2'
+  );
+  assert.equal(composed.usesRefTags, true);
+  assert.equal(composed.refTagSample, 'imageN');
+  assert.equal(composed.prompt.includes('@'), false);
+});
+
+test('every reference an asset holds is named, juxtaposed', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [{ ...ralph, inputImages: ['assets/ralph_1.png', 'assets/ralph_2.png'] }],
+    type: 'image',
+    modelId: 'google-gemini-image-pro'
+  });
+  assert.equal(composed.prompt, 'Ralph (grizzled mechanic) image1 image2 waits');
+  assert.equal(composed.inputImagePaths.length, 2);
+});
+
+test('four ticked references are named as four tokens', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [ticked],
+    type: 'image',
+    modelId: 'google-gemini-image-pro'
+  });
+  assert.equal(composed.prompt, 'Ralph (grizzled mechanic) image1 image2 image3 image4 waits');
+});
+
+test('Seedance still drops the description, because it indexes on the token', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> works on the car',
+    assetLibrary: [ralph, garage],
+    type: 'video',
+    modelId: SEEDANCE
+  });
+  assert.equal(composed.prompt, '@image1 works on the car');
+});
+
+test('Seedance still replaces, because the token is what it indexes on', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> works on the car',
+    assetLibrary: [ralph, garage],
+    type: 'video',
+    modelId: SEEDANCE
+  });
+  assert.equal(composed.prompt, '@image1 works on the car');
+});
+
+// --- ticked images travel ---------------------------------------------------
+//
+// Ticking is the user answering "which of my images represent me" directly.
+// It used to be consulted only on the board's auto-attach path, so with the
+// board unwired or auto-attach off, four ticked images arrived as one.
+
+const ticked = {
+  ...ralph,
+  inputImages: ['assets/ralph_1.png', 'assets/ralph_2.png', 'assets/ralph_3.png', 'assets/ralph_4.png']
+};
+
+test('every ticked image travels with the tag, not just the primary', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [ticked],
+    type: 'image',
+    modelId: 'google-gemini-image-pro' // 14 slots, so nothing is trimmed
+  });
+  assert.deepEqual(composed.inputImagePaths, [
+    'assets/ralph_1.png', 'assets/ralph_2.png', 'assets/ralph_3.png', 'assets/ralph_4.png'
+  ]);
+});
+
+test('ticks travel with auto-attach off — that setting is about the board', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [ticked],
+    type: 'image',
+    modelId: 'google-gemini-image-pro',
+    shot: { id: 's1', refExclusions: [] },
+    autoAttachRefs: false
+  });
+  assert.equal(composed.inputImagePaths.length, 4);
+});
+
+test('ticks travel with no reference board at all', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [ticked],
+    type: 'image',
+    modelId: 'google-gemini-image-pro'
+  });
+  assert.equal(composed.inputImagePaths.length, 4);
+});
+
+test('an unticked asset with inference off still sends its primary alone', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [ralph],
+    type: 'image',
+    modelId: 'google-gemini-image-pro',
+    autoAttachRefs: false
+  });
+  assert.deepEqual(composed.inputImagePaths, ['assets/ralph_1.png']);
+});
+
+// Seedance is the model that does index on position, so a tag there addresses
+// every slot its asset occupies. Four references sent and one addressed would
+// be three paid for and ignored.
+test('Seedance juxtaposes its tokens, because it has no list syntax', () => {
+  const pair = { ...ralph, inputImages: ['assets/ralph_1.png', 'assets/ralph_2.png'] };
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> works on the car',
+    assetLibrary: [pair],
+    type: 'video',
+    modelId: SEEDANCE
+  });
+  assert.equal(composed.prompt, '@image1 @image2 works on the car');
+});
+
+test('only the slots that survived the trim are addressed', () => {
+  // Two ticked, one slot. Pointing at a second image that was never sent
+  // resolves against whatever happens to be there.
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> works on the car',
+    assetLibrary: [{ ...ralph, inputImages: ['assets/ralph_1.png', 'assets/ralph_2.png'] }],
+    type: 'video',
+    modelId: 'atlas:bytedance/seedance-2.0/image-to-video',
+    shot: { id: 's1', refExclusions: [] }
+  });
+  assert.equal(composed.inputImagePaths.length, 1);
+  assert.equal(composed.prompt, '@image1 works on the car');
+});
+
+test('the model still caps them — four ticks into three slots is three', () => {
+  // Nano Banana takes 3; Nano Banana Pro takes 14. Ticking more than the model
+  // reads is not an error, it is a trim, and the prompt only points at what
+  // actually went.
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [ticked],
+    type: 'image',
+    modelId: 'google-gemini-image'
+  });
+  assert.equal(composed.inputImagePaths.length, 3);
+  assert.deepEqual(composed.droppedImagePaths, ['assets/ralph_4.png']);
+});
+
+// --- the two descriptions ---------------------------------------------------
+
+test('a shot gets the short description when the asset has one', () => {
+  const brief = { ...ralph, shotDescription: 'grey beard, overalls' };
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [brief],
+    type: 'image',
+    modelId: 'fal-ai/flux/schnell'
+  });
+  assert.equal(composed.prompt, 'Ralph (grey beard, overalls) waits');
+});
+
+test('an asset written before the split reads exactly as it always did', () => {
+  const composed = composeGenerationPrompt({
+    prompt: '<Ralph> waits',
+    assetLibrary: [ralph],
+    type: 'image',
+    modelId: 'fal-ai/flux/schnell'
+  });
+  assert.equal(composed.prompt, 'Ralph (grizzled mechanic) waits');
+});
+
+test('the full description still builds the asset art, short one or not', () => {
+  // The whole point of the split: the long one keeps every detail for the
+  // character sheet while the shot line stays a handful of words.
+  const brief = { ...ralph, shotDescription: 'grey beard' };
+  assert.equal(assetShotDescription(brief), 'grey beard');
+  assert.ok(defaultAssetPrompt(brief).includes('grizzled mechanic'));
+  assert.equal(defaultAssetPrompt(brief).includes('grey beard'), false);
+});
+
+test('an empty short description falls back rather than emptying the tag', () => {
+  assert.equal(assetShotDescription({ ...ralph, shotDescription: '   ' }), 'grizzled mechanic');
+  assert.equal(assetShotDescription({}), '');
+});
+
+test('Nano Banana Pro takes fourteen references where plain Nano Banana takes three', () => {
+  assert.equal(compose({ modelId: 'google-gemini-image', primaryImagePaths: paths(20) }).inputImagePaths.length, 3);
+  assert.equal(compose({ modelId: 'google-gemini-image-pro', primaryImagePaths: paths(20) }).inputImagePaths.length, 14);
+});
+
+test('a model that reads its references as a pile advertises no pointer syntax', () => {
+  const composed = compose({ modelId: 'fal-ai/flux/dev/redux', primaryImagePaths: paths(1) });
+  assert.equal(composed.usesRefTags, false);
+  assert.equal(composed.refTagSample, '');
 });
 
 test('an image picked by hand that is also a tagged asset is sent once and still addressable', () => {

@@ -38,7 +38,11 @@ export async function generateImage({ provider, providerFamily, prompt, resoluti
 
   if (family === 'atlas') return atlas.generateImage(req, ctx);
   if (routesToHiggsfield(family, modelPath)) return higgsfield.generateImage(req, ctx);
-  if (modelPath === 'google-gemini-image') return google.generateImage(req, ctx);
+  // Both Gemini image ids go to the same adapter; which API model and how
+  // many references it takes is decided there, from modelPath.
+  if (modelPath === 'google-gemini-image' || modelPath === 'google-gemini-image-pro') {
+    return google.generateImage(req, ctx);
+  }
   if (modelPath === 'chatgpt') return openai.generateImage(req, ctx);
   if (routesToFal(family, modelPath)) return fal.generateImage(req, ctx);
   throw new Error(`Unsupported image provider: ${provider}`);

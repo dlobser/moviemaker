@@ -6,7 +6,10 @@
 //     description: 'grizzled 60s mechanic, oil-stained overalls...',
 //     images: ['assets/ref_123.png'], primaryImage: 'assets/ref_123.png' }
 
-import { modelCapabilities, refImageCapacity, refTagToken, usesRefTags } from './catalog.js';
+import {
+  modelCapabilities, refImageCapacity, refTagReplacement, refTagSample, refTagToken,
+  usesRefTags
+} from './catalog.js';
 import { assetTemplateText, fillTemplate } from './prompts.js';
 import { resolveShotReferences } from './references.js';
 import { collectAssetReferences, orderEntriesByRole } from './refResolver.js';
@@ -187,11 +190,28 @@ export function buildAutoPromptContext({ assetLibrary = [], previousShot = null,
   return blocks.join('\n\n');
 }
 
+/**
+ * The text an asset contributes when its tag is substituted into a shot.
+ *
+ * Two descriptions, because the two jobs pull in opposite directions. Making a
+ * character sheet wants every detail — the shape of the jaw, the wear on the
+ * left cuff — and a shot that names four assets wants none of it, or the
+ * prompt is six hundred words of wardrobe notes before the camera move.
+ *
+ * `shotDescription` is the short one. `description` is the long one and the
+ * fallback, so an asset written before the split reads exactly as it always
+ * did — see `defaultAssetPrompt`, which uses the long one on purpose.
+ */
+export function assetShotDescription(asset) {
+  const short = (asset?.shotDescription || '').trim();
+  return short || (asset?.description || '').trim();
+}
+
 /** The text an asset contributes when its tag is substituted into a prompt. */
 export function assetPromptText(asset) {
   if (!asset) return '';
   const name = (asset.name || asset.tag || '').trim();
-  const description = (asset.description || '').trim();
+  const description = assetShotDescription(asset);
   if (name && description) return `${name} (${description})`;
   return name || description;
 }
@@ -380,15 +400,28 @@ export function composeGenerationPrompt({
   }
 
   if (attachTaggedImages) {
-    if (boardWired && autoAttachRefs) {
+    // `autoAttachRefs` governs *inference*: what the board can work out about an
+    // asset from links and matching tags. Ticking images in the asset editor is
+    // not inference, it is the user answering the question directly, so ticks
+    // travel whether or not the board is wired and whether or not auto-attach is
+    // on. Gating them behind it meant four ticked images arrived as one.
+    const inferring = boardWired && autoAttachRefs;
+    const anyTicked = scan.assets.some(asset => assetInputImages(asset).length > 0);
+
+    if (inferring || anyTicked) {
       // Round-robin by rank across tagged assets: every asset lands its
       // primary before any asset spends spare capacity on a second image —
       // the same fairness rule the one-image-per-asset behaviour existed for,
       // now extended to the model's real slot count.
       const perAsset = scan.assets.map(asset => ({
         asset,
-        candidates: collectAssetReferences({ asset, references, refKinds })
-          .filter(candidate => !candidate.refId || !refExclusions.has(candidate.refId))
+        candidates: collectAssetReferences({
+          asset,
+          // With inference off, the board contributes nothing and an unticked
+          // asset falls back to its primary alone — exactly what it did before.
+          references: inferring ? references : [],
+          refKinds
+        }).filter(candidate => !candidate.refId || !refExclusions.has(candidate.refId))
       }));
       const maxRank = perAsset.reduce((max, { candidates }) => Math.max(max, candidates.length), 0);
       for (let rank = 0; rank < maxRank; rank++) {
@@ -410,9 +443,14 @@ export function composeGenerationPrompt({
 
   // 2. Now the slots are fixed, each tag knows what to become.
   const pointerModel = usesRefTags(type, modelId);
-  const slotByAssetId = new Map();
+  // Every slot an asset occupies, not just its first. A character with four
+  // ticked images is addressed by all four or the other three are dead weight.
+  const slotsByAssetId = new Map();
   kept.forEach((entry, index) => {
-    if (entry.asset && !slotByAssetId.has(entry.asset.id)) slotByAssetId.set(entry.asset.id, index);
+    if (!entry.asset) return;
+    const slots = slotsByAssetId.get(entry.asset.id) || [];
+    slots.push(index);
+    slotsByAssetId.set(entry.asset.id, slots);
   });
   kept.forEach((entry, index) => {
     entry.slot = index;
@@ -422,12 +460,16 @@ export function composeGenerationPrompt({
   const resolvedText = renderPromptTags(prompt || '', scan.occurrences, occurrence => {
     if (!occurrence.asset) return null; // unknown tag — leave it visible
     if (pointerModel) {
-      const slot = slotByAssetId.get(occurrence.asset.id);
-      // A tag whose image did not make the cut has no slot to point at, so it
+      const slots = slotsByAssetId.get(occurrence.asset.id);
+      // A tag whose images did not make the cut has no slot to point at, so it
       // falls back to prose. Emitting "@image7" for an image that was never
       // sent is worse than a wordy prompt: the model resolves it to whatever
       // happens to be in slot 7.
-      if (slot !== undefined) return refTagToken(type, modelId, slot);
+      // Whether the pointer replaces the description or sits beside it is the
+      // model's business — see REFERENCE TAGGING in catalog.js.
+      if (slots && slots.length) {
+        return refTagReplacement(type, modelId, slots, assetPromptText(occurrence.asset));
+      }
     }
     return assetPromptText(occurrence.asset);
   });
@@ -459,9 +501,12 @@ export function composeGenerationPrompt({
       : scan.assets,
     attachTaggedImages,
     missingTags: scan.missing,
-    // True when tags became "@image2" pointers rather than descriptions — the
-    // UI says so, because the prompt reads very differently either way.
+    // True when tags became positional pointers rather than descriptions —
+    // the UI says so, because the prompt reads very differently either way.
     usesRefTags: pointerModel,
+    // How those pointers are spelled on this model ('@imageN', 'image N'),
+    // for the UI to name. '' when the model reads its references as a pile.
+    refTagSample: pointerModel ? refTagSample(type, modelId) : '',
     capacity
   };
 }

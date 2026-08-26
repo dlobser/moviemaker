@@ -13,7 +13,7 @@
 // underneath it.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link2, Link2Off, Volume2, VolumeX, Headphones, Trash2 } from 'lucide-react';
+import { Link2, Volume2, VolumeX, Headphones, Trash2 } from 'lucide-react';
 import { BIN_DRAG_TYPE } from './MediaBin.jsx';
 
 const TRACK_PADDING = 12;
@@ -26,9 +26,11 @@ const SNAP_PIXELS = 7;
 
 export default function Timeline({
   timeline,
+  cacheSpans,
   pixelsPerSecond,
   timeStore,
   selection,
+  linkedSelection,
   smart,
   onSelect,
   onSeek,
@@ -246,6 +248,22 @@ export default function Timeline({
           ))}
         </div>
 
+        {/* The cached bar, in the manner of every NLE's render bar: a thin strip
+            under the ruler saying which stretches of the film will play back
+            properly right now. Filled means a preview file exists. */}
+        <div className="edit-cachebar" title="Preview files — solid means this stretch plays and scrubs instantly">
+          {(cacheSpans || []).map(span => (
+            <span
+              key={`${span.start}_${span.state}`}
+              className={`edit-cachebar-span is-${span.state}`}
+              style={{
+                left: TRACK_PADDING + span.start * pixelsPerSecond,
+                width: Math.max(1, (span.end - span.start) * pixelsPerSecond)
+              }}
+            />
+          ))}
+        </div>
+
         <div className="edit-track-head">
           <span className="edit-track-label">V1 — picture{smart ? '' : ' · free'}</span>
         </div>
@@ -267,6 +285,7 @@ export default function Timeline({
               kind="video"
               pixelsPerSecond={pixelsPerSecond}
               selected={selection?.kind === 'video' && selection.id === entry.clip.id}
+              linked={linkedSelection === entry.clip.id}
               overrideStart={overrideFor(entry.clip.id)}
               dragging={dragging?.clipId === entry.clip.id}
               onStartDrag={startDrag}
@@ -313,6 +332,7 @@ export default function Timeline({
                   kind="audio"
                   pixelsPerSecond={pixelsPerSecond}
                   selected={selection?.kind === 'audio' && selection.id === entry.clip.id}
+                  linked={linkedSelection === entry.clip.id}
                   overrideStart={overrideFor(entry.clip.id)}
                   dragging={dragging?.clipId === entry.clip.id}
                   onStartDrag={startDrag}
@@ -395,7 +415,9 @@ function TrackHead({ track, index, anySolo, onField, onRemove }) {
 // Memoized: during playback and scrubbing its props are now stable (time
 // updates no longer render the Timeline at all), and during a drag only the
 // dragged clip's props change.
-const Clip = React.memo(function Clip({ entry, kind, pixelsPerSecond, selected, overrideStart, dragging, onStartDrag }) {
+const Clip = React.memo(function Clip({
+  entry, kind, pixelsPerSecond, selected, linked, overrideStart, dragging, onStartDrag
+}) {
   const width = Math.max(4, entry.length * pixelsPerSecond);
   const start = overrideStart === null || overrideStart === undefined ? entry.start : overrideStart;
   const isAudio = kind === 'audio';
@@ -409,14 +431,22 @@ const Clip = React.memo(function Clip({ entry, kind, pixelsPerSecond, selected, 
   const trimmed = entry.clip.out !== null && entry.clip.out !== undefined;
   // Handles need room to sit inside; below that a clip is move-only.
   const roomForHandles = width > HANDLE_WIDTH * 3;
-  const linked = isAudio && Boolean(entry.clip.link);
+  // Half of an A/V pair, so the chain icon means "this cuts with its other half"
+  // rather than the weaker "this is pinned to something".
+  const paired = isAudio
+    ? Boolean(entry.clip.link) && entry.clip.link.clipId === entry.clip.detachedFrom
+    : Boolean(entry.paired);
+  const follows = isAudio && Boolean(entry.clip.link);
 
   return (
     <div
-      className={`edit-clip ${kindClass} ${selected ? 'selected' : ''} ${dragging ? 'is-dragging' : ''}`}
+      className={`edit-clip ${kindClass} ${selected ? 'selected' : ''}`
+        + `${linked ? ' is-linked-selected' : ''}${paired ? ' is-paired' : ''}`
+        + `${dragging ? ' is-dragging' : ''}`}
       style={{ left: TRACK_PADDING + start * pixelsPerSecond, width }}
       onPointerDown={(event) => onStartDrag(event, entry, 'move', kind)}
-      title={`${entry.resolved.name}\n${entry.resolved.path || 'no media'}\n${entry.length.toFixed(2)}s`}
+      title={`${entry.resolved.name}\n${entry.resolved.path || 'no media'}\n${entry.length.toFixed(2)}s`
+        + (paired ? '\nlinked to picture — moves and cuts with it' : '')}
     >
       {roomForHandles && (
         <span
@@ -427,7 +457,7 @@ const Clip = React.memo(function Clip({ entry, kind, pixelsPerSecond, selected, 
       )}
 
       <span className="edit-clip-name">
-        {linked && <Link2 size={9} style={{ verticalAlign: '-1px', marginRight: 3 }} />}
+        {follows && <Link2 size={9} style={{ verticalAlign: '-1px', marginRight: 3 }} />}
         {entry.resolved.name}
       </span>
       <span className="edit-clip-meta">
@@ -439,9 +469,6 @@ const Clip = React.memo(function Clip({ entry, kind, pixelsPerSecond, selected, 
 
       {entry.stale && <span className="edit-clip-badge">source changed</span>}
       {entry.resolved.kind === 'missing' && <span className="edit-clip-badge">no media</span>}
-      {!isAudio && entry.clip.audio?.detached && (
-        <span className="edit-clip-badge muted"><Link2Off size={9} /> audio out</span>
-      )}
 
       {roomForHandles && (
         <span

@@ -38,6 +38,8 @@ import {
   Redo2,
   FileText
 } from 'lucide-react';
+import SaveGuardBanner from './SaveGuardBanner.jsx';
+import { emptyBaseline, adoptBaseline, saveHeaders } from './saveGuard.js';
 import {
   IMAGE_MODELS,
   VIDEO_MODELS,
@@ -63,6 +65,7 @@ import {
   assetPrimaryImage,
   assetPromptText,
   buildAutoPromptContext,
+  assetShotDescription,
   composeGenerationPrompt,
   defaultAssetPrompt,
   droppedTags,
@@ -146,6 +149,18 @@ import { Menu, MenuItem, MenuLabel, MenuSeparator } from './MenuBar.jsx';
 import './reference.css';
 import './menu.css';
 import './settings.css';
+
+// What each kind of queued job is called in the Batch Manager. Local ffmpeg work
+// sits in the same queue as the remote generations — it is the slowest thing
+// here, and a compile you cannot see running is a compile you start twice.
+const JOB_TYPE_LABELS = {
+  image: 'Image Prompt',
+  video: 'Video Prompt',
+  lipsync: 'Lip Sync',
+  compile: 'FFmpeg Compile',
+  watermark: 'FFmpeg Watermark',
+  render: 'FFmpeg Render'
+};
 
 /**
  * A compact model pill: the resolved model + where it came from, and (when
@@ -434,6 +449,8 @@ export default function App() {
   const [concatenatedVideo, setConcatenatedVideo] = useState(null);
   const [checkpoints, setCheckpoints] = useState([]);
   const [checkpointName, setCheckpointName] = useState('');
+  // null when the dialog is closed; otherwise { status, summary, preview, ... }
+  const [cleanFiles, setCleanFiles] = useState(null);
   // The edit document. Owned here so it autosaves and travels with the project
   // file; every operation on it lives in ./edit/.
   const [edit, setEdit] = useState(createEmptyEdit);
@@ -556,12 +573,35 @@ export default function App() {
     }
   };
 
-  const fetchProjectState = async () => {
+  /**
+   * Read the project, and remember which version of it we read.
+   *
+   * The early return on failure is the important line. Falling through to a
+   * default project here is what used to arm the disaster: the app would boot
+   * the built-in placeholder and then autosave it over the real file the moment
+   * the drive came back.
+   */
+  const fetchProjectState = async ({ quiet = false } = {}) => {
     try {
       const res = await apiFetch(`/api/state`);
-      if (res.ok) applyLoadedState(await res.json());
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setSaveBlock({
+          reason: data.reason || 'unreadable',
+          message: data.error || `Could not read the project (${res.status}).`,
+          detail: data
+        });
+        return false;
+      }
+      const state = await res.json();
+      baselineRef.current = adoptBaseline(baselineRef.current, res, null);
+      setSaveBlock(null);
+      applyLoadedState(state);
+      if (!quiet) lastRevisionSeenRef.current = baselineRef.current.revision;
+      return true;
     } catch (err) {
       console.error(err);
+      return false;
     }
   };
 
@@ -752,21 +792,113 @@ export default function App() {
     };
   };
 
-  // Auto-Save Project State
-  const saveProjectState = async (updatedScenes = scenes, extra = {}) => {
+  // --- AUTOSAVE, AND WHAT IT REFUSES TO DO ----------------------------------
+  //
+  // Which version of which file the state in this window came from. Every save
+  // quotes it back, and the server refuses one that no longer matches what is
+  // on disk. `loaded: false` means we have never successfully read the project,
+  // so what is in memory is the built-in placeholder — never write that.
+
+  const baselineRef = useRef(emptyBaseline());
+  const lastRevisionSeenRef = useRef(null);
+  const [saveBlock, setSaveBlock] = useState(null);
+  const saveBlockRef = useRef(null);
+  saveBlockRef.current = saveBlock;
+
+  /**
+   * Write the project.
+   *
+   * `force` is the user answering the banner: it skips our own gates and tells
+   * the server to skip its own, which is the only way to deliberately overwrite
+   * a file that moved on. The server copies the old one aside first.
+   */
+  const saveProjectState = async (updatedScenes = scenes, extra = {}, { force = false } = {}) => {
     // Nothing to write to yet in the hosted build until a folder is picked —
     // and a folder we have not been re-granted access to would only throw.
-    if (isStatic() && (!projectFs.getActiveHandle() || needsFolderPermission)) return;
+    if (isStatic() && (!projectFs.getActiveHandle() || needsFolderPermission)) return false;
+    if (!force && !baselineRef.current.loaded) return false;
+    if (!force && saveBlockRef.current) return false;
+
     try {
-      await apiFetch(`/api/state`, {
+      const res = await apiFetch(`/api/state`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: saveHeaders(baselineRef.current, { force }),
         body: JSON.stringify(buildStatePayload(updatedScenes, extra))
       });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok) {
+        baselineRef.current = adoptBaseline(baselineRef.current, res, data);
+        lastRevisionSeenRef.current = baselineRef.current.revision;
+        if (saveBlockRef.current) setSaveBlock(null);
+        return true;
+      }
+
+      console.warn('[state] save refused:', data);
+      setSaveBlock({
+        reason: data.reason || 'refused',
+        message: data.error || `Save refused (${res.status}).`,
+        detail: data
+      });
+      return false;
     } catch (err) {
       console.error('Error saving state:', err);
+      return false;
     }
   };
+
+  /** The banner's "overwrite" button: write what is on screen, on purpose. */
+  const forceSaveProjectState = async () => {
+    const ok = await saveProjectState(scenes, {}, { force: true });
+    showToast(ok
+      ? 'Overwrote the project file. The previous version is in checkpoints/auto-backups.'
+      : 'The forced save still failed — check the server log.', ok ? 'success' : 'error');
+  };
+
+  /** The banner's "reload" button: throw this window away and take the file. */
+  const reloadProjectState = async () => {
+    skipHistoryRef.current = true;
+    const ok = await fetchProjectState();
+    await fetchProject();
+    if (ok) showToast('Reloaded the project from disk.', 'success');
+  };
+
+  /**
+   * Notice a project that moved on while this window was in the background.
+   *
+   * The stale-tab case never reaches the server on its own: the tab sits there
+   * holding an old state and only finds out when it writes — by which point it
+   * has written. A cheap revision check on focus turns that into a banner
+   * before the next keystroke rather than after it.
+   */
+  useEffect(() => {
+    if (isStatic()) return undefined;
+    const check = async () => {
+      if (document.hidden || !baselineRef.current.loaded) return;
+      try {
+        const res = await apiFetch('/api/state/revision');
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          if (data.reason) setSaveBlock({ reason: data.reason, message: data.error || '', detail: data });
+          return;
+        }
+        const data = await res.json();
+        if (data.revision && data.revision !== baselineRef.current.revision) {
+          setSaveBlock({
+            reason: data.target !== baselineRef.current.target ? 'target-changed' : 'stale',
+            message: 'The project file changed on disk.',
+            detail: { current: data.target, revision: data.revision }
+          });
+        }
+      } catch { /* server down; the save path will report it */ }
+    };
+    window.addEventListener('focus', check);
+    document.addEventListener('visibilitychange', check);
+    return () => {
+      window.removeEventListener('focus', check);
+      document.removeEventListener('visibilitychange', check);
+    };
+  }, []);
 
   // Autosave is debounced: typing in a shot textarea used to fire one POST per
   // keystroke (and a second from the effect below), which made the timeline
@@ -814,7 +946,11 @@ export default function App() {
   const saveStateRef = useRef();
   saveStateRef.current = () => { saveProjectState(); recordHistory(); };
   useEffect(() => {
+    // Two gates, not one. An empty scene list has nothing to write; a project
+    // we have never successfully read has something to write and no business
+    // writing it — that state is the built-in placeholder, not this film.
     if (scenes.length === 0) return undefined;
+    if (!baselineRef.current.loaded) return undefined;
     const timer = setTimeout(() => saveStateRef.current(), 600);
     return () => clearTimeout(timer);
   }, [scenes, imageGallery, videoGallery, referenceImages, refAssignments, assetLibrary, promptSnippets, activeLlm, llmModel, activeImageGenerator, imageModel, imageResolution, activeVideoGenerator, videoResolution, videoModel, videoDuration, batchConcurrency, attachTagsForImages, attachTagsForVideos, atlasSafetyChecker, customModelCaps, assetTypeModels, autoAttachRefs, promptSettings, concatenatedVideo, edit, dreamSettings]);
@@ -1617,6 +1753,38 @@ export default function App() {
     return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta, audioRefs);
   };
 
+  /**
+   * Where a generation's output should be filed.
+   *
+   * A descriptor describes rather than points: it carries the scene and shot
+   * names rather than an id to look up. The host resolving an id would be
+   * reading whatever the last autosave wrote, so a shot generated seconds after
+   * it was created would resolve to nothing and the file would land in the bin.
+   *
+   * Nothing here reaches a folder name unslugified — see shared/assetPaths.js.
+   */
+  const shotDestination = (shotId, media) => {
+    const list = scenesRef.current?.length ? scenesRef.current : scenes;
+    for (let sceneIndex = 0; sceneIndex < list.length; sceneIndex += 1) {
+      const shots = list[sceneIndex]?.shots || [];
+      const shotIndex = shots.findIndex(shot => shot.id === shotId);
+      if (shotIndex < 0) continue;
+      const scene = list[sceneIndex];
+      return {
+        kind: 'shot',
+        media,
+        scene: { index: sceneIndex, name: scene.name, number: scene.number },
+        shot: { index: shotIndex, name: shots[shotIndex].name }
+      };
+    }
+    return null; // unknown shot: the host files it in the bin rather than failing
+  };
+
+  /** The same idea for an asset's own generations. */
+  const assetDestination = (asset) => (
+    asset ? { kind: 'asset', asset: { type: asset.type, tag: asset.tag, name: asset.name } } : null
+  );
+
   const runAsyncImageJob = async (jobId, shotId, promptText, inputImagePaths = [], recipe = {}, meta = null) => {
     const { model, resolution: resOption } = recipe;
     try {
@@ -1631,7 +1799,8 @@ export default function App() {
           prompt: promptText,
           resolution: resOption,
           inputImagePaths,
-          safetyChecker: atlasSafetyChecker
+          safetyChecker: atlasSafetyChecker,
+          destination: shotDestination(shotId, 'image')
         })
       });
 
@@ -1738,7 +1907,8 @@ export default function App() {
           imageUrls: imageUrlsToSend,
           audioUrls: audioInputs,
           resolution: resOption,
-          duration: duration
+          duration: duration,
+          destination: shotDestination(shotId, 'video')
         })
       });
 
@@ -1825,6 +1995,93 @@ export default function App() {
     setBatchJobs(batchJobs.filter(j => j.status === 'running'));
     showToast('Cleared completed and failed batch history.');
   };
+
+  /**
+   * Put a local ffmpeg run in the same queue the generations use.
+   *
+   * A compile or a render is the longest thing this app does and, until now, the
+   * only thing it did with no entry anywhere: a spinner on the button that
+   * vanished on reload, so a run that died while you were elsewhere looked
+   * exactly like one that never started. It is a job like any other — it takes
+   * minutes, it can fail, and the answer should stay put.
+   *
+   * Returns the id to hand to `finishJob`.
+   */
+  const startJob = ({ type, shotId = null, shotName, prompt, model = 'ffmpeg (local)' }) => {
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    setBatchJobs(prev => [{
+      id: jobId,
+      shotId,
+      shotName,
+      type,
+      model,
+      prompt,
+      status: 'running',
+      createdAt: new Date().toISOString(),
+      error: null
+    }, ...prev]);
+    return jobId;
+  };
+
+  const finishJob = (jobId, patch) => {
+    setBatchJobs(prev => prev.map(job => (job.id === jobId ? { ...job, ...patch } : job)));
+  };
+
+  /**
+   * Follow a timeline render to the end from the queue rather than the editor.
+   *
+   * The encoder outlives the view that started it: leaving the editor for the
+   * shot list does not stop ffmpeg, so the thing that watches it cannot be a
+   * panel inside the editor. The queue holds the encoder's own job id and polls
+   * the backend directly, which is also what makes the render visible from the
+   * side of the app where you spend the wait.
+   */
+  const renderProgressRef = useRef({});
+  const trackedRenders = batchJobs
+    .filter(job => job.type === 'render' && job.status === 'running' && job.renderJobId)
+    .map(job => `${job.id}|${job.renderJobId}`)
+    .join(',');
+
+  useEffect(() => {
+    if (!trackedRenders) return undefined;
+    const tracked = trackedRenders.split(',').map(entry => {
+      const [id, renderJobId] = entry.split('|');
+      return { id, renderJobId };
+    });
+    let cancelled = false;
+
+    const timer = setInterval(async () => {
+      for (const job of tracked) {
+        try {
+          const res = await apiFetch(`/api/render/${job.renderJobId}`);
+          const data = await res.json();
+          if (cancelled) return;
+          if (!res.ok) throw new Error(data.error || 'the backend lost track of this render');
+
+          if (data.state === 'done') {
+            delete renderProgressRef.current[job.id];
+            finishJob(job.id, { status: 'completed', progress: 1, outputPath: data.filePath });
+          } else if (data.state === 'error') {
+            delete renderProgressRef.current[job.id];
+            finishJob(job.id, { status: 'failed', error: data.error });
+          } else {
+            // Whole steps only. The editor's own bar is the place for 2Hz; every
+            // update here re-renders the app around it.
+            const percent = Math.round((data.progress || 0) * 100);
+            if (percent >= (renderProgressRef.current[job.id] ?? 0)) {
+              renderProgressRef.current[job.id] = percent + 5;
+              finishJob(job.id, { progress: data.progress || 0 });
+            }
+          }
+        } catch (error) {
+          if (!cancelled) finishJob(job.id, { status: 'failed', error: error.message });
+        }
+      }
+    }, 1000);
+
+    return () => { cancelled = true; clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackedRenders]);
 
   // --- BATCH GENERATION -----------------------------------------------------
 
@@ -2587,7 +2844,8 @@ export default function App() {
           prompt: composed.prompt,
           resolution,
           inputImagePaths: composed.inputImagePaths,
-          safetyChecker: atlasSafetyChecker
+          safetyChecker: atlasSafetyChecker,
+          destination: assetDestination(asset)
         })
       });
       const data = await res.json();
@@ -2839,6 +3097,7 @@ export default function App() {
       type: assetEditor.type || 'character',
       name: (assetEditor.name || '').trim() || tag,
       description: (assetEditor.description || '').trim(),
+      shotDescription: (assetEditor.shotDescription || '').trim(),
       images,
       primaryImage: assetEditor.primaryImage || images[0] || null,
       inputImages: assetInputImages(assetEditor).filter(p => images.includes(p)),
@@ -2851,10 +3110,15 @@ export default function App() {
     // Bump updatedAt only when a shot-visible field moved; otherwise carry the
     // old stamp so saving cosmetic settings never dirties every shot.
     const previous = assetLibrary.find(a => a.id === record.id) || null;
+    // The comparison is on what a shot actually *sees*, not on the raw fields:
+    // rewriting the full description to get better reference art is not a
+    // reason to flag every shot, so long as the in-shot line is unchanged. It
+    // still catches an edit to the full one when there is no short one, because
+    // then the fallback means shots really did change.
     const shotVisibleChange = !previous
       || previous.tag !== record.tag
       || (previous.name || '') !== record.name
-      || (previous.description || '') !== record.description
+      || assetShotDescription(previous) !== assetShotDescription(record)
       || assetPrimaryImage(previous) !== assetPrimaryImage(record);
     record.updatedAt = shotVisibleChange ? new Date().toISOString() : (previous?.updatedAt || null);
 
@@ -3074,6 +3338,9 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Could not open project');
 
+      baselineRef.current = adoptBaseline(baselineRef.current, res, data);
+      lastRevisionSeenRef.current = baselineRef.current.revision;
+      setSaveBlock(null);
       applyLoadedState(data.state || {});
       await fetchProject();
       setActiveOverlay(null);
@@ -3179,6 +3446,147 @@ export default function App() {
       return swap(node);
     };
     return walk(state);
+  };
+
+  // --- CLEAN FILES ----------------------------------------------------------
+  //
+  // Two round trips, deliberately. The first plans and reports; nothing on disk
+  // moves until the count has been shown and agreed to. The second carries it
+  // out and hands back what *actually* moved — the mapping is built from the
+  // renames that succeeded, never from the plan, so a file that could not be
+  // moved keeps a path that still points at it.
+
+  const organizeRequest = (apply) => apiFetch('/api/assets/organize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ state: buildStatePayload(), apply })
+  });
+
+  const handlePlanCleanFiles = async () => {
+    setCleanFiles({ status: 'planning' });
+    try {
+      // Save first. Planning against a shot list the disk has not seen yet
+      // would file this session's generations as strays.
+      await flushSave();
+      const res = await organizeRequest(false);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not read the project folder.');
+      setCleanFiles({ status: 'preview', ...data });
+    } catch (err) {
+      setCleanFiles(null);
+      showToast(`Clean Files failed: ${err.message}`, 'error');
+    }
+  };
+
+  const handleApplyCleanFiles = async () => {
+    setCleanFiles(prev => ({ ...prev, status: 'working' }));
+    try {
+      const res = await organizeRequest(true);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not move the files.');
+
+      const mapping = new Map(data.mapping || []);
+      const remapped = remapStateAssetPaths(buildStatePayload(), mapping);
+      applyLoadedState(remapped, { resetHistory: false });
+      if (isStatic()) projectFs.clearAssetUrlCache();
+      // `extra` spreads last inside buildStatePayload, so the remapped state
+      // wins over the hook values React has not re-rendered with yet.
+      await saveProjectState(remapped.scenes, remapped, { force: true });
+
+      setCleanFiles(null);
+      const failures = (data.failed || []).length;
+      showToast(
+        `Filed ${data.moved} file${data.moved === 1 ? '' : 's'}` +
+        (failures ? ` — ${failures} could not be moved and were left where they are.` : '.'),
+        failures ? 'warning' : 'success'
+      );
+    } catch (err) {
+      setCleanFiles(null);
+      showToast(`Clean Files failed: ${err.message}`, 'error');
+    }
+  };
+
+  /**
+   * What Clean Files is about to do, before it does any of it.
+   *
+   * The preview is capped server-side — a first run on a real project is
+   * thousands of rows, and nobody reads row eight hundred. The counts are the
+   * part that matters; the sample is there to make the naming concrete.
+   */
+  const renderCleanFilesDialog = () => {
+    if (!cleanFiles || cleanFiles.status === 'planning') return null;
+    const { summary = {}, preview = [], moves = 0, status } = cleanFiles;
+    const busy = status === 'working';
+
+    return (
+      <div className="modal-overlay" onClick={() => (busy ? null : setCleanFiles(null))}>
+        <div className="modal-window" style={{ maxWidth: '720px' }} onClick={(e) => e.stopPropagation()}>
+          <div className="modal-header">
+            <h2 style={{ fontSize: '1.25rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <FolderOpen size={20} /> Clean Files
+            </h2>
+            {!busy && (
+              <button className="btn btn-secondary" onClick={() => setCleanFiles(null)}><X size={16} /></button>
+            )}
+          </div>
+
+          <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            {moves === 0 ? (
+              <p style={{ margin: 0, fontSize: '0.85rem' }}>
+                Everything is already where it belongs — {summary.total || 0} file
+                {summary.total === 1 ? '' : 's'} checked, nothing to move.
+              </p>
+            ) : (
+              <>
+                <p style={{ margin: 0, fontSize: '0.85rem', lineHeight: 1.6 }}>
+                  <strong>{moves}</strong> of {summary.total} file{summary.total === 1 ? '' : 's'} will move.
+                  {summary.binned > 0 && (
+                    <> <strong>{summary.binned}</strong> nothing in the project points at will go to{' '}
+                    <code>assets/bin/</code> rather than being deleted.</>
+                  )}
+                  {summary.alreadyPlaced > 0 && <> {summary.alreadyPlaced} are already in place.</>}
+                </p>
+                <p style={{ margin: 0, fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                  Files are moved, never copied or deleted, and a forwarding record is kept — so
+                  checkpoints and auto-backups taken before this still open with their images intact.
+                </p>
+
+                <div style={{ maxHeight: '260px', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: '8px' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem', fontFamily: 'monospace' }}>
+                    <tbody>
+                      {preview.map(move => (
+                        <tr key={move.from} style={{ borderBottom: '1px solid var(--border)' }}>
+                          <td style={{ padding: '6px 10px', color: 'var(--text-dim)', whiteSpace: 'nowrap' }}>{move.from}</td>
+                          <td style={{ padding: '6px 4px', color: 'var(--text-dim)' }}>→</td>
+                          <td style={{ padding: '6px 10px', wordBreak: 'break-all' }}>{move.to}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {moves > preview.length && (
+                  <span style={{ fontSize: '0.74rem', color: 'var(--text-dim)' }}>
+                    …and {moves - preview.length} more.
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="modal-footer">
+            <button className="btn btn-secondary" onClick={() => setCleanFiles(null)} disabled={busy}>
+              {moves === 0 ? 'Close' : 'Cancel'}
+            </button>
+            {moves > 0 && (
+              <button className="btn btn-primary" onClick={handleApplyCleanFiles} disabled={busy}>
+                {busy ? <RefreshCw className="spinner" size={14} /> : <FolderOpen size={14} />}
+                {busy ? ' Moving…' : ` Move ${moves} file${moves === 1 ? '' : 's'}`}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
   };
 
   const handleCreateProject = async () => {
@@ -4015,8 +4423,12 @@ export default function App() {
     const parts = [];
     if (data.videoCount) parts.push(`${data.videoCount} video${data.videoCount === 1 ? '' : 's'}`);
     if (data.stillCount) parts.push(`${data.stillCount} still${data.stillCount === 1 ? '' : 's'} held as placeholders`);
+    const sound = data.audioCount ? ` ${data.audioCount} shot(s) carried sound.` : ' Nothing had sound to carry.';
+    // A shot whose audio file has gone missing compiles silent, which is easy to
+    // mistake for "there was never any sound there".
+    const lost = data.missingAudio?.length ? ` Audio missing for: ${data.missingAudio.slice(0, 3).join(', ')}.` : '';
     const skipped = data.skipped?.length ? ` ${data.skipped.length} shot(s) skipped (no media).` : '';
-    return `Compiled ${parts.join(' + ') || 'timeline'}.${skipped}`;
+    return `Compiled ${parts.join(' + ') || 'timeline'}.${sound}${lost}${skipped}`;
   };
 
   /**
@@ -4158,15 +4570,33 @@ export default function App() {
   };
 
   // --- FFMEG COMPILATION ---
+
+  /**
+   * What a shot contributes to a compile.
+   *
+   * Shots with no video contribute their still, so a partly generated edit still
+   * plays end to end as an animatic. Its audio file goes along with it: the
+   * compile mixes the clip's own soundtrack and the shot's audio together, the
+   * same way the editor does, so a narrated animatic is watchable without going
+   * through the timeline first.
+   */
+  const compileItems = (shotList) => (shotList || []).map(sh => ({
+    video: sh.selectedVideo || null,
+    image: sh.selectedImage || null,
+    audio: sh.lipSyncAudio || null,
+    duration: Number(sh.videoDuration || videoDuration) || 5,
+    name: sh.name
+  })).filter(entry => entry.video || entry.image);
+
+  /** One line for the queue saying what this compile is made of. */
+  const compileSummary = (timeline, label) => {
+    const withAudio = timeline.filter(entry => entry.audio).length;
+    return `Compile ${label} — ${timeline.length} shot${timeline.length === 1 ? '' : 's'}`
+      + (withAudio ? `, ${withAudio} with its own audio` : '');
+  };
+
   const handleStitchCompilation = async () => {
-    // Shots with no video contribute their still, so a partly generated edit
-    // still plays end to end as an animatic.
-    const timeline = scenes.flatMap(s => (s.shots || []).map(sh => ({
-      video: sh.selectedVideo || null,
-      image: sh.selectedImage || null,
-      duration: Number(sh.videoDuration || videoDuration) || 5,
-      name: sh.name
-    }))).filter(entry => entry.video || entry.image);
+    const timeline = compileItems(scenes.flatMap(s => s.shots || []));
 
     if (timeline.length === 0) {
       showToast('No shot has a video or an image to compile.', 'warning');
@@ -4174,6 +4604,11 @@ export default function App() {
     }
 
     setLoadingStates(prev => ({ ...prev, compilation: true }));
+    const jobId = startJob({
+      type: 'compile',
+      shotName: 'Full film',
+      prompt: compileSummary(timeline, 'the whole film')
+    });
     try {
       const res = await apiFetch(`/api/concatenate`, {
         method: 'POST',
@@ -4186,9 +4621,11 @@ export default function App() {
       window.open(await resolveAssetUrl(data.filePath), '_blank');
       setConcatenatedVideo(data.filePath);
       saveProjectState(scenes, { concatenatedVideo: data.filePath });
+      finishJob(jobId, { status: 'completed', outputPath: data.filePath });
       showToast(describeCompile(data), 'success');
     } catch (err) {
       console.error(err);
+      finishJob(jobId, { status: 'failed', error: err.message });
       showToast(`Compilation failed: ${err.message}`, 'error');
     } finally {
       setLoadingStates(prev => ({ ...prev, compilation: false }));
@@ -4199,12 +4636,7 @@ export default function App() {
     const targetScene = scenes.find(s => s.id === sceneId);
     if (!targetScene) return;
 
-    const timeline = (targetScene.shots || []).map(sh => ({
-      video: sh.selectedVideo || null,
-      image: sh.selectedImage || null,
-      duration: Number(sh.videoDuration || videoDuration) || 5,
-      name: sh.name
-    })).filter(entry => entry.video || entry.image);
+    const timeline = compileItems(targetScene.shots);
 
     if (timeline.length === 0) {
       showToast('No shot in this scene has a video or an image.', 'warning');
@@ -4212,6 +4644,11 @@ export default function App() {
     }
 
     setLoadingStates(prev => ({ ...prev, compilation: true }));
+    const jobId = startJob({
+      type: 'compile',
+      shotName: targetScene.name || 'Scene',
+      prompt: compileSummary(timeline, targetScene.name || 'this scene')
+    });
     try {
       const res = await apiFetch(`/api/concatenate`, {
         method: 'POST',
@@ -4222,7 +4659,7 @@ export default function App() {
       if (!res.ok) throw new Error(data.error || 'FFmpeg failed');
 
       window.open(await resolveAssetUrl(data.filePath), '_blank');
-      
+
       const updated = scenes.map(s => {
         if (s.id === sceneId) {
           return { ...s, sceneConcatenatedVideo: data.filePath };
@@ -4231,9 +4668,11 @@ export default function App() {
       });
       setScenes(updated);
       saveProjectState(updated);
+      finishJob(jobId, { status: 'completed', outputPath: data.filePath });
       showToast(describeCompile(data), 'success');
     } catch (err) {
       console.error(err);
+      finishJob(jobId, { status: 'failed', error: err.message });
       showToast(`Scene compilation failed: ${err.message}`, 'error');
     } finally {
       setLoadingStates(prev => ({ ...prev, compilation: false }));
@@ -4423,6 +4862,11 @@ export default function App() {
   const handleRenderWatermark = async () => {
     if (!concatenatedVideo || !watermarkImage) return;
     setLoadingStates(prev => ({ ...prev, watermark: true }));
+    const jobId = startJob({
+      type: 'watermark',
+      shotName: 'Master',
+      prompt: `Stamp ${pathBaseName(watermarkImage)} onto ${pathBaseName(concatenatedVideo)} (${watermarkMotion})`
+    });
     try {
       const res = await apiFetch(`/api/watermark`, {
         method: 'POST',
@@ -4440,9 +4884,11 @@ export default function App() {
         createdAt: new Date().toISOString()
       }, ...prev]);
       setConcatenatedVideo(data.filePath);
+      finishJob(jobId, { status: 'completed', outputPath: data.filePath });
       showToast('Watermarked. The clean master is still in your project folder.', 'success');
     } catch (err) {
       console.error(err);
+      finishJob(jobId, { status: 'failed', error: err.message });
       showToast(`Watermark failed: ${err.message}`, 'error');
     } finally {
       setLoadingStates(prev => ({ ...prev, watermark: false }));
@@ -4464,18 +4910,13 @@ export default function App() {
     // itself — so a run in progress and a run that failed while you looked away
     // were indistinguishable from nothing having happened. It gets a job entry
     // for the same reason generations do: somewhere the answer stays put.
-    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    setBatchJobs(prev => [{
-      id: jobId,
+    const jobId = startJob({
+      type: 'lipsync',
       shotId,
       shotName: shot.name || 'Shot',
-      type: 'lipsync',
       model: 'fal-ai/sync-lipsync',
-      prompt: `Lipsync ${pathBaseName(shot.selectedVideo)} to ${pathBaseName(shot.lipSyncAudio)}`,
-      status: 'running',
-      createdAt: new Date().toISOString(),
-      error: null
-    }, ...prev]);
+      prompt: `Lipsync ${pathBaseName(shot.selectedVideo)} to ${pathBaseName(shot.lipSyncAudio)}`
+    });
     showToast('Lip-sync started — track it in the Batch Manager.', 'info');
 
     try {
@@ -4523,13 +4964,11 @@ export default function App() {
         createdAt: new Date().toISOString()
       }, ...prev]);
 
-      setBatchJobs(prev => prev.map(j => (
-        j.id === jobId ? { ...j, status: 'completed', outputPath: data.filePath } : j
-      )));
+      finishJob(jobId, { status: 'completed', outputPath: data.filePath });
       showToast('Lip-sync complete! Output added and selected.', 'success');
     } catch (err) {
       console.error(err);
-      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error: err.message } : j)));
+      finishJob(jobId, { status: 'failed', error: err.message });
       showToast(`Lip sync failed: ${err.message}`, 'error');
     } finally {
       setLoadingStates(prev => ({ ...prev, [key]: false }));
@@ -5161,13 +5600,30 @@ export default function App() {
         setEdit={setEdit}
         videoDuration={videoDuration}
         onToast={showToast}
+        onJobStart={startJob}
+        onJobUpdate={finishJob}
         onClose={() => setView('create')}
+        banner={(
+          <SaveGuardBanner
+            block={saveBlock}
+            onReload={reloadProjectState}
+            onForce={forceSaveProjectState}
+          />
+        )}
       />
     );
   }
 
   return (
     <div className="app-container">
+      {/* Autosave has stopped. Above everything, because everything below it is
+          no longer being written to disk. */}
+      <SaveGuardBanner
+        block={saveBlock}
+        onReload={reloadProjectState}
+        onForce={forceSaveProjectState}
+      />
+
       {/* Toast Warning/Notifications */}
       {toast && (
         <div className="toast">
@@ -5240,6 +5696,16 @@ export default function App() {
               </MenuItem>
               <MenuItem icon={Clock} onClick={() => setActiveOverlay('projects')}>
                 Checkpoints…
+              </MenuItem>
+              <MenuItem
+                icon={FolderOpen}
+                disabled={Boolean(cleanFiles) || project.needsFolder}
+                onClick={handlePlanCleanFiles}
+                title={project.needsFolder
+                  ? 'Choose a project folder first'
+                  : 'File every generation under its shot, asset or reference — shows what will move before anything does'}
+              >
+                Clean files…
               </MenuItem>
 
               <MenuSeparator />
@@ -6599,7 +7065,7 @@ export default function App() {
                       {tagMarks.length > 0 && (
                         <span className="prompt-legend">
                           <span className="prompt-legend-swatch" style={{ background: 'var(--mark-tag)' }} />
-                          {preview.usesRefTags ? 'tag → @imageN' : 'tag → description'}
+                          {preview.usesRefTags ? `tag → ${preview.refTagSample}` : 'tag → description'}
                         </span>
                       )}
                       {/* Turned off pre/post is offered back rather than lost. */}
@@ -7260,6 +7726,33 @@ export default function App() {
                 </button>
               </div>
 
+              {/* Clean Files — the media tree, put back in order */}
+              <div className="glass-panel" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <div>
+                  <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Clean Files</span>
+                  <p style={{ margin: '4px 0 0', fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                    Files every generation into <code>assets/library/</code>, <code>assets/shots/</code> and{' '}
+                    <code>assets/reference/</code>, named after the character, scene and shot they belong to.
+                    Anything the project no longer points at goes to <code>assets/bin/</code>.
+                    New generations are filed as they arrive, so this is here for imports, older
+                    projects, and shots you have since renamed.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={handlePlanCleanFiles}
+                    disabled={Boolean(cleanFiles) || project.needsFolder}
+                    title={project.needsFolder ? 'Choose a project folder first' : 'Look at the project folder and report what would move'}
+                  >
+                    {cleanFiles?.status === 'planning' ? <RefreshCw className="spinner" size={14} /> : <FolderOpen size={14} />} Clean Files…
+                  </button>
+                  <span style={{ fontSize: '0.74rem', color: 'var(--text-dim)' }}>
+                    Shows you what will move before anything does.
+                  </span>
+                </div>
+              </div>
+
               {/* Checkpoints — versions of this project, without a new project */}
               <div className="glass-panel" style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div>
@@ -7693,16 +8186,43 @@ export default function App() {
               </div>
 
               <div className="form-group">
-                <label className="form-label">Description (substituted into the prompt)</label>
+                <label className="form-label">Full description (for generating this asset's own art)</label>
                 <textarea
                   className="input-field"
                   style={{ minHeight: '80px' }}
                   value={assetEditor.description}
                   onChange={(e) => setAssetEditor({ ...assetEditor, description: e.target.value })}
-                  placeholder="grizzled mechanic in his 60s, oil-stained canvas overalls, close-cropped grey beard"
+                  placeholder="grizzled mechanic in his 60s, oil-stained canvas overalls, close-cropped grey beard, deep crow's feet, a wedding ring worn thin"
                 />
                 <span className="input-help" style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>
-                  &lt;{assetEditor.tag || 'Tag'}&gt; becomes: "{[assetEditor.name, assetEditor.description].filter(Boolean).length ? `${assetEditor.name || assetEditor.tag}${assetEditor.description ? ` (${assetEditor.description})` : ''}` : '…'}"
+                  Every detail worth having. This builds the reference art below and is not
+                  sent to shots unless the short one is empty.
+                </span>
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">In-shot description (substituted for the tag)</label>
+                <textarea
+                  className="input-field"
+                  style={{ minHeight: '56px' }}
+                  value={assetEditor.shotDescription || ''}
+                  onChange={(e) => setAssetEditor({ ...assetEditor, shotDescription: e.target.value })}
+                  placeholder="grizzled mechanic, grey beard, oil-stained overalls"
+                />
+                <span className="input-help" style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>
+                  {(() => {
+                    const short = (assetEditor.shotDescription || '').trim();
+                    const used = short || (assetEditor.description || '').trim();
+                    const rendered = [assetEditor.name || assetEditor.tag, used].filter(Boolean).length
+                      ? `${assetEditor.name || assetEditor.tag}${used ? ` (${used})` : ''}`
+                      : '…';
+                    return (
+                      <>
+                        &lt;{assetEditor.tag || 'Tag'}&gt; becomes: "{rendered}"
+                        {!short && ' — falling back to the full description.'}
+                      </>
+                    );
+                  })()}
                 </span>
               </div>
 
@@ -7891,9 +8411,10 @@ export default function App() {
                       </span>
                     </label>
                     <span className="input-help" style={{ fontSize: '0.75rem', color: 'var(--text-dim)', display: 'block', marginBottom: '8px' }}>
-                      Click one to make it the primary — that is the single image sent with &lt;{assetEditor.tag || 'Tag'}&gt; in other prompts.
-                      Tick the checkboxes to send several of them <em>into</em> this asset's own generation, up to what the model takes.
-                      Double-click to view large.
+                      Tick the ones that represent this asset. They are what gets sent — both <em>into</em> this
+                      asset's own generation and along with &lt;{assetEditor.tag || 'Tag'}&gt; wherever it is tagged,
+                      up to what each model takes. Tick nothing and only the primary travels.
+                      Click an image to make it the primary; it leads the order. Double-click to view large.
                     </span>
 
                     {/* The ticks used to disappear entirely on a model with no
@@ -9149,8 +9670,13 @@ export default function App() {
                           {job.status === 'running' ? 'In Progress' : job.status}
                         </span>
                         <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
-                          {job.type === 'image' ? 'Image Prompt' : 'Video Prompt'}
+                          {JOB_TYPE_LABELS[job.type] || 'Video Prompt'}
                         </span>
+                        {typeof job.progress === 'number' && job.status === 'running' && (
+                          <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                            {Math.round(job.progress * 100)}%
+                          </span>
+                        )}
                       </div>
                       <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)', display: 'block', maxWidth: '450px', whiteSpace: 'nowrap', overflow: 'hidden', textSlice: 'ellipsis' }}>
                         "{job.prompt}"
@@ -9378,6 +9904,8 @@ export default function App() {
           </div>
         );
       })()}
+
+      {renderCleanFilesDialog()}
     </div>
   );
 }

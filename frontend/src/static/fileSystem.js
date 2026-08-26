@@ -293,8 +293,106 @@ export async function deleteCheckpoint(id) {
 }
 
 // --- assets ---
+//
+// The media root is a tree now, not a folder — see shared/assetPaths.js for the
+// shape and why. Everything below that used to call `getFileHandle(name)` on
+// one directory handle has to walk instead, because 'assets/shots/01-open/…' is
+// four handles deep.
+
+import {
+  planAssetLayout, destinationDir, destinationStem, nextFileName, BIN_DIR, MEDIA_ROOT
+} from '../shared/assetPaths.js';
 
 const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
+const LEDGER_FILE = '.organize-ledger.json';
+
+/** 'assets/a/b/c.png' -> ['a','b','c.png'], with the media root stripped. */
+function assetSegments(assetPath) {
+  return String(assetPath || '')
+    .replace(/\\/g, '/')
+    .replace(new RegExp('^' + MEDIA_ROOT + '/'), '')
+    .split('/')
+    .filter(segment => segment && segment !== '.');
+}
+
+/** The directory handle for a project-relative folder, walking every level. */
+async function walkToDir(assetDirPath, create = false) {
+  let dir = await getAssetsDir(create);
+  for (const segment of assetSegments(assetDirPath)) {
+    dir = await dir.getDirectoryHandle(segment, { create });
+  }
+  return dir;
+}
+
+/** The file handle for a project-relative path, or a throw if it is not there. */
+async function walkToFile(assetPath, create = false) {
+  const segments = assetSegments(assetPath);
+  const name = segments.pop();
+  let dir = await getAssetsDir(create);
+  for (const segment of segments) {
+    dir = await dir.getDirectoryHandle(segment, { create });
+  }
+  return dir.getFileHandle(name, { create });
+}
+
+/** Every file under the media root, as project-relative paths. */
+export async function listMediaFiles() {
+  const found = [];
+  const walk = async (dir, prefix) => {
+    for await (const [name, handle] of dir.entries()) {
+      if (name === LEDGER_FILE) continue;
+      const relative = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === 'directory') await walk(handle, relative);
+      else found.push(`${MEDIA_ROOT}/${relative}`);
+    }
+  };
+  try {
+    await walk(await getAssetsDir(false), '');
+  } catch (error) {
+    if (error.name !== 'NotFoundError') throw error;
+  }
+  return found;
+}
+
+// --- the forwarding ledger -------------------------------------------------
+//
+// The browser twin of the server's. Same file, same job: a path recorded before
+// a Clean Files run still has to find its file, and the run renames as well as
+// moves so there is no clue left in the file itself.
+
+async function readLedger() {
+  try {
+    const handle = await (await getAssetsDir(false)).getFileHandle(LEDGER_FILE);
+    const parsed = JSON.parse(await (await handle.getFile()).text());
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {}; // absent or corrupt is the same thing here: no forwarding
+  }
+}
+
+async function writeLedger(ledger) {
+  try {
+    const handle = await (await getAssetsDir(true)).getFileHandle(LEDGER_FILE, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify(ledger, null, 2));
+    await writable.close();
+  } catch (error) {
+    console.error('Could not write the move ledger:', error);
+  }
+}
+
+async function appendLedger(moves) {
+  if (moves.length === 0) return;
+  const ledger = await readLedger();
+  const destinations = new Map(moves.map(move => [move.from, move.to]));
+  Object.keys(ledger).forEach(from => {
+    const movedOn = destinations.get(ledger[from]);
+    if (movedOn) ledger[from] = movedOn;
+  });
+  moves.forEach(move => { ledger[move.from] = move.to; });
+  Object.keys(ledger).forEach(from => { if (ledger[from] === from) delete ledger[from]; });
+  await writeLedger(ledger);
+}
 
 function extensionFor(mimeType, fallback = '.png') {
   if (!mimeType) return fallback;
@@ -309,32 +407,94 @@ function extensionFor(mimeType, fallback = '.png') {
   return fallback;
 }
 
-/** Write a blob into assets/ and return its project-relative path. */
-export async function writeAsset(blob, prefix = 'file', explicitExt = null) {
-  const dir = await getAssetsDir();
+/** The bare filenames already in a project-relative folder. */
+async function siblingNames(assetDirPath) {
+  const names = [];
+  try {
+    const dir = await walkToDir(assetDirPath, false);
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind === 'file') names.push(name);
+    }
+  } catch { /* no folder yet means no siblings */ }
+  return names;
+}
+
+/**
+ * Where a new file goes, and what it is called.
+ *
+ * The browser twin of the server's `resolveWritePath`. Same rule about
+ * failure: a destination that will not resolve lands in the bin rather than
+ * throwing away a generation that has already been paid for.
+ */
+async function resolveWritePath(destination, prefix, ext, project) {
+  const timestamped = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}${ext}`;
+  if (!destination) return { dir: MEDIA_ROOT, name: timestamped };
+
+  try {
+    const state = project || (await readProjectState()) || {};
+    const dir = destinationDir(destination, state);
+    const naming = destinationStem(destination, state);
+    if (!naming || dir === BIN_DIR) return { dir: BIN_DIR, name: timestamped };
+    return { dir, name: nextFileName(naming.stem, naming.versioned, ext, await siblingNames(dir)) };
+  } catch (error) {
+    console.error('Could not resolve a destination folder, writing flat:', error);
+    return { dir: MEDIA_ROOT, name: timestamped };
+  }
+}
+
+/** Write a blob into the media tree and return its project-relative path. */
+export async function writeAsset(blob, prefix = 'file', explicitExt = null, destination = null) {
   const ext = explicitExt || extensionFor(blob.type);
-  const filename = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}${ext}`;
-  const handle = await dir.getFileHandle(filename, { create: true });
+  const { dir, name } = await resolveWritePath(destination, prefix, ext);
+  const relativePath = dir === MEDIA_ROOT ? `${MEDIA_ROOT}/${name}` : `${dir}/${name}`;
+  const handle = await walkToFile(relativePath, true);
   const writable = await handle.createWritable();
   await writable.write(blob);
   await writable.close();
-  return `assets/${filename}`;
+  return relativePath;
 }
 
 /** Copy an existing File (user upload) into the project. */
-export async function importFile(file, prefix = 'ref') {
+export async function importFile(file, prefix = 'ref', destination = null) {
   const ext = file.name.includes('.') ? `.${file.name.split('.').pop()}` : extensionFor(file.type);
-  return writeAsset(file, prefix, ext);
+  return writeAsset(file, prefix, ext, destination);
 }
 
 function assetFilename(assetPath) {
   return String(assetPath).replace(/\\/g, '/').replace(/^assets\//, '');
 }
 
+/**
+ * The path a recorded path actually lives at today.
+ *
+ * Tries where it says it is, then the forwarding ledger, and gives up rather
+ * than guessing. The browser has no cheap basename index, so unlike the server
+ * there is no third fallback — the ledger covers everything Clean Files did.
+ */
+export async function resolveRecordedPath(assetPath) {
+  try {
+    await walkToFile(assetPath, false);
+    return assetPath;
+  } catch { /* not where it says; try the forwarding address */ }
+
+  const forwarded = (await readLedger())[String(assetPath).replace(/\\/g, '/')];
+  if (!forwarded) return null;
+  try {
+    await walkToFile(forwarded, false);
+    return forwarded;
+  } catch {
+    return null;
+  }
+}
+
 export async function readAssetFile(assetPath) {
-  const dir = await getAssetsDir(false);
-  const handle = await dir.getFileHandle(assetFilename(assetPath));
-  return handle.getFile();
+  try {
+    return await (await walkToFile(assetPath, false)).getFile();
+  } catch (error) {
+    const forwarded = await resolveRecordedPath(assetPath);
+    if (!forwarded) throw error;
+    return (await walkToFile(forwarded, false)).getFile();
+  }
 }
 
 export async function readAssetDataUrl(assetPath) {
@@ -348,21 +508,9 @@ export async function readAssetDataUrl(assetPath) {
 }
 
 export async function listAssetImages() {
-  try {
-    const dir = await getAssetsDir(false);
-    const images = [];
-    for await (const [name, handle] of dir.entries()) {
-      if (handle.kind !== 'file') continue;
-      const lower = name.toLowerCase();
-      if (IMAGE_EXTENSIONS.some(ext => lower.endsWith(ext))) {
-        images.push({ name, path: `assets/${name}` });
-      }
-    }
-    return images;
-  } catch (error) {
-    if (error.name === 'NotFoundError') return [];
-    throw error;
-  }
+  return (await listMediaFiles())
+    .filter(file => IMAGE_EXTENSIONS.some(ext => file.toLowerCase().endsWith(ext)))
+    .map(file => ({ name: file.slice(file.lastIndexOf('/') + 1), path: file }));
 }
 
 // Everything the media bin can pull from the project folder, by extension —
@@ -374,24 +522,17 @@ const MEDIA_EXTENSIONS = {
 };
 
 export async function listAssetMedia() {
-  try {
-    const dir = await getAssetsDir(false);
-    const media = [];
-    for await (const [name, handle] of dir.entries()) {
-      if (handle.kind !== 'file') continue;
-      const lower = name.toLowerCase();
-      const type = Object.keys(MEDIA_EXTENSIONS)
-        .find(kind => MEDIA_EXTENSIONS[kind].some(ext => lower.endsWith(ext)));
-      if (!type) continue;
-      let mtime = 0;
-      try { mtime = (await handle.getFile()).lastModified; } catch { /* listed anyway */ }
-      media.push({ name, path: `assets/${name}`, type, mtime });
-    }
-    return media.sort((a, b) => b.mtime - a.mtime);
-  } catch (error) {
-    if (error.name === 'NotFoundError') return [];
-    throw error;
+  const media = [];
+  for (const file of await listMediaFiles()) {
+    const lower = file.toLowerCase();
+    const type = Object.keys(MEDIA_EXTENSIONS)
+      .find(kind => MEDIA_EXTENSIONS[kind].some(ext => lower.endsWith(ext)));
+    if (!type) continue;
+    let mtime = 0;
+    try { mtime = (await (await walkToFile(file, false)).getFile()).lastModified; } catch { /* listed anyway */ }
+    media.push({ name: file.slice(file.lastIndexOf('/') + 1), path: file, type, mtime });
   }
+  return media.sort((a, b) => b.mtime - a.mtime);
 }
 
 /** Copy every asset referenced by another project's library into this one. */
@@ -402,7 +543,16 @@ export async function copyAssetsFrom(sourceDirHandle, assetPaths) {
 
   for (const assetPath of assetPaths) {
     try {
-      const sourceFile = await (await sourceAssets.getFileHandle(assetFilename(assetPath))).getFile();
+      // The source project may itself be organised, so this walks rather than
+      // reading one flat folder. Imported files land unfiled and Clean Files
+      // sorts them — the importing project's shot list is the only thing that
+      // can say where they belong, and it has not seen them yet.
+      const segments = assetSegments(assetPath);
+      let sourceDir = sourceAssets;
+      for (const segment of segments.slice(0, -1)) {
+        sourceDir = await sourceDir.getDirectoryHandle(segment);
+      }
+      const sourceFile = await (await sourceDir.getFileHandle(segments[segments.length - 1])).getFile();
       const ext = sourceFile.name.includes('.') ? `.${sourceFile.name.split('.').pop()}` : '.png';
       const filename = `ref_${Date.now()}_${Math.random().toString(36).slice(2, 6)}${ext}`;
       const handle = await targetDir.getFileHandle(filename, { create: true });
@@ -415,6 +565,141 @@ export async function copyAssetsFrom(sourceDirHandle, assetPaths) {
     }
   }
   return mapping;
+}
+
+// --- Clean Files ------------------------------------------------------------
+//
+// The browser twin of the server's organize endpoint. Same plan, from the same
+// pure module; only the moving is different, because a directory handle has no
+// rename-across-folders unless the browser implements `FileSystemFileHandle
+// .move` — Chromium does, and the copy-and-delete fallback covers the rest.
+
+const STAGING_DIR = '.organize-staging';
+
+/** The directory handle holding a project-relative file, plus its bare name. */
+async function locate(assetPath, create = false) {
+  const segments = assetSegments(assetPath);
+  const name = segments.pop();
+  const dirPath = segments.length ? `${MEDIA_ROOT}/${segments.join('/')}` : MEDIA_ROOT;
+  return { dir: await walkToDir(dirPath, create), name };
+}
+
+async function fileExists(assetPath) {
+  try {
+    await walkToFile(assetPath, false);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Move one file, preferring the native rename and copying only if we must. */
+async function moveAsset(from, to) {
+  const source = await locate(from, false);
+  const target = await locate(to, true);
+  const handle = await source.dir.getFileHandle(source.name);
+
+  if (typeof handle.move === 'function') {
+    await handle.move(target.dir, target.name);
+    return;
+  }
+
+  const file = await handle.getFile();
+  const created = await target.dir.getFileHandle(target.name, { create: true });
+  const writable = await created.createWritable();
+  await writable.write(file);
+  await writable.close();
+  await source.dir.removeEntry(source.name);
+}
+
+/** Drop folders the moves emptied, deepest first. The root itself survives. */
+async function pruneEmptyDirs(dir) {
+  const removable = [];
+  let empty = true;
+  for await (const [name, handle] of dir.entries()) {
+    if (handle.kind === 'directory') {
+      if (await pruneEmptyDirs(handle)) removable.push(name);
+      else empty = false;
+    } else {
+      empty = false;
+    }
+  }
+  for (const name of removable) {
+    try { await dir.removeEntry(name); } catch { empty = false; }
+  }
+  return empty && removable.length === 0 ? true : empty;
+}
+
+/**
+ * Plan the layout, and carry it out when asked.
+ *
+ * Mirrors the server's contract exactly so the client does not care which mode
+ * it is in: a dry run reports, an applied run returns the mapping of what
+ * actually moved. A file that will not move keeps its path, and the state that
+ * points there stays correct.
+ */
+export async function organizeAssets({ state = {}, apply = false } = {}) {
+  const existingFiles = await listMediaFiles();
+  const plan = planAssetLayout(state, { existingFiles });
+
+  if (!apply) {
+    return {
+      applied: false,
+      summary: plan.summary,
+      preview: plan.moves.slice(0, 40),
+      moves: plan.moves.length
+    };
+  }
+
+  const moved = [];
+  const failed = [];
+  const staged = [];
+
+  // Anything landing on an occupied name is parked first, so two files
+  // exchanging places cannot lose one of themselves.
+  for (const move of plan.moves) {
+    if (!(await fileExists(move.to))) continue;
+    const parked = `${MEDIA_ROOT}/${STAGING_DIR}/${staged.length}_${move.from.slice(move.from.lastIndexOf('/') + 1)}`;
+    try {
+      await moveAsset(move.from, parked);
+      staged.push({ move, parked });
+    } catch (error) {
+      failed.push({ ...move, error: error.message });
+    }
+  }
+  const parkedFrom = new Set(staged.map(entry => entry.move.from));
+
+  for (const move of plan.moves) {
+    if (parkedFrom.has(move.from) || failed.some(entry => entry.from === move.from)) continue;
+    try {
+      await moveAsset(move.from, move.to);
+      moved.push(move);
+    } catch (error) {
+      failed.push({ ...move, error: error.message });
+    }
+  }
+  for (const entry of staged) {
+    try {
+      await moveAsset(entry.parked, entry.move.to);
+      moved.push(entry.move);
+    } catch (error) {
+      failed.push({ ...entry.move, error: error.message });
+    }
+  }
+
+  await appendLedger(moved);
+  try {
+    await pruneEmptyDirs(await getAssetsDir(false));
+  } catch { /* nothing to prune */ }
+  clearAssetUrlCache();
+
+  return {
+    applied: true,
+    summary: plan.summary,
+    mapping: moved.map(move => [move.from, move.to]),
+    moved: moved.length,
+    failed
+  };
 }
 
 // --- object URLs for <img>/<video> ---

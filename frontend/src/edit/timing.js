@@ -207,7 +207,73 @@ export function normalize(edit, ctx) {
   const clamped = clampTransitions(ordered, ctx);
   const video = edit.smart ? reflow(clamped, ctx) : readBackOverlaps(clamped, ctx);
 
-  return { ...edit, video };
+  return syncCompanions({ ...edit, video }, ctx);
+}
+
+// --- linked sound -----------------------------------------------------------
+//
+// A picture clip with a soundtrack gets that soundtrack as its own clip on an
+// audio track, pinned to it. Two clips, one gesture: trim, move, split or delete
+// the picture and the sound goes with it, exactly like an A/V pair in Premiere.
+// Unlinking is what breaks the pair, and after that the sound is an ordinary
+// clip sitting at an absolute time.
+//
+// The pairing is written down twice on purpose. `detachedFrom` says which
+// picture clip this sound came off — permanent, and what makes "restore the
+// audio" possible. `link` says whether it is still following that clip — the
+// thing unlinking clears. A companion is a clip where both agree.
+
+/** Is this the sound of that picture clip, still following it? */
+export function isCompanion(audioClip) {
+  return Boolean(audioClip?.detachedFrom)
+    && Boolean(audioClip?.link)
+    && audioClip.link.clipId === audioClip.detachedFrom;
+}
+
+/** The sound clip belonging to a picture clip, linked or not. */
+export function companionOf(edit, videoClipId) {
+  for (const track of edit.audio || []) {
+    for (const clip of track.clips || []) {
+      if (clip.detachedFrom === videoClipId) return { track, clip };
+    }
+  }
+  return null;
+}
+
+/**
+ * Make every companion's trim agree with the picture it follows.
+ *
+ * The picture clip is the single source of truth for the pair's in and out
+ * points, so there is nothing to keep in step by hand — trimming picture, or
+ * splitting it, or dropping a longer take underneath it, all land here. Only
+ * placement stays the companion's own business, via `link.offset`, which is how
+ * a sync nudge survives.
+ */
+function syncCompanions(edit, ctx) {
+  if (!(edit.audio || []).length) return edit;
+  const byId = new Map(edit.video.map(clip => [clip.id, clip]));
+  let changed = false;
+
+  const audio = (edit.audio || []).map(track => {
+    const clips = (track.clips || []).map(clip => {
+      if (!isCompanion(clip)) return clip;
+      const anchor = byId.get(clip.detachedFrom);
+      if (!anchor) return clip;
+
+      const inPoint = Math.max(0, Number(anchor.in) || 0);
+      const outPoint = effectiveOut(anchor, ctx);
+      if (Math.abs((Number(clip.in) || 0) - inPoint) < EPSILON
+        && clip.out !== null && clip.out !== undefined
+        && Math.abs(clip.out - outPoint) < EPSILON) {
+        return clip;
+      }
+      changed = true;
+      return { ...clip, in: inPoint, out: outPoint };
+    });
+    return changed ? { ...track, clips } : track;
+  });
+
+  return changed ? { ...edit, audio } : edit;
 }
 
 // --- video track operations -------------------------------------------------
@@ -364,7 +430,41 @@ export function splitClipAtTime(edit, clipId, time, ctx) {
 
   const video = [...edit.video];
   video.splice(index, 1, left, right);
-  return withVideo(edit, video, ctx);
+  // The sound is cut at the same frame and the tail handed to the new clip, so
+  // one keystroke cuts the pair rather than leaving the audio running under both
+  // halves and re-syncing itself the moment either is moved.
+  const audio = splitCompanions(edit, clip.id, right.id, cut);
+  return withVideo({ ...edit, audio }, video, ctx);
+}
+
+/** Cut every companion of `clipId` at `cut` and give the tail to `rightId`. */
+function splitCompanions(edit, clipId, rightId, cut) {
+  return (edit.audio || []).map(track => ({
+    ...track,
+    clips: (track.clips || []).flatMap(clip => {
+      if (clip.detachedFrom !== clipId) return [clip];
+      // An unlinked clip is nobody's other half any more; splitting the picture
+      // is not a reason to cut it.
+      if (!isCompanion(clip)) return [clip];
+
+      const inPoint = Math.max(0, Number(clip.in) || 0);
+      const outPoint = clip.out === null || clip.out === undefined ? null : Number(clip.out);
+      if (cut <= inPoint + MIN_CLIP_SECONDS) return [clip];
+      if (outPoint !== null && cut >= outPoint - MIN_CLIP_SECONDS) return [clip];
+
+      return [
+        { ...clip, out: cut },
+        {
+          ...clip,
+          id: `${clip.id}_b${Math.random().toString(36).slice(2, 6)}`,
+          in: cut,
+          out: outPoint,
+          detachedFrom: rightId,
+          link: { clipId: rightId, offset: clip.link.offset || 0 }
+        }
+      ];
+    })
+  }));
 }
 
 export function setTransition(edit, clipId, transition, ctx) {
@@ -456,6 +556,17 @@ export function setAudioClipTrim(edit, clipId, edge, value, ctx) {
   if (!found) return edit;
 
   const { clip } = found;
+
+  // Half of a linked pair. The picture clip owns the trim, so the gesture is
+  // forwarded there and `syncCompanions` brings the sound along — otherwise the
+  // two would disagree until the next time anything touched the picture.
+  if (isCompanion(clip)) {
+    const anchor = edit.video.find(entry => entry.id === clip.detachedFrom);
+    if (anchor) {
+      const offset = clip.link.offset || 0;
+      return setClipTrim(edit, anchor.id, edge, value - offset, ctx);
+    }
+  }
   const limit = sourceDuration(clip, ctx);
   const currentIn = Number(clip.in) || 0;
   const currentOut = effectiveOut(clip, ctx);
@@ -482,9 +593,17 @@ export function setAudioClipTrim(edit, clipId, edge, value, ctx) {
  * that is how you nudge a lip-sync a few frames without losing the fact that it
  * belongs to that shot. A free clip just takes the new absolute time.
  */
-export function moveAudioClip(edit, clipId, start) {
+export function moveAudioClip(edit, clipId, start, ctx) {
   const found = findAudioClip(edit, clipId);
   if (!found) return edit;
+
+  // Dragging either half of a linked pair drags both. Slipping sync against
+  // the picture is a deliberate act, so it lives on the offset field in the
+  // inspector rather than one pixel away from an ordinary move.
+  if (ctx && isCompanion(found.clip)) {
+    const anchor = edit.video.find(entry => entry.id === found.clip.detachedFrom);
+    if (anchor) return moveClipToTime(edit, anchor.id, start - (found.clip.link.offset || 0), ctx);
+  }
 
   if (found.clip.link) {
     const anchor = edit.video.find(clip => clip.id === found.clip.link.clipId);
@@ -529,21 +648,17 @@ export function detachClipAudio(edit, videoClipId, ctx) {
   if (index < 0) return edit;
 
   const clip = edit.video[index];
-  if (clip.audio?.detached) return edit;
+  // Already done. A clip whose companion was deleted keeps `detached` — that is
+  // what stops the auto-link pass quietly putting it back — so the check is for
+  // the clip, not the flag.
+  if (companionOf(edit, videoClipId)) return edit;
 
   const entry = buildTimeline(edit, ctx).video[index];
   // A still has no soundtrack to lift, and neither does a silent take — which
   // most generated clips are.
   if (entry.resolved.kind !== 'video' || !sourceHasAudio(clip, ctx)) return edit;
 
-  let next = edit;
-  let track = (edit.audio || [])[0];
-  if (!track) {
-    next = addAudioTrack(next, 'Audio 1');
-    track = next.audio[0];
-  }
-
-  const detached = createAudioClip(
+  const companion = createAudioClip(
     { ...clip.source, stream: 'audio' },
     {
       start: entry.start,
@@ -552,13 +667,68 @@ export function detachClipAudio(edit, videoClipId, ctx) {
       gain: clip.audio?.gain ?? 1,
       fadeIn: clip.audio?.fadeIn ?? 0,
       fadeOut: clip.audio?.fadeOut ?? 0,
-      detachedFrom: videoClipId
+      detachedFrom: videoClipId,
+      link: { clipId: videoClipId, offset: 0 }
     }
   );
 
-  const video = [...next.video];
+  const placed = claimPictureTrack(edit, entry.start, entry.end, ctx);
+  const video = [...placed.edit.video];
   video[index] = { ...clip, audio: { ...clip.audio, detached: true } };
-  return normalize(addAudioClip({ ...next, video }, track.id, detached), ctx);
+  return normalize(addAudioClip({ ...placed.edit, video }, placed.trackId, companion), ctx);
+}
+
+/**
+ * An audio track this stretch of time is free on, making one if need be.
+ *
+ * Picture tracks are kept apart from imported music and voiceover: dropping a
+ * clip's dialogue into the middle of somebody's score would be a rude surprise,
+ * and the mute and solo buttons are per track, so the separation is what makes
+ * them useful. Overlapping picture — a dissolve, or free mode — spills onto the
+ * next one down, which is what A1/A2/A3 are for.
+ */
+function claimPictureTrack(edit, start, end, ctx) {
+  const timeline = buildTimeline(edit, ctx);
+  for (const trackEntry of timeline.audio) {
+    if (!trackEntry.track.forPicture) continue;
+    const clash = trackEntry.clips.some(entry => (
+      entry.start < end - EPSILON && entry.end > start + EPSILON
+    ));
+    if (!clash) return { edit, trackId: trackEntry.track.id };
+  }
+
+  const count = (edit.audio || []).filter(track => track.forPicture).length;
+  const next = addAudioTrack(edit, `Picture ${count + 1}`);
+  const track = next.audio[next.audio.length - 1];
+  return {
+    edit: { ...next, audio: next.audio.map(entry => (
+      entry.id === track.id ? { ...entry, forPicture: true } : entry
+    )) },
+    trackId: track.id
+  };
+}
+
+/**
+ * Give every picture clip that has sound its sound.
+ *
+ * Run whenever the timeline or the measurements change, which is how a clip
+ * dropped from the bin, a take that finished generating, and a project opened
+ * from before any of this existed all end up with the same layout.
+ *
+ * `sourceHasAudio` treats unknown as yes so the render never silences real
+ * sound by accident; here the opposite is right, so the check is strict. An
+ * unprobed clip is left alone and picked up on the pass after its probe lands.
+ */
+export function autoLinkClipAudio(edit, ctx) {
+  let next = edit;
+  for (const clip of edit.video) {
+    if (clip.audio?.detached) continue;
+    const resolved = resolveClipSource(clip, ctx.scenes);
+    if (resolved.kind !== 'video' || !resolved.path) continue;
+    if (ctx.durations?.[resolved.path]?.hasAudio !== true) continue;
+    next = detachClipAudio(next, clip.id, ctx);
+  }
+  return next;
 }
 
 /** Put a detached soundtrack back into its picture clip. */
@@ -605,6 +775,22 @@ export function buildTimeline(edit, ctx) {
   });
 
   const byId = new Map(video.map(entry => [entry.clip.id, entry]));
+
+  // Which picture clips have their sound on a track below them. Read once here
+  // rather than searched per clip while drawing, and it belongs in the resolved
+  // timeline anyway: the strip and the inspector should agree about what is
+  // half of a pair without either of them working it out for itself.
+  const companions = new Map();
+  for (const track of edit.audio || []) {
+    for (const clip of track.clips || []) {
+      if (clip.detachedFrom) companions.set(clip.detachedFrom, clip);
+    }
+  }
+  for (const entry of video) {
+    const companion = companions.get(entry.clip.id);
+    entry.companionId = companion ? companion.id : null;
+    entry.paired = Boolean(companion && companion.link && companion.link.clipId === entry.clip.id);
+  }
 
   const audio = (edit.audio || []).map(track => ({
     track,

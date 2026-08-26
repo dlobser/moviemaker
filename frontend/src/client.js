@@ -12,13 +12,15 @@
 import { loadCredentials, saveCredentials } from './static/keyStore.js';
 import {
   readProjectState, writeProjectState, listAssetImages, listAssetMedia,
-  importFile, getAssetObjectUrl, getActiveName, getActiveHandle,
+  importFile, getAssetObjectUrl, getActiveName, getActiveHandle, organizeAssets,
   isFileSystemAccessSupported,
   listCheckpoints, writeCheckpoint, readCheckpoint, deleteCheckpoint
 } from './static/fileSystem.js';
 import { generateText, listModels, generateImage, generateVideo, runLipSync } from './static/providers.js';
 
-export const SERVER_BASE = 'http://localhost:3001';
+// Overridable so a second instance can be run against a scratch project
+// without going near the one you have open.
+export const SERVER_BASE = import.meta.env?.VITE_SERVER_BASE || 'http://localhost:3001';
 
 // Force static with `?static=1` (or VITE_STATIC=1 at build time) — handy for
 // testing the hosted behaviour while a local backend happens to be running.
@@ -68,8 +70,8 @@ function asResponse(body, ok = true, status = 200) {
   return { ok, status, json: async () => body, text: async () => JSON.stringify(body) };
 }
 
-function errorResponse(message, status = 500) {
-  return asResponse({ error: message }, false, status);
+function errorResponse(message, status = 500, reason = undefined) {
+  return asResponse({ error: message, reason }, false, status);
 }
 
 const DEFAULT_STATE = {
@@ -91,7 +93,8 @@ export async function apiFetch(path, options = {}) {
       return errorResponse(
         `Cannot connect to MovieMaker backend server (${SERVER_BASE}). ` +
         `Please ensure the backend server is running ("npm start" or "node server.js").`,
-        503
+        503,
+        'offline'
       );
     }
   }
@@ -146,6 +149,13 @@ export async function apiFetch(path, options = {}) {
       return asResponse(await listAssetMedia());
     }
 
+    // Clean Files. Same request and reply shape as the server's, so App.jsx
+    // never has to know which build it is running in.
+    if (route === '/api/assets/organize') {
+      if (!getActiveHandle()) return errorResponse('Pick a project folder first.', 400);
+      return asResponse(await organizeAssets(body || {}));
+    }
+
     // The hosted build measures sources with a media element instead — see
     // edit/durations.js. An empty result keeps a stray caller from treating
     // this as a failure.
@@ -159,7 +169,12 @@ export async function apiFetch(path, options = {}) {
       const prefix = file.type?.startsWith('audio') ? 'audio'
         : file.type?.startsWith('video') ? 'video'
         : 'ref';
-      const filePath = await importFile(file, prefix);
+      let destination = null;
+      try {
+        const field = options.body?.get?.('destination');
+        destination = field ? JSON.parse(field) : null;
+      } catch { /* an unreadable descriptor is the same as none */ }
+      const filePath = await importFile(file, prefix, destination);
       return asResponse({ filePath, originalName: file.name, mimeType: file.type });
     }
 

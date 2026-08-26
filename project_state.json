@@ -1,0 +1,119 @@
+{
+  "scenes": [
+    {
+      "id": "scene_default_1787059983219",
+      "name": "Scene 1",
+      "number": 1,
+      "shots": [
+        {
+          "id": "shot_1787059983214",
+          "name": "Shot 1",
+          "setup": "Wide establishing shot of a futuristic cyberpunk city skyline, neon lights reflecting in the rain.",
+          "description": "A glowing hover-car slowly flies between towering skyscrapers. Rain streaks the camera lens.",
+          "dialogue": "A voiceover says: \"Welcome to New Eden, where dreams are manufactured.\"",
+          "notes": "Needs to feel atmospheric and slow.",
+          "selectedImage": null,
+          "selectedVideo": null,
+          "referenceImages": [],
+          "lipSyncAudio": null
+        }
+      ],
+      "sceneConcatenatedVideo": null
+    }
+  ],
+  "shots": [
+    {
+      "id": "shot_1787059983214",
+      "name": "Shot 1",
+      "setup": "Wide establishing shot of a futuristic cyberpunk city skyline, neon lights reflecting in the rain.",
+      "description": "A glowing hover-car slowly flies between towering skyscrapers. Rain streaks the camera lens.",
+      "dialogue": "A voiceover says: \"Welcome to New Eden, where dreams are manufactured.\"",
+      "notes": "Needs to feel atmospheric and slow.",
+      "selectedImage": null,
+      "selectedVideo": null,
+      "referenceImages": [],
+      "lipSyncAudio": null
+    }
+  ],
+  "imageGallery": [],
+  "videoGallery": [],
+  "referenceImages": [],
+  "refAssignments": [],
+  "referenceSchemaVersion": 2,
+  "assetLibrary": [],
+  "promptSnippets": [
+    {
+      "id": "s1",
+      "name": "Establish",
+      "text": "wide establishing shot, scale detail"
+    },
+    {
+      "id": "s2",
+      "name": "Close Up",
+      "text": "cinematic macro close up shot, shallow depth of field"
+    },
+    {
+      "id": "s3",
+      "name": "Cyberpunk",
+      "text": "neon cyberpunk aesthetic, volumetric haze, atmospheric reflections"
+    },
+    {
+      "id": "s4",
+      "name": "Tracking",
+      "text": "slow smooth tracking shot, camera moving forward"
+    },
+    {
+      "id": "s5",
+      "name": "8K Film",
+      "text": "photorealistic 8k octane render, cinematic lighting, 35mm film grain"
+    }
+  ],
+  "activeLlm": "gemini",
+  "llmModel": "gemini-2.5-flash",
+  "activeImageGenerator": "fal-ai",
+  "imageModel": "fal-ai/flux/schnell",
+  "imageResolution": "1344x768",
+  "activeVideoGenerator": "fal-ai",
+  "videoResolution": "1280x720",
+  "videoModel": "fal-ai/kling-video",
+  "videoDuration": "5",
+  "batchConcurrency": 3,
+  "attachTagsForImages": true,
+  "attachTagsForVideos": false,
+  "atlasSafetyChecker": true,
+  "customModelCaps": {},
+  "assetTypeModels": {},
+  "autoAttachRefs": true,
+  "batchJobs": [],
+  "pipelineRun": null,
+  "dreamSettings": {},
+  "promptSettings": {
+    "prePrompt": "Create a cinematic, photorealistic visual description for a high-budget sci-fi film of the following scene: ",
+    "postPrompt": ", ultra realistic, highly detailed, octane render, 8k, volumetric lighting"
+  },
+  "prePrompt": "Create a cinematic, photorealistic visual description for a high-budget sci-fi film of the following scene: ",
+  "postPrompt": ", ultra realistic, highly detailed, octane render, 8k, volumetric lighting",
+  "videoPrePrompt": "",
+  "videoPostPrompt": "",
+  "imageSystemPrompt": "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual description optimized for AI generation (like Flux/Midjourney or Kling). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.",
+  "videoSystemPrompt": "You are a professional cinematographic prompt engineer. Based on the user's details, write a single highly visual video description optimized for AI generation (like Kling, Runway, or Veo). Output ONLY the final visual prompt itself. Do not include titles, introductions, quotes, or conversational preamble.",
+  "concatenatedVideo": null,
+  "watermarkImage": null,
+  "watermarkMotion": "drift",
+  "edit": {
+    "version": 1,
+    "settings": {
+      "width": 1920,
+      "height": 1080,
+      "fps": 24,
+      "resolutionAuto": true
+    },
+    "smart": true,
+    "video": [],
+    "audio": [],
+    "bin": [],
+    "durations": {}
+  },
+  "activeSceneId": "scene_default_1787059983219",
+  "activeShotId": "shot_1787059983214"
+}

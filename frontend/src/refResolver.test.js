@@ -72,6 +72,44 @@ const composeWired = (over = {}) => composeGenerationPrompt({
   ...over
 });
 
+// --- what the ticks mean ----------------------------------------------------
+//
+// The ticks are the asset's own answer to "which of my images represent me".
+// They used to govern only the asset's own artwork, so a shot with slots to
+// spare topped them up from the board — which is how ticking four boxes ended
+// up sending six images.
+
+test('ticked images are the whole candidate list, not a starting point', () => {
+  const ticked = { ...ralph, inputImages: ['assets/ralph_1.png', 'assets/ralph_closeup.png'] };
+  const found = collectAssetReferences({ asset: ticked, references: refs });
+  assert.deepEqual(found.map(entry => entry.path), ['assets/ralph_1.png', 'assets/ralph_closeup.png']);
+});
+
+test('the primary leads the ticked order when it is among them', () => {
+  const ticked = { ...ralph, inputImages: ['assets/ralph_closeup.png', 'assets/ralph_1.png'] };
+  const found = collectAssetReferences({ asset: ticked, references: refs });
+  assert.equal(found[0].path, 'assets/ralph_1.png');
+  assert.equal(found[0].reason, 'primary');
+});
+
+test('a primary that is not ticked does not force its way in', () => {
+  const ticked = { ...ralph, inputImages: ['assets/ralph_closeup.png'] };
+  const found = collectAssetReferences({ asset: ticked, references: refs });
+  assert.deepEqual(found.map(entry => entry.path), ['assets/ralph_closeup.png']);
+});
+
+test('with nothing ticked the board still fills the spare slots', () => {
+  const found = collectAssetReferences({ asset: { ...ralph, inputImages: [] }, references: refs });
+  assert.equal(found[0].reason, 'primary');
+  assert.ok(found.length > 1);
+});
+
+test('ticks are capped by the model like anything else', () => {
+  const ticked = { ...ralph, inputImages: ['assets/ralph_1.png', 'assets/ralph_closeup.png'] };
+  const found = collectAssetReferences({ asset: ticked, references: refs, capacityHint: 1 });
+  assert.deepEqual(found.map(entry => entry.path), ['assets/ralph_1.png']);
+});
+
 test('auto-attach: every tagged asset lands its primary before any second image', () => {
   // 3-slot Gemini with two tagged assets: both primaries in, remaining slot
   // goes to the first asset's rank-1 candidate.

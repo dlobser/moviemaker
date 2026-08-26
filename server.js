@@ -8,6 +8,11 @@ const { exec, execFile, spawn } = require('child_process');
 const { buildRenderGraph } = require('./renderGraph.js');
 const { buildWatermarkGraph } = require('./watermarkGraph.js');
 const { buildExportPlan } = require('./exportPlan.js');
+const {
+  summariseProject, revisionOf, guardRevision, guardContent
+} = require('./projectGuard.js');
+const { ProxyCache, readSettings: readCacheSettings, defaultWorkFolder } = require('./proxyCache.js');
+const assetOrganizer = require('./assetOrganizer.js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -18,7 +23,9 @@ app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // Config & State file paths
-const CONFIG_FILE = path.join(__dirname, 'config.json');
+// Overridable so the guard tests can point a whole server at a scratch
+// project without going anywhere near the real one.
+const CONFIG_FILE = process.env.MM_CONFIG || path.join(__dirname, 'config.json');
 
 // Helper to read JSON safely
 function readJsonFile(filePath, defaultVal = {}) {
@@ -46,12 +53,28 @@ function projectNameFromPath(projectPath) {
   return path.basename(projectPath).replace(/\.mmproj\.json$/i, '');
 }
 
-/** The active project file, or null when running on the legacy loose state file. */
-function getActiveProjectPath() {
+/**
+ * Where the active project is, and whether we can actually see it.
+ *
+ * The distinction is the whole point. A project on a removable or network
+ * drive disappears and comes back; treating "gone" as "there is no project"
+ * silently demotes the app to the loose legacy state file, which is how a
+ * placeholder ends up written over a real film. `unreachable` is reported as
+ * an error everywhere instead, so nothing is read or written until the drive
+ * is back.
+ */
+function activeProjectStatus() {
   const config = readJsonFile(CONFIG_FILE);
   const active = config.activeProjectPath;
-  if (active && fs.existsSync(active)) return active;
-  return null;
+  if (!active) return { path: null, state: 'none' };
+  if (fs.existsSync(active)) return { path: active, state: 'ok' };
+  return { path: active, state: 'unreachable' };
+}
+
+/** The active project file, or null when running on the legacy loose state file. */
+function getActiveProjectPath() {
+  const status = activeProjectStatus();
+  return status.state === 'ok' ? status.path : null;
 }
 
 // Helper to get current project working root from config
@@ -178,49 +201,113 @@ function getStateFilePath() {
 }
 
 // Serve assets statically (wrapped dynamically to support runtime config updates)
+//
+// The fallback behind it is what lets the tree be reorganised at all. Every
+// checkpoint, auto-backup and exported project holds paths recorded before the
+// move, and rewriting all of them was never going to be reliable. So a URL that
+// does not resolve is looked up by filename before it is called a 404 — old
+// state keeps rendering, and the only cost is one directory walk the first time
+// a stale path is asked for.
 app.use('/assets', (req, res, next) => {
-  express.static(getAssetsDir())(req, res, next);
+  express.static(getAssetsDir())(req, res, () => {
+    let recorded;
+    try {
+      recorded = `assets${decodeURIComponent(req.path)}`;
+    } catch {
+      return next(); // a malformed escape is not a path worth chasing
+    }
+    const found = assetOrganizer.resolveRecordedPath(getWorkingRoot(), recorded);
+    if (!found) return next();
+    res.sendFile(path.resolve(getWorkingRoot(), found));
+  });
 });
 
-// Helper to write JSON safely
+/**
+ * Write JSON, or leave what was there alone.
+ *
+ * Straight to the destination meant a crash or a drive dropping mid-write left
+ * a truncated file — a project that no longer parses at all. Writing beside it
+ * and renaming makes the swap atomic on every filesystem we run on, so the
+ * worst case is a stale project rather than a destroyed one.
+ */
 function writeJsonFile(filePath, data) {
+  const temporary = `${filePath}.tmp${process.pid}`;
   try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    fs.writeFileSync(temporary, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(temporary, filePath);
     return true;
   } catch (error) {
     console.error(`Error writing ${filePath}:`, error);
+    try { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } catch { /* nothing to clean */ }
     return false;
   }
 }
 
+// Where a newly generated file goes.
+//
+// A generation request may carry a `destination` — which shot, which asset, the
+// reference board — and when it does, the file is written straight into the
+// right folder under the right name. Clean Files exists to repair everything
+// that arrived without one; the point of this path is that it should have very
+// little left to repair.
+//
+// A destination that will not resolve is never fatal. The generation has
+// already been paid for by the time this runs, so anything unrecognised lands
+// in the bin — visible, sweepable, and far better than discarding a picture
+// that cost money or scattering it at the root.
+async function resolveWritePath(destination, prefix, ext) {
+  const workingRoot = getWorkingRoot();
+  const timestamped = `${prefix}_${Date.now()}${ext}`;
+  const flat = () => ({
+    absolutePath: path.join(getAssetsDir(), timestamped),
+    relativePath: `assets/${timestamped}`
+  });
+  if (!destination) return flat();
+
+  try {
+    const paths = await getAssetPaths();
+    // A descriptor normally carries its own scene and shot names; the saved
+    // project is only consulted when it carried an id instead.
+    const project = readProjectStateForPaths();
+    const dir = paths.destinationDir(destination, project);
+    const naming = paths.destinationStem(destination, project);
+    // The bin keeps the timestamped name: there is nothing to name it after,
+    // and the timestamp is the only clue left about when it arrived.
+    if (!naming || dir === paths.BIN_DIR) {
+      return assetOrganizer.reserveNewFile(workingRoot, paths.BIN_DIR, timestamped);
+    }
+    const siblings = assetOrganizer.siblingNames(workingRoot, dir);
+    const filename = paths.nextFileName(naming.stem, naming.versioned, ext, siblings);
+    return assetOrganizer.reserveNewFile(workingRoot, dir, filename);
+  } catch (error) {
+    console.error('Could not resolve a destination folder, writing flat:', error.message);
+    return flat();
+  }
+}
+
 // Helper to download a file from a URL to assets
-async function downloadFile(url, prefix, ext) {
+async function downloadFile(url, prefix, ext, destination = null) {
+  const { absolutePath, relativePath } = await resolveWritePath(destination, prefix, ext);
   // If it's a data URL, handle base64
   if (url.startsWith('data:')) {
     const matches = url.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
     if (!matches || matches.length !== 3) {
       throw new Error('Invalid data URL');
     }
-    const buffer = Buffer.from(matches[2], 'base64');
-    const filename = `${prefix}_${Date.now()}${ext}`;
-    const filePath = path.join(getAssetsDir(), filename);
-    fs.writeFileSync(filePath, buffer);
-    return `assets/${filename}`;
+    fs.writeFileSync(absolutePath, Buffer.from(matches[2], 'base64'));
+    assetOrganizer.invalidateIndex(getWorkingRoot());
+    return relativePath;
   }
 
   // Handle standard HTTP/HTTPS URLs
-  const filename = `${prefix}_${Date.now()}${ext}`;
-  const filePath = path.join(getAssetsDir(), filename);
-
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch remote asset: ${response.statusText}`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  fs.writeFileSync(filePath, buffer);
-  return `assets/${filename}`;
+  fs.writeFileSync(absolutePath, Buffer.from(await response.arrayBuffer()));
+  assetOrganizer.invalidateIndex(getWorkingRoot());
+  return relativePath;
 }
 
 // Multer Storage Configuration for user uploads (audio, reference images)
@@ -264,6 +351,78 @@ app.post('/api/config', (req, res) => {
 });
 
 // --- PROJECT STATE API ENDPOINTS ---
+//
+// Every read hands back the revision it read, every write says which revision
+// it was based on, and a write whose baseline no longer matches is refused
+// rather than applied. See projectGuard.js for why.
+
+/** The revision string for whatever file the state currently lives in. */
+function currentStateRevision() {
+  try {
+    const file = getStateFilePath();
+    if (!fs.existsSync(file)) return 'none';
+    return revisionOf(fs.statSync(file)) || 'none';
+  } catch {
+    return 'none';
+  }
+}
+
+/** Stamp a state response with what it came from, so the save can quote it back. */
+function stampRevision(res, target) {
+  res.set('X-MM-Revision', currentStateRevision());
+  res.set('X-MM-Target', target || getStateFilePath());
+  // The app is on a different origin in dev; without this the fetch sees no
+  // custom headers at all and every save would look like it had no baseline.
+  res.set('Access-Control-Expose-Headers', 'X-MM-Revision, X-MM-Target');
+}
+
+/** Whatever is on disk right now, for the guards to compare against. */
+function readCurrentState() {
+  const activePath = getActiveProjectPath();
+  try {
+    if (activePath) return readProjectFile(activePath).state || null;
+    const file = getStateFilePath();
+    return fs.existsSync(file) ? readJsonFile(file, null) : null;
+  } catch {
+    // Unreadable is not the same as absent, and guessing "absent" here would
+    // wave through the very write the guards exist to stop.
+    return undefined;
+  }
+}
+
+/**
+ * Keep a copy of what we are about to overwrite.
+ *
+ * Only ever called on a save the guards refused and the user forced through,
+ * which is exactly the save worth being able to undo. Named for the moment so
+ * a folder of them reads as a timeline.
+ */
+function backupBeforeOverwrite(reason) {
+  try {
+    const file = getStateFilePath();
+    if (!fs.existsSync(file)) return null;
+    const dir = path.join(getWorkingRoot(), 'checkpoints', 'auto-backups');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const target = path.join(dir, `${stamp}_before-${reason}.json`);
+    fs.copyFileSync(file, target);
+    console.warn(`[state] forced ${reason} save; previous file kept at ${target}`);
+    return target;
+  } catch (error) {
+    console.error('Could not take a pre-overwrite backup:', error);
+    return null;
+  }
+}
+
+/** A cheap poll so a window can notice the file moved on under it. */
+app.get('/api/state/revision', (req, res) => {
+  const status = activeProjectStatus();
+  if (status.state === 'unreachable') {
+    return res.status(503).json({ reason: 'project-unreachable', path: status.path });
+  }
+  res.json({ revision: currentStateRevision(), target: getStateFilePath() });
+});
+
 app.get('/api/state', (req, res) => {
   const defaultState = {
     shots: [
@@ -292,10 +451,23 @@ app.get('/api/state', (req, res) => {
     videoResolution: '1280x720',
     videoModel: 'fal-ai/kling-video' // fallback / flexible model selection
   };
-  const activePath = getActiveProjectPath();
-  if (activePath) {
+  const status = activeProjectStatus();
+
+  // The drive is away, or the file was moved. Handing back the placeholder here
+  // is what let the app boot a default project and then autosave it over the
+  // real one the moment the drive returned.
+  if (status.state === 'unreachable') {
+    return res.status(503).json({
+      error: `The project file is not reachable: ${status.path}`,
+      reason: 'project-unreachable',
+      path: status.path
+    });
+  }
+
+  if (status.state === 'ok') {
     try {
-      const project = readProjectFile(activePath);
+      const project = readProjectFile(status.path);
+      stampRevision(res, status.path);
       return res.json(Object.keys(project.state || {}).length > 0 ? project.state : defaultState);
     } catch (error) {
       console.error('Failed to read active project:', error);
@@ -304,20 +476,81 @@ app.get('/api/state', (req, res) => {
   }
 
   const state = readJsonFile(getStateFilePath(), defaultState);
+  stampRevision(res);
   res.json(state);
 });
 
-// Autosave channel. Writes into the active project file when one is open,
-// otherwise the legacy loose project_state.json.
+/**
+ * Autosave channel. Writes into the active project file when one is open,
+ * otherwise the legacy loose project_state.json.
+ *
+ * Three things have to be true before the write happens: the project is where
+ * we last saw it, the client based this save on the file's current contents,
+ * and the save is not obviously a wipe. Each failure is a 409 carrying enough
+ * detail for the app to offer the user the two real choices - reload what is on
+ * disk, or say "yes, overwrite it" and send `X-MM-Force`.
+ */
 app.post('/api/state', (req, res) => {
-  const activePath = getActiveProjectPath();
+  const status = activeProjectStatus();
+  if (status.state === 'unreachable') {
+    return res.status(503).json({
+      error: `Refusing to save: the project file is not reachable (${status.path}).`,
+      reason: 'project-unreachable',
+      path: status.path
+    });
+  }
+
+  const force = req.get('X-MM-Force') === '1';
+  const target = getStateFilePath();
+  const revision = currentStateRevision();
+
+  const claimedTarget = req.get('X-MM-Target');
+  if (claimedTarget && !force && path.resolve(claimedTarget) !== path.resolve(target)) {
+    // The active project changed under this window - usually a drive coming
+    // back, or another window opening something else.
+    return res.status(409).json({
+      error: 'This window is saving to a different project than the one now open.',
+      reason: 'target-changed',
+      expected: claimedTarget,
+      current: target,
+      revision
+    });
+  }
+
+  const baseline = guardRevision(req.get('X-MM-Base-Revision'), revision, { force });
+  if (!baseline.ok) {
+    return res.status(409).json({ ...baseline, ok: undefined, error: baseline.message, revision, target });
+  }
+
+  const existing = readCurrentState();
+  if (existing === undefined && !force) {
+    return res.status(409).json({
+      error: 'The project file on disk could not be read, so this save was held back.',
+      reason: 'unreadable',
+      revision,
+      target
+    });
+  }
+
+  const content = guardContent(req.body, existing || null, { force });
+  if (!content.ok) {
+    return res.status(409).json({ ...content, ok: undefined, error: content.message, revision, target });
+  }
+
   try {
-    if (activePath) {
-      writeProjectFile(activePath, req.body);
-    } else if (!writeJsonFile(getStateFilePath(), req.body)) {
+    if (force) backupBeforeOverwrite('forced-overwrite');
+    if (status.state === 'ok') {
+      writeProjectFile(status.path, req.body);
+    } else if (!writeJsonFile(target, req.body)) {
       throw new Error('Failed to save project state');
     }
-    res.json({ message: 'Project state saved successfully' });
+    stampRevision(res, status.path || target);
+    res.json({
+      message: 'Project state saved successfully',
+      revision: currentStateRevision(),
+      target,
+      summary: summariseProject(req.body)
+    });
   } catch (error) {
     console.error('Save error:', error);
     res.status(500).json({ error: error.message });
@@ -356,7 +589,11 @@ app.post('/api/project/new', (req, res) => {
 
     writeProjectFile(projectPath, {}, safeName);
     setActiveProject(projectPath);
-    res.json({ path: projectPath, name: safeName, workingFolder: projectDir });
+    stampRevision(res, projectPath);
+    res.json({
+      path: projectPath, name: safeName, workingFolder: projectDir,
+      revision: currentStateRevision(), target: getStateFilePath()
+    });
   } catch (error) {
     console.error('New project error:', error);
     res.status(500).json({ error: error.message });
@@ -380,12 +617,15 @@ app.post('/api/project/open', (req, res) => {
       writeProjectFile(projectPath, project.state, project.name);
     }
 
+    stampRevision(res, projectPath);
     res.json({
       path: projectPath,
       name: projectNameFromPath(projectPath),
       workingFolder: actualDir,
       relocatedFrom: moved ? project.workingFolder : null,
-      state: project.state
+      state: project.state,
+      revision: currentStateRevision(),
+      target: getStateFilePath()
     });
   } catch (error) {
     console.error('Open project error:', error);
@@ -426,7 +666,11 @@ app.post('/api/project/save-as', (req, res) => {
     }
 
     setActiveProject(projectPath);
-    res.json({ path: projectPath, name, workingFolder: projectDir, copiedAssets: copied });
+    stampRevision(res, projectPath);
+    res.json({
+      path: projectPath, name, workingFolder: projectDir, copiedAssets: copied,
+      revision: currentStateRevision(), target: getStateFilePath()
+    });
   } catch (error) {
     console.error('Save-as error:', error);
     res.status(500).json({ error: error.message });
@@ -477,13 +721,85 @@ app.post('/api/project/import-assets', (req, res) => {
   }
 });
 
+// --- CLEAN FILES ------------------------------------------------------------
+//
+// Two calls, deliberately. `POST /api/assets/organize` with `apply: false`
+// answers "what would happen" and touches nothing; with `apply: true` it moves
+// the files and reports what actually moved.
+//
+// The client sends its live state rather than the server reading the saved
+// project, because the two differ by however long ago the last autosave was and
+// planning against a stale shot list would file this morning's work in the bin.
+//
+// The mapping that comes back is built from what *moved*, never from the plan.
+// A file that could not be renamed — open in another program is the usual
+// reason on Windows — keeps its old path, and the state that still points there
+// is correct.
+app.post('/api/assets/organize', async (req, res) => {
+  try {
+    const paths = await getAssetPaths();
+    const workingRoot = getWorkingRoot();
+    const state = req.body?.state || {};
+    const existingFiles = assetOrganizer.listMediaFiles(workingRoot);
+    const plan = paths.planAssetLayout(state, { existingFiles });
+
+    if (!req.body?.apply) {
+      return res.json({
+        applied: false,
+        summary: plan.summary,
+        // Enough for a dialog to show the shape of it without shipping
+        // thousands of rows to render.
+        preview: plan.moves.slice(0, 40),
+        moves: plan.moves.length
+      });
+    }
+
+    const { moved, failed } = assetOrganizer.applyMoves(workingRoot, plan.moves);
+    res.json({
+      applied: true,
+      summary: plan.summary,
+      mapping: moved.map(move => [move.from, move.to]),
+      moved: moved.length,
+      failed
+    });
+  } catch (error) {
+    console.error('Organize error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- FILE UPLOAD ENDPOINT ---
-app.post('/api/upload', upload.single('file'), (req, res) => {
+//
+// Multer still writes where it always did; the file is filed afterwards. Doing
+// it in this handler rather than in multer's own destination callback keeps the
+// async layout lookup out of a synchronous callback, and means an upload whose
+// destination cannot be resolved is still a successful upload.
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
+  let filePath = `assets/${req.file.filename}`;
+
+  // Multipart fields are parsed by the time the handler runs, so the client can
+  // say what the upload is for the same way a generation does.
+  let destination = null;
+  try {
+    destination = req.body?.destination ? JSON.parse(req.body.destination) : null;
+  } catch { /* an unreadable descriptor is the same as none */ }
+
+  if (destination) {
+    try {
+      const target = await resolveWritePath(destination, 'ref', path.extname(req.file.filename));
+      fs.renameSync(req.file.path, target.absolutePath);
+      assetOrganizer.invalidateIndex(getWorkingRoot());
+      filePath = target.relativePath;
+    } catch (error) {
+      console.error('Could not file the upload, leaving it at the root:', error.message);
+    }
+  }
+
   res.json({
-    filePath: `assets/${req.file.filename}`,
+    filePath,
     originalName: req.file.originalname,
     mimeType: req.file.mimetype
   });
@@ -492,21 +808,11 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 // --- PROJECT IMAGES ENUMERATION ENDPOINT ---
 app.get('/api/project-images', (req, res) => {
   try {
-    if (!fs.existsSync(getAssetsDir())) {
-      return res.json([]);
-    }
-    const files = fs.readdirSync(getAssetsDir());
-    const images = files
-      .filter(file => {
-        const ext = path.extname(file).toLowerCase();
-        return ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext);
-      })
-      .map(file => {
-        return {
-          name: file,
-          path: `assets/${file}`
-        };
-      });
+    // A walk rather than a readdir: the pickers are how you find an image, and
+    // an image filed under its shot is exactly the one you are looking for.
+    const images = assetOrganizer.listMediaFiles(getWorkingRoot())
+      .filter(file => ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(path.extname(file).toLowerCase()))
+      .map(file => ({ name: file.slice(file.lastIndexOf('/') + 1), path: file }));
     res.json(images);
   } catch (err) {
     console.error('Error reading assets directory:', err);
@@ -524,17 +830,14 @@ const MEDIA_EXTENSIONS = {
 
 app.get('/api/project-media', (req, res) => {
   try {
-    if (!fs.existsSync(getAssetsDir())) {
-      return res.json([]);
-    }
-    const media = fs.readdirSync(getAssetsDir())
+    const media = assetOrganizer.listMediaFiles(getWorkingRoot())
       .map(file => {
         const ext = path.extname(file).toLowerCase();
         const type = Object.keys(MEDIA_EXTENSIONS).find(kind => MEDIA_EXTENSIONS[kind].includes(ext));
         if (!type) return null;
         let mtime = 0;
-        try { mtime = fs.statSync(path.join(getAssetsDir(), file)).mtimeMs; } catch { /* listed anyway */ }
-        return { name: file, path: `assets/${file}`, type, mtime };
+        try { mtime = fs.statSync(path.resolve(getWorkingRoot(), file)).mtimeMs; } catch { /* listed anyway */ }
+        return { name: file.slice(file.lastIndexOf('/') + 1), path: file, type, mtime };
       })
       .filter(Boolean)
       .sort((a, b) => b.mtime - a.mtime);
@@ -552,8 +855,27 @@ app.get('/api/project-media', (req, res) => {
 let providersPromise;
 const getProviders = () => (providersPromise ??= import('./frontend/src/shared/providers/index.js'));
 
+// Where files belong is decided by the same ESM module the browser build uses,
+// reached the same way. Keeping one copy of the layout rules is the point: two
+// would drift, and a drifted layout means Clean Files moving files that
+// generation then writes somewhere else.
+let assetPathsPromise = null;
+const getAssetPaths = () => (assetPathsPromise ??= import('./frontend/src/shared/assetPaths.js'));
+
+/**
+ * The saved project's state, for resolving a destination given by id.
+ *
+ * Deliberately the file on disk rather than anything cached: it is only read
+ * when a descriptor did not carry its own names, which is the uncommon path.
+ */
+function readProjectStateForPaths() {
+  const active = getActiveProjectPath();
+  if (!active) return {};
+  return readJsonFile(active, {}).state || {};
+}
+
 /** The shared module's host contract, server edition. */
-function buildProviderCtx(config) {
+function buildProviderCtx(config, destination = null) {
   return {
     fetch: (url, options) => fetch(url, options),
     credentials: config,
@@ -565,7 +887,7 @@ function buildProviderCtx(config) {
       if (!config.falKey) throw new Error('A Fal.ai key is required to upload input files to cloud-accessible storage.');
       return uploadToFalMedia(absolutePath, config.falKey);
     },
-    saveRemote: (url, prefix, ext) => downloadFile(url, prefix, ext),
+    saveRemote: (url, prefix, ext) => downloadFile(url, prefix, ext, destination),
     capabilities: { direct: true }
   };
 }
@@ -683,6 +1005,10 @@ app.get('/api/llm/models', async (req, res) => {
 // Read a project asset into a data URL so it can be shipped inline to providers
 // that accept base64 image inputs.
 function assetToDataUrl(inputPath) {
+  // A generation whose input was filed away since the shot recorded it must
+  // still find its reference. Same fallback the static route uses.
+  const current = assetOrganizer.resolveRecordedPath(getWorkingRoot(), inputPath);
+  if (current) inputPath = current;
   const normalizedPath = String(inputPath).replace(/\\/g, '/');
   const assetPath = path.resolve(getWorkingRoot(), normalizedPath);
   if (!fs.existsSync(assetPath)) {
@@ -703,7 +1029,7 @@ app.post('/api/image/generate', async (req, res) => {
   const config = readJsonFile(CONFIG_FILE);
   try {
     const { generateImage } = await getProviders();
-    const filePath = await generateImage(req.body, buildProviderCtx(config));
+    const filePath = await generateImage(req.body, buildProviderCtx(config, req.body.destination));
     res.json({ filePath });
   } catch (error) {
     console.error('Image Generation Error:', error);
@@ -716,7 +1042,7 @@ app.post('/api/video/generate', async (req, res) => {
   const config = readJsonFile(CONFIG_FILE);
   try {
     const { generateVideo } = await getProviders();
-    const filePath = await generateVideo(req.body, buildProviderCtx(config));
+    const filePath = await generateVideo(req.body, buildProviderCtx(config, req.body.destination));
     res.json({ filePath });
   } catch (error) {
     console.error('Video Generation Error:', error);
@@ -911,6 +1237,86 @@ function runFfprobe(filePath) {
   });
 }
 
+// --- PREVIEW PROXY CACHE ----------------------------------------------------
+//
+// See proxyCache.js. The server's job here is small: resolve the settings and
+// the source paths, hand the cache the order the editor wants things built in,
+// and serve the results.
+
+const previewCache = new ProxyCache({
+  resolveSettings: () => readCacheSettings(readJsonFile(CONFIG_FILE)),
+  resolveSource: (relative) => {
+    // Only ever inside the project. A path that climbs out of it is either a
+    // bug or an attempt to transcode something we were not asked to.
+    const root = getWorkingRoot();
+    const absolute = path.resolve(root, relative);
+    return absolute.startsWith(path.resolve(root)) ? absolute : null;
+  },
+  probeDuration: async (absolute) => {
+    const probe = await runFfprobe(absolute);
+    return Number(probe.format?.duration) || 0;
+  }
+});
+
+// Proxies are immutable — the source's size and mtime are in the filename — so
+// the browser may keep them for as long as it likes.
+app.use('/cache', (req, res, next) => {
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  express.static(readCacheSettings(readJsonFile(CONFIG_FILE)).folder)(req, res, next);
+});
+
+app.get('/api/cache/settings', (req, res) => {
+  const settings = readCacheSettings(readJsonFile(CONFIG_FILE));
+  res.json({ ...settings, defaultFolder: defaultWorkFolder(), usage: previewCache.usage() });
+});
+
+app.post('/api/cache/settings', (req, res) => {
+  const config = readJsonFile(CONFIG_FILE);
+  const next = { ...(config.previewCache || {}) };
+  if (req.body.enabled !== undefined) next.enabled = Boolean(req.body.enabled);
+  if (typeof req.body.folder === 'string') next.folder = req.body.folder.trim();
+  if (req.body.height !== undefined) next.height = Number(req.body.height);
+
+  const settings = readCacheSettings({ previewCache: next });
+  try {
+    if (!fs.existsSync(settings.folder)) fs.mkdirSync(settings.folder, { recursive: true });
+    // Prove it is writable now rather than failing silently on every encode.
+    const probe = path.join(settings.folder, '.mm-write-test');
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+  } catch (error) {
+    return res.status(400).json({ error: `That work folder cannot be written to: ${error.message}` });
+  }
+
+  // Changing where the proxies live means nothing in flight is going to the
+  // right place any more.
+  previewCache.cancelAll();
+  config.previewCache = next;
+  writeJsonFile(CONFIG_FILE, config);
+  res.json({ ...settings, defaultFolder: defaultWorkFolder(), usage: previewCache.usage() });
+});
+
+app.post('/api/cache/status', (req, res) => {
+  const paths = Array.isArray(req.body?.paths) ? req.body.paths : [];
+  const results = {};
+  for (const relative of paths) {
+    if (typeof relative === 'string' && relative) results[relative] = previewCache.statusOf(relative);
+  }
+  res.json({ results, settings: readCacheSettings(readJsonFile(CONFIG_FILE)) });
+});
+
+/** `paths` is a priority order, not a set: nearest the playhead first. */
+app.post('/api/cache/build', (req, res) => {
+  const paths = Array.isArray(req.body?.paths) ? req.body.paths : [];
+  const settings = readCacheSettings(readJsonFile(CONFIG_FILE));
+  if (!settings.enabled) return res.json({ queued: 0, enabled: false });
+  res.json({ queued: previewCache.request(paths), enabled: true });
+});
+
+app.post('/api/cache/clear', (req, res) => {
+  res.json(previewCache.clear());
+});
+
 app.post('/api/probe', async (req, res) => {
   const paths = Array.isArray(req.body?.paths) ? req.body.paths : [];
   if (paths.length === 0) return res.json({ results: {} });
@@ -952,16 +1358,42 @@ app.post('/api/probe', async (req, res) => {
   res.json({ results });
 });
 
+/** Everything in the mix runs at one layout so amix and concat cannot object. */
+const SEGMENT_AUDIO_FORMAT = 'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo';
+
+/** What a source is made of, as far as the mix is concerned. */
+async function probeForMix(filePath) {
+  try {
+    const probe = await runFfprobe(filePath);
+    const streams = Array.isArray(probe.streams) ? probe.streams : [];
+    return {
+      hasAudio: streams.some(stream => stream.codec_type === 'audio'),
+      duration: Number(probe.format?.duration) || null
+    };
+  } catch {
+    // A probe failure is not a reason to refuse the compile: without a length
+    // the silent bed simply runs long and -shortest ends the segment instead.
+    return { hasAudio: false, duration: null };
+  }
+}
+
 /**
  * Concatenate a timeline into one file.
  *
- * `items` is an ordered list of { video?, image?, duration? }. A shot with no
- * video contributes its still image held for `duration` seconds, so a partly
- * generated edit still plays end to end as an animatic.
+ * `items` is an ordered list of { video?, image?, audio?, duration? }. A shot
+ * with no video contributes its still image held for `duration` seconds, so a
+ * partly generated edit still plays end to end as an animatic.
  *
  * Every segment is re-encoded to identical parameters first. The concat demuxer
  * with `-c copy` only works when inputs already agree on codec, resolution and
  * timebase, which generated clips and stills never do.
+ *
+ * Sound follows the same rule as picture: whatever the shot actually has ends up
+ * in the master. That is the clip's own soundtrack — models that generate audio
+ * used to have it thrown away here — plus the shot's own audio file if it has
+ * one. Both are mixed, which is what the editor does too; a shot whose clip is
+ * already a lip-synced render therefore doubles its dialogue, and wants its
+ * audio file detached rather than compiled twice.
  */
 app.post('/api/concatenate', async (req, res) => {
   const { videoPaths, items, width = 1280, height = 720, fps = 24, placeholderSeconds = 5 } = req.body;
@@ -986,12 +1418,17 @@ app.post('/api/concatenate', async (req, res) => {
   const segments = [];
   let videoCount = 0;
   let stillCount = 0;
+  let audioCount = 0;
   const skipped = [];
+  const missingAudio = [];
 
   try {
     // Normalise every entry to one common encode.
-    const commonVideo = `-vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}" `
-      + `-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p`;
+    const videoChain = `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
+      + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p`;
+    const encode = '-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p '
+      + '-c:a aac -b:a 192k -ar 48000 -ac 2';
+    const seconds = (value) => Math.round(value * 1000) / 1000;
 
     for (let index = 0; index < timeline.length; index++) {
       const entry = timeline[index] || {};
@@ -999,27 +1436,70 @@ app.post('/api/concatenate', async (req, res) => {
       const imagePath = resolve(entry.image);
       const segmentPath = path.join(workDir, `seg_${String(index).padStart(3, '0')}.mp4`);
 
-      if (videoPath) {
-        // Silent audio keeps every segment's stream layout identical, so clips
-        // with and without sound can be concatenated together.
-        await runFfmpeg(
-          `-i "${videoPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 `
-          + `${commonVideo} -c:a aac -shortest -map 0:v:0 -map 1:a:0 "${segmentPath}"`,
-          `segment ${index + 1} (video)`
-        );
-        videoCount++;
-      } else if (imagePath) {
-        const seconds = Number(entry.duration) > 0 ? Number(entry.duration) : placeholderSeconds;
-        await runFfmpeg(
-          `-loop 1 -t ${seconds} -i "${imagePath}" -f lavfi -t ${seconds} -i anullsrc=channel_layout=stereo:sample_rate=44100 `
-          + `${commonVideo} -c:a aac -map 0:v:0 -map 1:a:0 "${segmentPath}"`,
-          `segment ${index + 1} (still)`
-        );
-        stillCount++;
-      } else {
+      if (!videoPath && !imagePath) {
         skipped.push(entry.name || `#${index + 1}`);
         continue;
       }
+
+      // The shot's own audio file — dialogue, narration, a scratch track. A path
+      // that no longer resolves is worth saying out loud rather than compiling
+      // a silent shot and leaving you to wonder.
+      const audioPath = entry.audio ? resolve(entry.audio) : null;
+      if (entry.audio && !audioPath) missingAudio.push(entry.name || `#${index + 1}`);
+
+      const inputs = [];
+      const sounds = [];   // input indices that carry real sound
+      let length = null;
+
+      if (videoPath) {
+        const probed = await probeForMix(videoPath);
+        length = probed.duration;
+        inputs.push(`-i "${videoPath}"`);
+        if (probed.hasAudio) sounds.push(inputs.length - 1);
+        videoCount++;
+      } else {
+        length = Number(entry.duration) > 0 ? Number(entry.duration) : placeholderSeconds;
+        inputs.push(`-loop 1 -t ${seconds(length)} -i "${imagePath}"`);
+        stillCount++;
+      }
+
+      if (audioPath) {
+        inputs.push(`-i "${audioPath}"`);
+        sounds.push(inputs.length - 1);
+      }
+
+      // A silent bed under every segment. The concat demuxer copies streams
+      // rather than re-encoding them, so a segment with no sound still has to
+      // carry a track of exactly the same shape as one that does.
+      const bedIndex = inputs.length;
+      inputs.push(`-f lavfi ${length ? `-t ${seconds(length)} ` : ''}`
+        + '-i anullsrc=channel_layout=stereo:sample_rate=48000');
+
+      const chains = [`[0:v]${videoChain}[v]`];
+      const mixed = sounds.map((inputIndex, slot) => {
+        chains.push(`[${inputIndex}:a]asetpts=PTS-STARTPTS,${SEGMENT_AUDIO_FORMAT}[sa${slot}]`);
+        return `[sa${slot}]`;
+      });
+      chains.push(`[${bedIndex}:a]${SEGMENT_AUDIO_FORMAT}[bed]`);
+      mixed.push('[bed]');
+      if (mixed.length === 1) {
+        chains.push(`${mixed[0]}anull[a]`);
+      } else {
+        // normalize=0 matters: left on, amix divides every input by the number
+        // of them, so the silent bed alone would halve the shot.
+        chains.push(`${mixed.join('')}amix=inputs=${mixed.length}:normalize=0:dropout_transition=0[a]`);
+      }
+
+      if (sounds.length > 0) audioCount++;
+
+      // -shortest ends the segment with its picture: the bed is only as long as
+      // the probe said, and a shot audio file longer than its shot is cut there
+      // rather than pushing everything after it out of sync.
+      await runFfmpeg(
+        `${inputs.join(' ')} -filter_complex "${chains.join(';')}" `
+        + `-map "[v]" -map "[a]" ${encode} -shortest "${segmentPath}"`,
+        `segment ${index + 1} (${videoPath ? 'video' : 'still'})`
+      );
       segments.push(segmentPath);
     }
 
@@ -1038,6 +1518,8 @@ app.post('/api/concatenate', async (req, res) => {
       filePath: `assets/${outputFilename}`,
       videoCount,
       stillCount,
+      audioCount,
+      missingAudio,
       skipped
     });
   } catch (error) {
@@ -1399,7 +1881,7 @@ $dialog.FileName = '${String(defaultName).replace(/'/g, "''")}'
 if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.FileName }`,
     folder: `
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = 'Choose the folder to create the project in'
+$dialog.Description = '${String(defaultName || 'Choose the folder to create the project in').replace(/'/g, "''")}'
 if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.SelectedPath }`
   };
 

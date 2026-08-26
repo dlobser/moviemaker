@@ -12,8 +12,11 @@ import assert from 'node:assert/strict';
 import { resolveRouting, routesToHiggsfield, routesToFal } from './routing.js';
 import { buildFalImageRequest, buildFalVideoRequest, resolveFalVideoModel, falImageSize, isFalReferenceEndpoint, falQueueBase, describeFalError } from './fal.js';
 import { buildHiggsfieldImageRequest, buildHiggsfieldVideoRequest } from './higgsfield.js';
-import { buildAtlasImageBodies, buildAtlasVideoBodies, atlasImageSize, resolveAudioReference } from './atlas.js';
-import { buildGeminiImageBodies, geminiAspectRatio } from './google.js';
+import {
+  buildAtlasImageBodies, buildAtlasVideoBodies, atlasImageSize, resolveAudioReference,
+  isAtlasGeminiImage, usesAtlasImageArray
+} from './atlas.js';
+import { buildGeminiImageBodies, geminiAspectRatio, geminiImageModel, referenceImageParts } from './google.js';
 import { dalleSize } from './openai.js';
 import { generateImage, generateVideo, generateText } from './index.js';
 
@@ -124,31 +127,95 @@ test('Atlas pixel map translates studio ratios', () => {
 });
 
 test('Atlas image body ladder: rich body first, minimal fallback second', () => {
-  const bodies = buildAtlasImageBodies('z-image/turbo', {
-    prompt: 'x', resolution: '16:9', imageDataUrl: 'data:a', safetyChecker: false
+  const bodies = buildAtlasImageBodies('black-forest-labs/flux-dev', {
+    prompt: 'x', resolution: '16:9', imageDataUrls: ['data:a'], safetyChecker: false
   });
   assert.equal(bodies.length, 2);
   assert.equal(bodies[0].enable_safety_checker, false);
   assert.equal(bodies[0].size, '1344*768');
-  assert.deepEqual(bodies[1], { model: 'z-image/turbo', prompt: 'x', image: 'data:a' });
+  assert.deepEqual(bodies[1], { model: 'black-forest-labs/flux-dev', prompt: 'x', image: 'data:a' });
+});
+
+// --- Atlas: Gemini image endpoints ------------------------------------------
+//
+// Atlas documents `images` (1..10) and `aspect_ratio` for these, and neither
+// `image` nor `size` nor `num_images`. Sending the open-weight shape here is
+// not an error Atlas reports — it is a bill for a picture that ignored the
+// references.
+
+test('a Gemini edit endpoint takes its references as an array, not a lone image', () => {
+  const bodies = buildAtlasImageBodies('google/nano-banana-pro/edit', {
+    prompt: 'x', resolution: '16:9', imageDataUrls: ['data:a', 'data:b', 'data:c']
+  });
+  assert.deepEqual(bodies[0].images, ['data:a', 'data:b', 'data:c']);
+  assert.equal('image' in bodies[0], false);
+  assert.equal('size' in bodies[0], false);
+  assert.equal('num_images' in bodies[0], false);
+  assert.equal(bodies[0].aspect_ratio, '16:9');
+});
+
+test('the Gemini fallback gives up the ratio but never the references', () => {
+  const bodies = buildAtlasImageBodies('google/nano-banana-pro/edit', {
+    prompt: 'x', resolution: '16:9', imageDataUrls: ['data:a']
+  });
+  assert.equal(bodies.length, 2);
+  assert.deepEqual(bodies[1], { model: 'google/nano-banana-pro/edit', prompt: 'x', images: ['data:a'] });
+});
+
+test('a shape Atlas has no ratio for constrains nothing rather than guessing', () => {
+  const bodies = buildAtlasImageBodies('google/nano-banana-pro/edit', {
+    prompt: 'x', resolution: '7:5', imageDataUrls: ['data:a']
+  });
+  assert.equal('aspect_ratio' in bodies[0], false);
+});
+
+test('the Gemini text-to-image endpoint is sent no images at all', () => {
+  // It documents none. Passing them anyway is the silent drop, one layer in.
+  const bodies = buildAtlasImageBodies('google/nano-banana-pro/text-to-image', {
+    prompt: 'x', resolution: '16:9', imageDataUrls: ['data:a']
+  });
+  assert.equal(isAtlasGeminiImage('google/nano-banana-pro/text-to-image'), true);
+  assert.equal(usesAtlasImageArray('google/nano-banana-pro/text-to-image'), false);
+  bodies.forEach(body => {
+    assert.equal('images' in body, false);
+    assert.equal('image' in body, false);
+  });
+});
+
+test('the open-weight models keep the shape they always had', () => {
+  assert.equal(isAtlasGeminiImage('black-forest-labs/flux-dev'), false);
+  assert.equal(isAtlasGeminiImage('z-image/turbo'), false);
+  const bodies = buildAtlasImageBodies('black-forest-labs/flux-dev', {
+    prompt: 'x', resolution: '16:9', imageDataUrls: ['data:a']
+  });
+  assert.equal(bodies[0].image, 'data:a');
+  assert.equal(bodies[0].num_images, 1);
 });
 
 test('the safety checker flag only appears when turned off', () => {
-  const bodies = buildAtlasImageBodies('z-image/turbo', { prompt: 'x', resolution: '16:9', safetyChecker: true });
+  const bodies = buildAtlasImageBodies('black-forest-labs/flux-dev', { prompt: 'x', resolution: '16:9', safetyChecker: true });
   assert.equal('enable_safety_checker' in bodies[0], false);
 });
 
-test('Atlas i2v body ladder: single first frame, three shapes', () => {
+test('Atlas i2v body ladder: single first frame, every documented shape', () => {
   const bodies = buildAtlasVideoBodies('bytedance/seedance-2.0/image-to-video', {
     prompt: 'x', resolution: '1280x720', duration: '5', imageDataUrls: ['data:a', 'data:b']
   });
-  assert.equal(bodies.length, 3);
-  assert.equal(bodies[0].image, 'data:a');
-  assert.equal(bodies[0].ratio, '16:9');
+  assert.equal(bodies.length, 4);
+  // Only the first frame travels on an i2v endpoint, whatever was collected.
+  bodies.forEach(body => assert.equal(body.image, 'data:a'));
+
+  assert.equal(bodies[0].ratio, '16:9');          // Seedance 2.0
   assert.equal(bodies[0].resolution, '720p');
+  // Seedance 1.5 documents aspect_ratio *and* resolution together. This rung
+  // used to carry only the ratio, so a 1.5 request that reached it asked for
+  // no size at all and took whatever the model defaulted to.
   assert.equal(bodies[1].aspect_ratio, '16:9');
-  assert.equal(bodies[2].image, 'data:a');
-  assert.equal('ratio' in bodies[2], false);
+  assert.equal(bodies[1].resolution, '720p');
+  assert.equal(bodies[2].aspect_ratio, '16:9');
+  assert.equal('resolution' in bodies[2], false);
+  assert.equal('ratio' in bodies[3], false);
+  assert.equal('aspect_ratio' in bodies[3], false);
 });
 
 test('Atlas ref2v never falls back to a body without the reference array', () => {
@@ -180,7 +247,7 @@ test('audio does not multiply the candidate ladder', () => {
     prompt: 'x', resolution: '1280x720', duration: '5',
     imageDataUrls: ['data:a'], audioAssetRefs: ['data:audio/mpeg;base64,AAA']
   });
-  assert.equal(bodies.length, 3);
+  assert.equal(bodies.length, 4);
   bodies.forEach(body => assert.deepEqual(body.reference_audio, ['data:audio/mpeg;base64,AAA']));
 });
 
@@ -232,7 +299,7 @@ test('no audio means the body ladder is untouched', () => {
   const bodies = buildAtlasVideoBodies('bytedance/seedance-2.0/image-to-video', {
     prompt: 'x', resolution: '1280x720', duration: '5', imageDataUrls: ['data:a']
   });
-  assert.equal(bodies.length, 3);
+  assert.equal(bodies.length, 4);
   bodies.forEach(body => assert.equal('reference_audio' in body, false));
 });
 
@@ -423,6 +490,36 @@ test('no ratio means one body, exactly as before', () => {
   const bodies = buildGeminiImageBodies([{ text: 'x' }], null);
   assert.equal(bodies.length, 1);
   assert.deepEqual(bodies[0].generationConfig, { responseModalities: ['IMAGE'] });
+});
+
+test('the two Nano Bananas are different endpoints with different ceilings', () => {
+  assert.deepEqual(geminiImageModel('google-gemini-image'),
+    { model: 'gemini-2.5-flash-image', label: 'Nano Banana', maxImages: 3 });
+  assert.deepEqual(geminiImageModel('google-gemini-image-pro'),
+    { model: 'gemini-3-pro-image-preview', label: 'Nano Banana Pro', maxImages: 14 });
+});
+
+test('an unknown id falls back to the small model rather than overpromising', () => {
+  // Guessing Pro would let 14 references through to an endpoint that takes 3.
+  assert.equal(geminiImageModel(undefined).maxImages, 3);
+  assert.equal(geminiImageModel('something-else').model, 'gemini-2.5-flash-image');
+});
+
+test('references travel as a plain run of images, with nothing interleaved', () => {
+  // Labelling them ("The second image:") was tried and made character identity
+  // worse: numbering four views of one person invites the model to reconcile
+  // four people. Anything between the images is a claim about them.
+  const parts = referenceImageParts([
+    { mimeType: 'image/png', data: 'AAA' },
+    { mimeType: 'image/jpeg', data: 'BBB' }
+  ]);
+  assert.deepEqual(parts.map(p => p.inlineData.data), ['AAA', 'BBB']);
+  assert.equal(parts.every(p => p.text === undefined), true);
+  assert.equal(parts[1].inlineData.mimeType, 'image/jpeg');
+});
+
+test('no references means no parts', () => {
+  assert.deepEqual(referenceImageParts([]), []);
 });
 
 // --- DALL-E ----------------------------------------------------------------

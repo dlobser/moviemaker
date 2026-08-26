@@ -38,6 +38,11 @@ import {
   unlinkAudioClip,
   detachClipAudio,
   reattachClipAudio,
+  autoLinkClipAudio,
+  companionOf,
+  isCompanion,
+  linkAudioClip,
+  removeAudioClip,
   trackAudible,
   sourceHasAudio,
   MIN_CLIP_SECONDS
@@ -355,19 +360,22 @@ test('dragging a linked clip slips the sync rather than breaking the link', () =
   assert.equal(round(buildTimeline(slipped, ctx).audio[0].clips[0].start), 5.5);
 });
 
-test('detaching a clip’s sound puts it on a track and silences the picture', () => {
+test('detaching a clip’s sound puts it on a track, linked to the picture', () => {
   const base = freshEdit();
   const after = detachClipAudio(base, base.video[0].id, ctx);
 
   assert.equal(after.video[0].audio.detached, true);
   assert.equal(after.audio.length, 1);
   assert.equal(after.audio[0].clips.length, 1);
+  // Its own track, kept apart from imported music so mute and solo mean something.
+  assert.equal(after.audio[0].forPicture, true);
 
-  const detached = after.audio[0].clips[0];
-  assert.equal(detached.detachedFrom, base.video[0].id);
-  // Detached means detached: it stays put when the picture is recut.
-  assert.equal(detached.link, null);
-  assert.equal(round(detached.start), 0);
+  const companion = after.audio[0].clips[0];
+  assert.equal(companion.detachedFrom, base.video[0].id);
+  // An A/V pair: the sound follows the picture until it is unlinked.
+  assert.equal(companion.link.clipId, base.video[0].id);
+  assert.equal(companion.link.offset, 0);
+  assert.equal(round(buildTimeline(after, ctx).audio[0].clips[0].start), 0);
 });
 
 test('a still has no soundtrack to detach', () => {
@@ -514,4 +522,162 @@ test('the bin migrates: junk dropped, fields defaulted, and its paths get probed
   assert.ok(edit.bin.every(item => item.id && item.addedAt));
   const paths = collectSourcePaths(edit, []);
   assert.ok(paths.includes('assets/music.mp3') && paths.includes('assets/clip.mp4'));
+});
+
+// --- linked sound (the A/V pair) --------------------------------------------
+//
+// The rule under all of these: the picture clip owns the pair's in and out
+// points and its place on the timeline, and the sound derives from it until
+// somebody unlinks the two.
+
+/** An edit where every picture clip with sound has been given its sound. */
+function pairedEdit() {
+  return autoLinkClipAudio(freshEdit(), ctx);
+}
+
+test('auto-link gives every picture clip with sound a clip of its own', () => {
+  const edit = pairedEdit();
+  // Two takes with audio; the still has none.
+  const companions = edit.audio.flatMap(track => track.clips);
+  assert.equal(companions.length, 2);
+  assert.ok(companions.every(isCompanion));
+  assert.equal(companionOf(edit, edit.video[0].id).clip.detachedFrom, edit.video[0].id);
+  assert.equal(companionOf(edit, edit.video[2].id), null);
+});
+
+test('auto-link is idempotent and leaves a silenced clip alone', () => {
+  const once = pairedEdit();
+  assert.equal(autoLinkClipAudio(once, ctx), once);
+
+  // A companion the user deleted must not quietly come back.
+  const removed = removeAudioClip(once, companionOf(once, once.video[0].id).clip.id);
+  assert.equal(companionOf(autoLinkClipAudio(removed, ctx), removed.video[0].id), null);
+});
+
+test('auto-link waits for the probe rather than guessing', () => {
+  // sourceHasAudio treats unknown as yes; auto-link must not, or every silent
+  // generated take would sprout an empty audio clip.
+  const blind = makeContext(scenes, {});
+  const edit = autoLinkClipAudio(
+    normalize({ ...createEmptyEdit(), video: deriveVideoClips(scenes) }, blind),
+    blind
+  );
+  assert.equal(edit.audio.length, 0);
+});
+
+test('the sound follows the picture when it moves', () => {
+  const edit = pairedEdit();
+  const moved = moveClipToIndex(edit, edit.video[0].id, 1, ctx);
+  const timeline = buildTimeline(moved, ctx);
+  const picture = timeline.video.find(entry => entry.clip.id === edit.video[0].id);
+  const sound = timeline.audio.flatMap(track => track.clips)
+    .find(entry => entry.clip.detachedFrom === edit.video[0].id);
+  assert.equal(round(sound.start), round(picture.start));
+  assert.equal(round(sound.end), round(picture.end));
+});
+
+test('trimming the picture trims the sound to match', () => {
+  const edit = pairedEdit();
+  const trimmed = setClipTrim(edit, edit.video[0].id, 'out', 3, ctx);
+  const sound = companionOf(trimmed, edit.video[0].id).clip;
+  assert.equal(round(sound.out), 3);
+  assert.equal(round(buildTimeline(trimmed, ctx).audio[0].clips[0].length), 3);
+});
+
+test('trimming the sound of a pair trims the picture with it', () => {
+  const edit = pairedEdit();
+  const companion = companionOf(edit, edit.video[0].id).clip;
+  const trimmed = setAudioClipTrim(edit, companion.id, 'out', 2, ctx);
+  assert.equal(round(trimmed.video[0].out), 2);
+  assert.equal(round(companionOf(trimmed, edit.video[0].id).clip.out), 2);
+});
+
+test('dragging the sound of a pair drags the picture with it', () => {
+  const edit = setSmart(pairedEdit(), false, ctx);
+  const companion = companionOf(edit, edit.video[0].id).clip;
+  const moved = moveAudioClip(edit, companion.id, 7, ctx);
+  assert.equal(round(moved.video.find(clip => clip.id === edit.video[0].id).start), 7);
+  assert.equal(round(buildTimeline(moved, ctx).audio[0].clips[0].start), 7);
+});
+
+test('splitting the picture splits the sound at the same frame', () => {
+  const edit = pairedEdit();
+  const split = splitClipAtTime(edit, edit.video[0].id, 2, ctx);
+  assert.equal(split.video.length, 4);
+
+  const left = split.video[0];
+  const right = split.video[1];
+  const halves = split.audio.flatMap(track => track.clips)
+    .filter(clip => clip.detachedFrom === left.id || clip.detachedFrom === right.id);
+  assert.equal(halves.length, 2);
+
+  const timeline = buildTimeline(split, ctx);
+  const sounds = timeline.audio.flatMap(track => track.clips)
+    .filter(entry => entry.start < 5)
+    .sort((a, b) => a.start - b.start);
+  assert.equal(round(sounds[0].end), 2);
+  assert.equal(round(sounds[1].start), 2);
+  // The tail belongs to the new right-hand picture clip, not the old one.
+  assert.equal(halves.find(clip => round(clip.in) === 2).detachedFrom, right.id);
+});
+
+test('unlinking freezes the sound where it is and stops it following', () => {
+  const edit = setSmart(pairedEdit(), false, ctx);
+  const companion = companionOf(edit, edit.video[0].id).clip;
+  const loose = unlinkAudioClip(edit, companion.id, ctx);
+
+  assert.equal(findAudioClip(loose, companion.id).clip.link, null);
+  assert.equal(isCompanion(findAudioClip(loose, companion.id).clip), false);
+
+  // The picture can now be moved and cut without dragging the sound along.
+  const moved = moveClipToTime(loose, edit.video[0].id, 9, ctx);
+  assert.equal(round(buildTimeline(moved, ctx).audio[0].clips[0].start), 0);
+
+  const split = splitClipAtTime(moved, edit.video[0].id, 11, ctx);
+  assert.equal(split.audio.flatMap(track => track.clips).length, 2);
+});
+
+test('relinking re-establishes the pair', () => {
+  const edit = pairedEdit();
+  const companion = companionOf(edit, edit.video[0].id).clip;
+  const loose = unlinkAudioClip(edit, companion.id, ctx);
+  const relinked = linkAudioClip(loose, companion.id, edit.video[0].id, ctx);
+  assert.ok(isCompanion(findAudioClip(relinked, companion.id).clip));
+});
+
+test('deleting the picture takes its linked sound with it, but not an unlinked one', () => {
+  const edit = pairedEdit();
+  const companion = companionOf(edit, edit.video[0].id).clip;
+
+  const gone = removeVideoClip(edit, edit.video[0].id, ctx);
+  assert.equal(findAudioClip(gone, companion.id), null);
+
+  const loose = unlinkAudioClip(edit, companion.id, ctx);
+  const kept = removeVideoClip(loose, edit.video[0].id, ctx);
+  assert.ok(findAudioClip(kept, companion.id));
+});
+
+test('overlapping picture spills its sound onto a second track', () => {
+  // A dissolve makes two picture clips overlap, so their sound cannot share one
+  // track without one covering the other.
+  const base = freshEdit();
+  const dissolved = setTransition(base, base.video[1].id, { type: 'dissolve', duration: 1 }, ctx);
+  const paired = autoLinkClipAudio(dissolved, ctx);
+  const used = paired.audio.filter(track => track.clips.length > 0);
+  assert.equal(used.length, 2);
+  assert.ok(used.every(track => track.forPicture));
+});
+
+test('a longer take stretches the pair, not just the picture', () => {
+  // The parity rule: an untrimmed clip adopts whatever take is selected now.
+  const edit = pairedEdit();
+  const longer = [{
+    ...scenes[0],
+    shots: [{ ...scenes[0].shots[0], selectedVideo: 'assets/d.mp4' }, ...scenes[0].shots.slice(1)]
+  }];
+  const wider = makeContext(longer, durations);
+  const after = normalize(edit, wider);
+  const timeline = buildTimeline(after, wider);
+  assert.equal(round(timeline.video[0].length), 6);
+  assert.equal(round(timeline.audio[0].clips[0].length), 6);
 });

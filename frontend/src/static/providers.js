@@ -53,7 +53,7 @@ async function callApi(url, options, credentials, providerLabel) {
 }
 
 /** Pull a finished generation (remote or data: URL) into the project folder. */
-async function downloadToProject(remoteUrl, prefix, fallbackExt, credentials) {
+async function downloadToProject(remoteUrl, prefix, fallbackExt, credentials, destination) {
   let response;
   try {
     // data: URLs need no proxy and always "download".
@@ -66,7 +66,7 @@ async function downloadToProject(remoteUrl, prefix, fallbackExt, credentials) {
   }
   if (!response.ok) throw new Error(`Could not download result: ${response.status}`);
   const blob = await response.blob();
-  return writeAsset(blob, prefix, blob.type ? null : fallbackExt);
+  return writeAsset(blob, prefix, blob.type ? null : fallbackExt, destination);
 }
 
 /** Push a local asset into Fal storage so remote models can read it by URL. */
@@ -92,19 +92,21 @@ async function uploadToFalMedia(assetPath, credentials) {
 }
 
 /** The shared module's host contract, browser edition. */
-function buildCtx(credentials) {
+function buildCtx(credentials, destination = null) {
   return {
     fetch: (url, options, providerLabel) => callApi(url, options, credentials, providerLabel || 'The provider'),
     credentials,
     readAssetDataUrl,
     uploadPublicUrl: (assetPath) => uploadToFalMedia(assetPath, credentials),
-    saveRemote: (url, prefix, ext) => downloadToProject(url, prefix, ext, credentials),
+    saveRemote: (url, prefix, ext) => downloadToProject(url, prefix, ext, credentials, destination),
     capabilities: { direct: false }
   };
 }
 
-export const generateImage = (req, credentials) => shared.generateImage(req, buildCtx(credentials));
-export const generateVideo = (req, credentials) => shared.generateVideo(req, buildCtx(credentials));
+// The destination rides on the request the same way it does on the server, so
+// a generated file lands in its shot's folder in both builds.
+export const generateImage = (req, credentials) => shared.generateImage(req, buildCtx(credentials, req.destination));
+export const generateVideo = (req, credentials) => shared.generateVideo(req, buildCtx(credentials, req.destination));
 export const generateText = (req, credentials) => shared.generateText(req, buildCtx(credentials));
 export const runLipSync = (req, credentials) => shared.runLipSync(req, buildCtx(credentials));
 

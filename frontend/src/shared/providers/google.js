@@ -87,19 +87,66 @@ export function buildGeminiImageBodies(parts, aspectRatio) {
 }
 
 // Which shape this key accepted, so the losing body is paid for once per
-// session rather than on every generation.
-let acceptedRatioShape = null;
+// session rather than on every generation. Keyed by API model: the two image
+// models are separate endpoints and need not agree on the config field.
+const acceptedRatioShape = new Map();
 
-export async function generateImage({ prompt, resolution, inputImagePaths }, ctx) {
+// --- which model, and how many references it will take ---------------------
+//
+// "Nano Banana" names two models with very different reference budgets, and
+// the studio can reach both. gemini-2.5-flash-image is the 3-image one;
+// gemini-3-pro-image-preview (Nano Banana Pro) documents up to 14. Sending a
+// fourth image to the small one is a 400 after every reference has already
+// been base64'd into the request, so the count is checked here, where the
+// message can name the model and say what to switch to.
+//
+// Nano Banana Pro also holds a *likeness* for at most five of those fourteen —
+// a soft limit (more people still generate, they just stop looking like
+// themselves), so it is not enforced as a throw.
+const GEMINI_IMAGE_MODELS = {
+  'google-gemini-image': { model: 'gemini-2.5-flash-image', label: 'Nano Banana', maxImages: 3 },
+  'google-gemini-image-pro': { model: 'gemini-3-pro-image-preview', label: 'Nano Banana Pro', maxImages: 14 }
+};
+
+const DEFAULT_GEMINI_IMAGE = GEMINI_IMAGE_MODELS['google-gemini-image'];
+const PRO_GEMINI_IMAGE = GEMINI_IMAGE_MODELS['google-gemini-image-pro'];
+
+/** The API model and reference ceiling behind a studio image-model id. */
+export function geminiImageModel(modelPath) {
+  return GEMINI_IMAGE_MODELS[modelPath] || DEFAULT_GEMINI_IMAGE;
+}
+
+// --- references ------------------------------------------------------------
+//
+// Sent as a plain run of image parts, with nothing interleaved.
+//
+// Labelling each one ("The second image:") was tried, so that a prompt could
+// address them by position the way ai.google.dev's composition examples do.
+// For multiple views of a single character — the common case here — it made
+// identity worse, not better: the numbering invites the model to treat four
+// references of one person as four people to reconcile. The prompt names the
+// character in prose and the references support it; nothing needs to count.
+export function referenceImageParts(images) {
+  return images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } }));
+}
+
+export async function generateImage({ modelPath, prompt, resolution, inputImagePaths }, ctx) {
   const apiKey = ctx.credentials.geminiKey;
   if (!apiKey) throw new Error('Google AI Studio key is not configured.');
-  // ai.google.dev caps gemini-2.5-flash-image at 3 images per prompt.
-  if (inputImagePaths.length > 3) throw new Error('Gemini Image accepts at most 3 input images.');
 
-  const imageParts = await Promise.all(inputImagePaths.map(async (assetPath) => {
-    const img = await assetToInlineImage(assetPath, ctx);
-    return { inlineData: { mimeType: img.mimeType, data: img.data } };
-  }));
+  const target = geminiImageModel(modelPath);
+  if (inputImagePaths.length > target.maxImages) {
+    throw new Error(
+      `${target.label} (${target.model}) accepts at most ${target.maxImages} input ` +
+      `image${target.maxImages === 1 ? '' : 's'}; this request has ${inputImagePaths.length}.` +
+      (target.maxImages < PRO_GEMINI_IMAGE.maxImages
+        ? ` Switch the shot to ${PRO_GEMINI_IMAGE.label} to send up to ${PRO_GEMINI_IMAGE.maxImages}.`
+        : '')
+    );
+  }
+
+  const images = await Promise.all(inputImagePaths.map(assetPath => assetToInlineImage(assetPath, ctx)));
+  const imageParts = referenceImageParts(images);
 
   const aspectRatio = geminiAspectRatio(resolution);
   // Editing is where the config field is least trusted — the model leans hard
@@ -107,31 +154,33 @@ export async function generateImage({ prompt, resolution, inputImagePaths }, ctx
   // outright. One line of prompt is the documented way through. It is added
   // here rather than in prompt composition so the recipe the project records
   // stays exactly what was typed.
-  const promptText = aspectRatio && imageParts.length > 0
+  const promptText = aspectRatio && images.length > 0
     ? `${prompt}\n\nOutput the image in a ${aspectRatio} aspect ratio, recomposing the framing to fill it rather than padding or cropping to the input's shape.`
     : prompt;
 
+  // Instruction first, then the references it describes.
   const bodies = buildGeminiImageBodies([{ text: promptText }, ...imageParts], aspectRatio);
-  const known = acceptedRatioShape !== null && acceptedRatioShape < bodies.length;
+  const cached = acceptedRatioShape.get(target.model);
+  const known = cached !== undefined && cached < bodies.length;
   const ordered = known
-    ? [bodies[acceptedRatioShape], ...bodies.filter((_, i) => i !== acceptedRatioShape)]
+    ? [bodies[cached], ...bodies.filter((_, i) => i !== cached)]
     : bodies;
 
   let data = null;
-  let lastError = 'Gemini Image API error';
+  let lastError = `${target.label} API error`;
   for (const [index, body] of ordered.entries()) {
     const res = await ctx.fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${target.model}:generateContent?key=${apiKey}`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
-      'Gemini Image'
+      `Gemini Image (${target.label})`
     );
     const parsed = await res.json();
     if (res.ok && !parsed.error) {
-      acceptedRatioShape = bodies.indexOf(ordered[index]);
+      acceptedRatioShape.set(target.model, bodies.indexOf(ordered[index]));
       data = parsed;
       break;
     }
-    lastError = parsed.error?.message || `Gemini Image API error (${res.status})`;
+    lastError = parsed.error?.message || `${target.label} API error (${res.status})`;
     // Only an argument complaint means the *shape* was wrong. A quota or key
     // problem will not be fixed by reshaping, and retrying it twice more just
     // makes the failure slower.
@@ -140,7 +189,7 @@ export async function generateImage({ prompt, resolution, inputImagePaths }, ctx
   if (!data) throw new Error(lastError);
 
   const part = data.candidates?.flatMap(c => c.content?.parts || []).find(p => p.inlineData?.data);
-  if (!part) throw new Error('Gemini Image returned no image output.');
+  if (!part) throw new Error(`${target.label} returned no image output.`);
 
   const mimeType = part.inlineData.mimeType || 'image/png';
   const ext = mimeType === 'image/jpeg' ? '.jpg' : mimeType === 'image/webp' ? '.webp' : '.png';

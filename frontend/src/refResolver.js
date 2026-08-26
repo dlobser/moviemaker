@@ -6,12 +6,23 @@
 // affected a generation at all. This module ranks everything the board knows
 // about one asset so composeGenerationPrompt can spend spare capacity on it.
 
-import { assetPrimaryImage, normalizeTag } from './promptTags.js';
+import { assetInputImages, assetPrimaryImage, normalizeTag } from './promptTags.js';
 
 /**
- * Ranked reference candidates for one tagged asset:
+ * Ranked reference candidates for one tagged asset.
  *
- *   1. the asset's primary image        (rank 0 — today's behaviour, always first)
+ * **A ticked asset is its own answer.** When the asset editor has images ticked,
+ * those are the whole candidate list and nothing is inferred around them — an
+ * explicit choice is not a hint to be topped up. Before this, ticking governed
+ * only the asset's own artwork, and a shot with spare slots quietly filled them
+ * with every board reference that mentioned the asset: a character with six
+ * sheets on the board sent all six into a fourteen-slot model, which is not
+ * what anyone ticking four boxes meant.
+ *
+ * With nothing ticked there is no explicit choice to honour, so the board's
+ * ranking still applies:
+ *
+ *   1. the asset's primary image        (rank 0 — always first)
  *   2. board refs linked to the asset   (ref.assetId === asset.id)
  *   3. board refs whose tags match      (ref.tags[] contains the asset's tag)
  *
@@ -19,7 +30,7 @@ import { assetPrimaryImage, normalizeTag } from './promptTags.js';
  * come first; ties keep board insertion order. Deduped by path. `capacityHint`
  * caps the list length when given.
  *
- * Returns [{ path, refId?, reason: 'primary'|'linked'|'tag-match', kind?, rank }]
+ * Returns [{ path, refId?, reason: 'primary'|'ticked'|'linked'|'tag-match', kind?, rank }]
  */
 export function collectAssetReferences({ asset, references = [], capacityHint = null, refKinds = null }) {
   if (!asset) return [];
@@ -30,8 +41,20 @@ export function collectAssetReferences({ asset, references = [], capacityHint = 
     seen.add(entry.path);
     out.push({ ...entry, rank: out.length });
   };
+  const capped = () => (capacityHint != null && capacityHint >= 0 ? out.slice(0, capacityHint) : out);
 
   const primary = assetPrimaryImage(asset);
+
+  // The ticks, when there are any. The primary leads if it is among them —
+  // it is the asset's identity image and the slot order is load-bearing on
+  // models that address their references by position.
+  const ticked = assetInputImages(asset);
+  if (ticked.length > 0) {
+    if (primary && ticked.includes(primary)) push({ path: primary, reason: 'primary' });
+    ticked.forEach(path => push({ path, reason: 'ticked' }));
+    return capped();
+  }
+
   if (primary) push({ path: primary, reason: 'primary' });
 
   const kindMatches = (ref) => !Array.isArray(refKinds) || refKinds.includes(ref.kind);
@@ -49,7 +72,7 @@ export function collectAssetReferences({ asset, references = [], capacityHint = 
   ));
   byKindPreference(tagMatched).forEach(ref => push({ path: ref.path, refId: ref.id, reason: 'tag-match', kind: ref.kind }));
 
-  return capacityHint != null && capacityHint >= 0 ? out.slice(0, capacityHint) : out;
+  return capped();
 }
 
 // Explicit beats automatic; a subject reference beats a style one on models

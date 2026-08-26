@@ -36,8 +36,21 @@ export const IMAGE_MODELS = [
   { id: 'fal-ai/stable-diffusion-v35-medium', label: 'SD 3.5 Medium', provider: 'fal-ai', price: 0.015, refImages: 0 },
 
   // --- Google (direct) ---
-  // ai.google.dev caps gemini-2.5-flash-image at 3 images per prompt.
-  { id: 'google-gemini-image', label: 'Gemini 2.5 Flash Image (Nano Banana)', provider: 'google', priceNote: 'per Google AI Studio rates', refImages: 3 },
+  // Two different models wear the "Nano Banana" name and they do not have the
+  // same reference budget. gemini-3-pro-image-preview (Nano Banana Pro) is
+  // documented at up to 14 references — 6 objects, 5 characters, 3 style.
+  // The 3 on gemini-2.5-flash-image is the long-standing best-practice figure
+  // rather than a documented hard cap: ai.google.dev states no maximum for
+  // that model. Left at 3 because more has never composed reliably on it, and
+  // Pro is the answer when you need more. Selecting "Nano Banana" and finding that only three references
+  // went is the whole reason both are listed separately.
+  //
+  // Both address their references positionally — see REFERENCE TAGGING. The
+  // Google adapter labels each image part "Image N:" on the way out, so the
+  // "image 2" a composed prompt contains lands on the picture the studio put
+  // in slot 2 rather than on whichever one the model felt was second.
+  { id: 'google-gemini-image', label: 'Gemini 2.5 Flash Image (Nano Banana) — 3 refs', provider: 'google', priceNote: 'per Google AI Studio rates', refImages: 3, refTagStyle: 'gemini' },
+  { id: 'google-gemini-image-pro', label: 'Gemini 3 Pro Image (Nano Banana Pro) — up to 14 refs', provider: 'google', priceNote: 'per Google AI Studio rates', refImages: 14, refTagStyle: 'gemini' },
 
   // --- OpenAI (direct) ---
   { id: 'chatgpt', label: 'DALL-E 3', provider: 'openai', price: 0.04, priceNote: 'standard 1024px', refImages: 0, promptLimit: 4000 },
@@ -81,10 +94,25 @@ export const IMAGE_MODELS = [
     { value: '3:2', label: 'Photo (3:2)' },
     { value: '2:3', label: 'Portrait photo (2:3)' }
   ] },
-  { id: 'atlas:qwen/qwen-image-2.0/text-to-image', label: 'Qwen-Image 2.0 (Atlas, open weights)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1 },
-  { id: 'atlas:z-image/turbo', label: 'Z-Image Turbo (Atlas, open weights)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1 },
-  { id: 'atlas:bytedance/seedream-v5.0-pro/text-to-image', label: 'Seedream 5.0 Pro (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1 },
-  { id: 'atlas:google/nano-banana-pro/text-to-image', label: 'Nano Banana Pro (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1 }
+  // flux-dev above is the only Atlas image model here that documents an
+  // `image` field, and the reason the single-image request shape exists at all.
+  // Every one below it is text-to-image and documents no image input — checked
+  // field by field against its page on atlascloud.ai. They were all listed at
+  // one reference apiece, which was not a harmless over-count: Atlas takes the
+  // request, ignores the field it has no schema for, bills the generation and
+  // returns a picture that never saw the reference the shot was built around.
+  // A wrong picture that cost money is worse than a refusal, so the honest
+  // number is zero and the studio now says so before anything is sent.
+  { id: 'atlas:qwen/qwen-image-2.0/text-to-image', label: 'Qwen-Image 2.0 (Atlas, open weights)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 0 },
+  { id: 'atlas:z-image/turbo', label: 'Z-Image Turbo (Atlas, open weights)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 0 },
+  { id: 'atlas:bytedance/seedream-v5.0-pro/text-to-image', label: 'Seedream 5.0 Pro (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 0 },
+  // Nano Banana Pro on Atlas is two endpoints, not one. /text-to-image has no
+  // image input; /edit is the one that takes references, as an `images` array
+  // Atlas documents at 1..10. Ten rather than the model's own 14 because the
+  // host's ceiling is the one that rejects the request, and `images` is
+  // required there — /edit with nothing to edit is not a text-to-image call.
+  { id: 'atlas:google/nano-banana-pro/text-to-image', label: 'Nano Banana Pro t2i (Atlas) — no refs', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 0 },
+  { id: 'atlas:google/nano-banana-pro/edit', label: 'Nano Banana Pro edit (Atlas) — up to 10 refs', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 10, refMode: 'required', refTagStyle: 'gemini' }
 ];
 
 export const VIDEO_MODELS = [
@@ -153,7 +181,19 @@ export const VIDEO_MODELS = [
   { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/text-to-video', label: 'Seedance 2.0 t2v (Atlas)', provider: 'atlas', priceNote: '$0.112 / s', refImages: 0, durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas)', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, refMode: 'required', durations: ['4', '5', '6', '8', '10', '12'] }
+  // Seedance 1.5 Pro's plain image-to-video, id taken verbatim from the cURL
+  // sample on its atlascloud.ai model page. It is also the control for the
+  // Spicy variant below: if this one runs on a key and Spicy answers
+  // "not found", the id is fine and the *variant* is not reachable.
+  { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video', label: 'Seedance 1.5 Pro i2v (Atlas)', provider: 'atlas', priceNote: '$0.047 / s', refImages: 1, refMode: 'required', durations: ['4', '5', '6', '8', '10', '12'] },
+  // Spicy answers `{"code":400,"msg":"not found"}` on the tested key, which is
+  // Atlas's reply for a model the caller cannot reach as much as for one that
+  // does not exist — the same ambiguity Higgsfield's `model_not_found` has, and
+  // the reason those resells were dropped from this list. The id matches the
+  // path on atlascloud.ai and the plain i2v id above verified verbatim, so the
+  // spelling is not the problem. Gated variants usually need account
+  // verification. Left listed, labelled, rather than silently removed.
+  { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas) — may need account verification', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, refMode: 'required', durations: ['4', '5', '6', '8', '10', '12'] }
 ];
 
 export const IMAGE_ASPECT_RATIOS = [
@@ -337,11 +377,58 @@ export function refAudioCapacity(type, id) {
 // The token is purely positional, which makes the send order in
 // composeGenerationPrompt load-bearing: renumber the images and every pointer
 // in the prompt silently addresses the wrong picture.
+//
+// Not every positional model spells the pointer the same way, which is why
+// this is a table rather than one function. Seedance invented an @-token;
+// Gemini has no such syntax at all and is addressed in plain English by
+// ordinal ("use the pose from image 2"), which only resolves because the
+// Google adapter numbers the parts it sends. Writing "@image2" to Gemini gets
+// a literal at-sign read as prose and a reference nothing points at.
 
+// `keepsDescription` is the difference between a pointer that *replaces* what
+// the tag said and one that *annotates* it, and it is not a style choice.
+//
+// Seedance indexes on the token. "@image1 crashes through @image2" is the whole
+// instruction, and repeating the description alongside it competes with the
+// image rather than reinforcing it.
+//
+// Gemini has no token to index on. It reads the prompt as English, so throwing
+// away "Ralph (grizzled mechanic)" to say "image 1" loses everything the model
+// could have used and gains nothing — the number only means something because
+// the adapter labelled the parts. Both together is what it wants:
+// "Ralph (grizzled mechanic) (image 1)".
+// One asset can occupy several slots — four ticked images of a character are
+// four references, all of them hers — so a format lists indices rather than
+// formatting one. A tag that named only the first slot left the other three
+// unaddressed, which on these models means largely unused: they were paid for,
+// sent, and then ignored because nothing in the prompt referred to them.
 const REF_TAG_FORMATS = {
   // @image1 … @image9. Both cases appear in ByteDance's own material; lower
-  // case is what the English-language docs standardise on.
-  seedance: (index) => `@image${index + 1}`
+  // case is what the English-language docs standardise on. Several are simply
+  // juxtaposed — there is no list syntax, and a comma would be read as prose.
+  seedance: {
+    sample: '@imageN',
+    list: (indices) => indices.map(index => `@image${index + 1}`).join(' ')
+  },
+  // Gemini image models (Nano Banana, Nano Banana Pro). This one is measured
+  // rather than reasoned, and the measurement went against the documentation.
+  //
+  // ai.google.dev addresses inputs by ordinal — "the blue floral dress from the
+  // first image" — so that phrasing was tried first and it made character
+  // identity markedly worse. The docs' example is *composing one subject out of
+  // several different ones*, which is the opposite of holding one likeness
+  // across several views of it. Bare juxtaposed tokens hold the character; an
+  // English list of ordinals does not. No @: that is Seedance's marker and
+  // Gemini reads it as literal punctuation.
+  //
+  // `withDescription` is what keeps the prose. The description says who this
+  // is, the tokens say which pictures show her, and dropping either one costs
+  // the model something it was using.
+  gemini: {
+    sample: 'imageN',
+    list: (indices) => indices.map(index => `image${index + 1}`).join(' '),
+    withDescription: (description, token) => `${description} ${token}`
+  }
 };
 
 /** Whether this model wants its references pointed at from inside the prompt. */
@@ -354,8 +441,43 @@ export function usesRefTags(type, id) {
  * model has no such convention.
  */
 export function refTagToken(type, id, index) {
+  return refTagTokens(type, id, [index]);
+}
+
+/**
+ * The token that addresses *every* slot in `indices` at once — "images 1, 2
+ * and 4". Empty when the model has no such convention.
+ *
+ * How several are joined is the model's business, not the caller's: Seedance
+ * juxtaposes bare tokens, Gemini needs something that reads as a sentence.
+ */
+export function refTagTokens(type, id, indices) {
   const format = REF_TAG_FORMATS[modelCapabilities(type, id).refTagStyle];
-  return format ? format(index) : '';
+  const slots = (indices || []).filter(index => Number.isInteger(index));
+  return format && slots.length ? format.list(slots) : '';
+}
+
+/**
+ * What this model's pointers look like, for the UI to show ('@imageN'), or ''
+ * when the model has no such convention. Never build a real pointer from it.
+ */
+export function refTagSample(type, id) {
+  const format = REF_TAG_FORMATS[modelCapabilities(type, id).refTagStyle];
+  return format ? format.sample : '';
+}
+
+/**
+ * The finished replacement for one tag: the pointer, joined to the description
+ * the way this model wants it.
+ *
+ * A model with no `withDescription` indexes on the token alone and the prose
+ * only competes with it — that is Seedance. One that has it wants both.
+ */
+export function refTagReplacement(type, id, indices, description) {
+  const format = REF_TAG_FORMATS[modelCapabilities(type, id).refTagStyle];
+  const token = refTagTokens(type, id, indices);
+  if (!token) return description;
+  return format.withDescription ? format.withDescription(description, token) : token;
 }
 
 /**

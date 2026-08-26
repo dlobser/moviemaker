@@ -94,6 +94,10 @@ export function createAudioTrack(name, overrides = {}) {
     gain: 1,
     muted: false,
     solo: false,
+    // Set on tracks that hold picture clips own soundtracks, so imported music
+    // and voiceover never get one dropped into the middle of them, and muting
+    // all the dialogue at once stays one click.
+    forPicture: false,
     clips: [],
     ...overrides
   };
@@ -391,6 +395,7 @@ function normalizeAudioTrack(raw) {
     gain: finiteOr(raw?.gain, 1),
     muted: Boolean(raw?.muted),
     solo: Boolean(raw?.solo),
+    forPicture: Boolean(raw?.forPicture),
     clips: (Array.isArray(raw?.clips) ? raw.clips : []).map(normalizeAudioClip)
   };
 }

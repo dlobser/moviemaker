@@ -1,9 +1,23 @@
 // Timeline playback.
 //
-// Two video elements take turns. The one under the playhead is drawn to a
-// canvas every frame; the next clip is loaded and seeked on the spare element
-// well before it is needed, so a cut costs nothing at the boundary and a
-// dissolve has both halves already running.
+// A pool of video elements takes turns. The one under the playhead is drawn to
+// a canvas every frame; neighbouring clips are loaded and seeked on spare
+// elements well before they are needed, so a cut costs nothing at the boundary
+// and a dissolve has both halves already running.
+//
+// Two rules keep the picture up, and both exist because breaking either one
+// looks exactly like "the preview is broken":
+//
+//   * Never clear the canvas unless there is something to put on it. Pointing a
+//     video element at a file costs about 100ms before there is a frame to
+//     draw, and clearing first turned every one of those into a black flash —
+//     over half the frames of a fast scrub. Holding the previous frame until
+//     the next one decodes is what every NLE does, and it is not a compromise.
+//   * Never make the clip under the playhead wait for a slot. Slots are claimed
+//     by preferring one that already holds the same *file* (free), then an idle
+//     one, then whatever the playhead is furthest from. The old "protect these
+//     four clips" rule could, with a pool of three, refuse a slot to the very
+//     clip being drawn — and then the picture was gone until you moved again.
 //
 // The AudioContext clock is the master. Video chases it, never the other way
 // round: media elements drift by tens of milliseconds over a few seconds and
@@ -18,6 +32,16 @@
 
 import { clipsAtTime } from './timing.js';
 import { AudioScheduler } from './AudioScheduler.js';
+
+/**
+ * How many video elements to keep.
+ *
+ * Sized so the clip under the playhead, one dissolving into it, and two
+ * neighbours either side can all be loaded at once with room to spare. Three
+ * was fewer than the draw loop wanted warm, so scrubbing spent its time
+ * evicting and reloading the same handful of files.
+ */
+const SLOT_COUNT = 8;
 
 /** Past this much drift, seek. Below it, nudge the rate instead. */
 const HARD_CORRECT = 0.25;
@@ -63,11 +87,16 @@ export class PreviewEngine {
       resolveUrl: this.resolveUrl
     });
 
-    // Three, not two: current, next AND previous stay warm, so scrubbing
-    // backwards across a cut does not hit a cold src assignment.
-    this.slots = [this.createSlot(), this.createSlot(), this.createSlot()];
+    this.slots = Array.from({ length: SLOT_COUNT }, () => this.createSlot());
+    // False until anything has ever been drawn, which is the only moment a
+    // black canvas is the honest answer rather than a dropped frame.
+    this.hasPainted = false;
     this.images = new Map();   // asset path -> HTMLImageElement
     this.urls = new Map();     // asset path -> object/http url
+    // Sources whose URL changed under us — a preview proxy finished building.
+    // Swapping one mid-play would drop a frame at a moment nobody asked for it,
+    // so they are held until the transport next stops.
+    this.pendingRefresh = new Set();
     this.frame = null;
 
     // The loop runs from construction, not from play(). Loading a clip is
@@ -102,6 +131,10 @@ export class PreviewEngine {
       seekTarget: null,
       seeking: false,
       seekIssuedAt: 0,
+      // Whether this element has ever decoded a frame. Once it has, it can be
+      // drawn at any time — including mid-seek, when `readyState` briefly
+      // reports HAVE_METADATA but the previous frame is still perfectly good.
+      hasFrame: false,
       // Generation token: a superseded loadInto must never mark the slot
       // ready with stale content (the AudioScheduler pattern).
       loadToken: 0
@@ -180,6 +213,41 @@ export class PreviewEngine {
     return url;
   }
 
+  /**
+   * A source now resolves to something better than what we loaded.
+   *
+   * The one caller is the proxy cache: a full-resolution clip has finished
+   * transcoding into something that actually seeks, and the slot holding the
+   * original should pick it up. Deferred while playing — a reload is a black
+   * frame, and one arriving unbidden mid-take is worse than waiting.
+   */
+  refreshSources(paths) {
+    for (const path of paths || []) this.pendingRefresh.add(path);
+    if (!this.playing) this.flushRefresh();
+  }
+
+  flushRefresh() {
+    if (this.pendingRefresh.size === 0) return;
+    for (const path of this.pendingRefresh) {
+      const url = this.urls.get(path);
+      if (url && url.startsWith('blob:')) URL.revokeObjectURL(url);
+      this.urls.delete(path);
+      this.images.delete(path);
+      for (const slot of this.slots) {
+        if (slot.path !== path) continue;
+        // Forcing the slot cold is what makes the next draw reload it; the
+        // token bump stops an in-flight load marking the old media ready.
+        slot.loadToken += 1;
+        slot.path = null;
+        slot.clipId = null;
+        slot.ready = false;
+      }
+      this.scheduler.forget(path);
+    }
+    this.pendingRefresh.clear();
+    if (!this.playing) this.drawAt(this.playhead);
+  }
+
   async imageFor(path) {
     if (this.images.has(path)) return this.images.get(path);
     const url = await this.urlFor(path);
@@ -197,15 +265,56 @@ export class PreviewEngine {
   }
 
   /**
-   * The slot already showing this clip, an empty one, or one whose clip is
-   * not in `keep` (clip ids to protect: current + incoming during dissolves,
-   * current + neighbours during preload). Null when everything is protected —
-   * callers skip rather than evict.
+   * A slot to put this clip's media in.
+   *
+   * The order of preference is the whole performance story. Reusing a slot that
+   * already holds the same *file* costs nothing — no `src` assignment, none of
+   * the ~100ms before there is a frame — and it is a common case: the two
+   * halves of a split clip, or one take used twice, are one file. Everything
+   * below that costs a reload, so the last resort gives up whatever the
+   * playhead is furthest from.
+   *
+   * `onScreen` is only ever the one or two clips actually being drawn. Anything
+   * broader risks refusing a slot to the clip you are looking at.
    */
-  claimSlot(entry, keep = []) {
-    const existing = this.slots.find(slot => slot.clipId === entry.clip.id);
-    if (existing) return existing;
-    return this.slots.find(slot => !keep.includes(slot.clipId) && slot.clipId !== entry.clip.id) || null;
+  claimSlot(entry, onScreen = []) {
+    const sameClip = this.slots.find(slot => slot.clipId === entry.clip.id);
+    if (sameClip) return sameClip;
+
+    const path = entry.resolved.path;
+    const samePath = path && this.slots.find(slot => (
+      slot.path === path && !onScreen.includes(slot.clipId)
+    ));
+    if (samePath) return samePath;
+
+    const idle = this.slots.find(slot => !slot.clipId);
+    if (idle) return idle;
+
+    let worst = null;
+    let worstDistance = -1;
+    for (const slot of this.slots) {
+      if (onScreen.includes(slot.clipId)) continue;
+      const distance = this.slotDistance(slot);
+      if (distance > worstDistance) {
+        worstDistance = distance;
+        worst = slot;
+      }
+    }
+    return worst;
+  }
+
+  /** How far the playhead is from a clip, in seconds; 0 while it is inside it. */
+  distanceOf(entry) {
+    if (!entry) return Infinity;
+    const time = this.playing ? this.now() : this.playhead;
+    if (time >= entry.start && time < entry.end) return 0;
+    return time < entry.start ? entry.start - time : time - entry.end;
+  }
+
+  /** The same, for whatever a slot is currently holding. */
+  slotDistance(slot) {
+    if (!slot.clipId) return Infinity;
+    return this.distanceOf(this.timeline?.video.find(entry => entry.clip.id === slot.clipId));
   }
 
   async loadInto(slot, entry) {
@@ -218,6 +327,9 @@ export class PreviewEngine {
     const token = ++slot.loadToken;
     slot.clipId = entry.clip.id;
     slot.ready = false;
+    // Only a new file invalidates the decoded frame; retargeting a slot to
+    // another clip of the same source keeps it, which is the point of doing so.
+    if (slot.path !== entry.resolved.path) slot.hasFrame = false;
     slot.seekTarget = null;
     slot.seeking = false;
 
@@ -259,6 +371,8 @@ export class PreviewEngine {
     this.scheduler.stop();
     for (const slot of this.slots) slot.element.pause();
     this.onStateChange({ playing: false });
+    // Proxies that landed while the film was running get picked up now.
+    this.flushRefresh();
   }
 
   toggle() {
@@ -316,53 +430,88 @@ export class PreviewEngine {
   drawAt(time) {
     if (!this.timeline) return;
     const { current, incoming, mix } = clipsAtTime(this.timeline, time);
-    const paint = this.context2d;
 
-    paint.globalAlpha = 1;
-    paint.fillStyle = '#000';
-    paint.fillRect(0, 0, this.canvas.width, this.canvas.height);
-
+    // Genuinely nothing here — past the end, or an empty timeline.
     if (!current) {
-      this.idleSlots(null, null);
+      this.clearToBlack();
+      this.idleSlots();
       return;
     }
 
-    const next = this.timeline.video[current.index + 1];
-    const previous = this.timeline.video[current.index - 1];
-    // Everything worth keeping warm; claimSlot never evicts these.
-    const keep = [current.clip.id, incoming?.clip.id, next?.clip.id, previous?.clip.id].filter(Boolean);
-
-    this.syncSlot(current, time, keep);
-    this.paintEntry(current, 1);
-
-    if (incoming) {
-      this.syncSlot(incoming, time, keep);
-      this.paintEntry(incoming, mix);
-      this.mixAudio(current, 1 - mix, incoming, mix);
-      // With three slots it is safe to warm the next clip even mid-dissolve —
-      // the two on screen are protected by `keep`.
-      this.preload(current, [current.clip.id, incoming.clip.id, next?.clip.id].filter(Boolean));
-    } else {
+    // A clip pointing at nothing renders black, so it has to preview black too.
+    // Holding the previous clip's frame over it is the one case where holding
+    // would lie about what the export is going to contain.
+    if (current.resolved.kind === 'missing' && !incoming) {
+      this.clearToBlack();
       this.mixAudio(current, 1, null, 0);
-      this.preload(current, keep);
+      this.preload(current, [current.clip.id]);
+      return;
     }
 
-    this.paintDip(current, incoming, time);
+    // Only what is being drawn is untouchable. Neighbours are warmed on a
+    // best-effort basis and can always give their slot up.
+    const onScreen = [current.clip.id, incoming?.clip.id].filter(Boolean);
+
+    this.syncSlot(current, time, onScreen);
+    if (incoming) this.syncSlot(incoming, time, onScreen);
+
+    const currentFrame = this.frameFor(current);
+    const incomingFrame = incoming ? this.frameFor(incoming) : null;
+
+    if (currentFrame || incomingFrame) {
+      const paint = this.context2d;
+      paint.globalAlpha = 1;
+      paint.fillStyle = '#000';
+      paint.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+      if (currentFrame) {
+        paint.globalAlpha = 1;
+        drawFitted(paint, currentFrame.source, currentFrame.width, currentFrame.height, this.canvas);
+      }
+      if (incomingFrame) {
+        paint.globalAlpha = Math.max(0, Math.min(1, mix));
+        drawFitted(paint, incomingFrame.source, incomingFrame.width, incomingFrame.height, this.canvas);
+      }
+
+      this.paintDip(current, incoming, time);
+      paint.globalAlpha = 1;
+      this.hasPainted = true;
+    } else if (!this.hasPainted) {
+      // Nothing has ever been drawable, so there is no previous frame to hold.
+      this.clearToBlack();
+    }
+    // Otherwise the last good frame stays up while the next one loads.
+
+    if (incoming) this.mixAudio(current, 1 - mix, incoming, mix);
+    else this.mixAudio(current, 1, null, 0);
+
+    this.preload(current, onScreen);
+  }
+
+  clearToBlack() {
+    const paint = this.context2d;
     paint.globalAlpha = 1;
+    paint.fillStyle = '#000';
+    paint.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.hasPainted = false;
   }
 
   /** Get the right media onto a slot and keep it in step with the clock. */
-  syncSlot(entry, time, keep = []) {
+  syncSlot(entry, time, onScreen = []) {
     if (entry.resolved.kind === 'image' || entry.resolved.kind === 'missing') return;
 
-    const slot = this.claimSlot(entry, keep);
+    const slot = this.claimSlot(entry, onScreen);
     if (!slot) return;
     if (slot.clipId !== entry.clip.id || slot.path !== entry.resolved.path) {
       this.loadInto(slot, entry);
       return;
     }
-    // Nothing decodable yet — there is no frame to show and no point steering.
-    if (slot.element.readyState < 2) return;
+    // Nothing decoded yet — no frame to show and no point steering. Note this
+    // is `hasFrame`, not `readyState`: an element mid-seek reports
+    // HAVE_METADATA, and refusing to steer it then is how a scrub used to fight
+    // itself.
+    if (!slot.hasFrame && slot.element.readyState < 2) return;
+    if (slot.element.readyState >= 2) slot.hasFrame = true;
 
     // A wedged seek (seeking to exactly `duration` never fires `seeked` in
     // most browsers) must not freeze the slot forever.
@@ -401,27 +550,42 @@ export class PreviewEngine {
     }
   }
 
-  paintEntry(entry, alpha) {
-    const paint = this.context2d;
-    paint.globalAlpha = Math.max(0, Math.min(1, alpha));
+  /**
+   * What there is to draw for this entry right now, or null.
+   *
+   * Asking is the same act as starting: a still that has not been fetched yet
+   * kicks off its own load on the way past. Separating "is there a frame" from
+   * "paint it" is what lets the caller decide to hold the last one instead of
+   * clearing to black.
+   */
+  frameFor(entry) {
+    if (entry.resolved.kind === 'missing') return null;
 
     if (entry.resolved.kind === 'image') {
       const image = this.images.get(entry.resolved.path);
       if (image?.complete && image.naturalWidth) {
-        drawFitted(paint, image, image.naturalWidth, image.naturalHeight, this.canvas);
-      } else {
-        this.imageFor(entry.resolved.path);
+        return { source: image, width: image.naturalWidth, height: image.naturalHeight };
       }
-      return;
+      this.imageFor(entry.resolved.path);
+      return null;
     }
-
-    if (entry.resolved.kind === 'missing') return;
 
     const slot = this.slots.find(candidate => candidate.clipId === entry.clip.id);
     const element = slot?.element;
-    if (element && element.readyState >= 2 && element.videoWidth) {
-      drawFitted(paint, element, element.videoWidth, element.videoHeight, this.canvas);
+    if (!element) return null;
+
+    // `readyState >= 2` is the wrong question, and asking it was the single
+    // biggest cause of a black preview. Assigning `currentTime` drops an
+    // element to HAVE_METADATA for a few milliseconds while it decodes the new
+    // frame -- so during a scrub, which seeks on every tick, the answer was
+    // "not ready" almost every frame even though the element was sitting there
+    // holding a perfectly good picture. What matters is whether it has ever
+    // decoded a frame; after that `drawImage` always produces one.
+    if (element.readyState >= 2) slot.hasFrame = true;
+    if (slot.hasFrame && element.videoWidth) {
+      return { source: element, width: element.videoWidth, height: element.videoHeight };
     }
+    return null;
   }
 
   /** A dip to black is a fade out and a fade in either side of a hard cut. */
@@ -480,18 +644,26 @@ export class PreviewEngine {
    * fetching by its own cut point started late and then had to be yanked into
    * place by drift correction.
    */
-  preload(current, keep = []) {
+  preload(current, onScreen = []) {
     const warm = (entry) => {
       if (!entry || entry.resolved.kind === 'missing') return;
       if (entry.resolved.kind === 'image') {
         this.imageFor(entry.resolved.path);
         return;
       }
-      const slot = this.claimSlot(entry, keep);
-      if (slot && slot.clipId !== entry.clip.id) this.loadInto(slot, entry);
+      const slot = this.claimSlot(entry, onScreen);
+      if (!slot || slot.clipId === entry.clip.id) return;
+      // Never evict something nearer the playhead than the thing being warmed.
+      // Two neighbours taking turns to throw each other out is worse than
+      // neither of them being warm.
+      if (slot.clipId && this.slotDistance(slot) <= this.distanceOf(entry)) return;
+      this.loadInto(slot, entry);
     };
+    // Nearest first, so it wins the slot when only one is going spare.
     warm(this.timeline.video[current.index + 1]);
     warm(this.timeline.video[current.index - 1]);
+    warm(this.timeline.video[current.index + 2]);
+    warm(this.timeline.video[current.index - 2]);
   }
 
   idleSlots() {

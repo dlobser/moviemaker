@@ -82,6 +82,11 @@ export class AudioScheduler {
     return job;
   }
 
+  /** Drop a decoded buffer so the next schedule fetches the source again. */
+  forget(path) {
+    this.buffers.delete(path);
+  }
+
   start(playhead) {
     this.stop();
     if (!this.timeline) return;
