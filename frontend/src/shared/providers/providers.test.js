@@ -16,6 +16,11 @@ import {
   buildAtlasImageBodies, buildAtlasVideoBodies, atlasImageSize, resolveAudioReference,
   isAtlasGeminiImage, usesAtlasImageArray
 } from './atlas.js';
+import {
+  buildVeniceImageBody, buildVeniceEditBody, buildVeniceVideoBody,
+  veniceAspectRatio, veniceResolutionTier, veniceDuration,
+  isVeniceEditModel, isVeniceReferenceVideo, describeVeniceError
+} from './venice.js';
 import { buildGeminiImageBodies, geminiAspectRatio, geminiImageModel, referenceImageParts } from './google.js';
 import { dalleSize } from './openai.js';
 import { generateImage, generateVideo, generateText } from './index.js';
@@ -537,4 +542,442 @@ test('Runway and Kling refuse to run without direct network access', async () =>
   const ctx = { credentials: { runwayKey: 'k', klingKey: 'k' }, capabilities: { direct: false } };
   await assert.rejects(generateVideo({ provider: 'runway', prompt: 'x' }, ctx), /no CORS support/);
   await assert.rejects(generateVideo({ provider: 'kling', prompt: 'x' }, ctx), /no CORS support/);
+});
+
+// --- Venice ----------------------------------------------------------------
+//
+// Venice's split of every image model into a generator and an editor is the
+// thing these tests exist to hold. The generator has no image field at all, so
+// a reference handed to it does not fail — it vanishes, and a picture that
+// ignored it is billed and saved. The adapter has to refuse instead.
+
+test('Venice tells its generators and its editors apart from the id alone', () => {
+  assert.equal(isVeniceEditModel('qwen-image-3-pro'), false);
+  assert.equal(isVeniceEditModel('seedream-v5-pro'), false);
+  assert.equal(isVeniceEditModel('qwen-image-3-pro-edit'), true);
+  // The infix spelling, which is the one that would be missed by a suffix test.
+  assert.equal(isVeniceEditModel('qwen-edit-uncensored'), true);
+  assert.equal(isVeniceEditModel('firered-image-edit'), true);
+});
+
+test('the venice host routes nowhere else', () => {
+  assert.deepEqual(resolveRouting('venice:qwen-image-3-pro', null),
+    { family: 'venice', path: 'qwen-image-3-pro' });
+  assert.equal(routesToFal('venice', 'qwen-image-3-pro'), false);
+  assert.equal(routesToHiggsfield('venice', 'qwen-image-3-pro'), false);
+});
+
+test('a Venice generator refuses references rather than dropping them', async () => {
+  const ctx = {
+    credentials: { veniceKey: 'k' },
+    readAssetDataUrl: async () => 'data:image/png;base64,AAA',
+    capabilities: { direct: true },
+    fetch: async () => { throw new Error('should never be sent'); }
+  };
+  await assert.rejects(
+    generateImage({ provider: 'venice:seedream-v5-pro', prompt: 'x', inputImagePaths: ['assets/a.png'] }, ctx),
+    /takes no reference images.*seedream-v5-pro-edit/s
+  );
+});
+
+test('a Venice editor refuses to run with nothing to edit', async () => {
+  const ctx = {
+    credentials: { veniceKey: 'k' },
+    readAssetDataUrl: async () => 'data:image/png;base64,AAA',
+    capabilities: { direct: true },
+    fetch: async () => { throw new Error('should never be sent'); }
+  };
+  await assert.rejects(
+    generateImage({ provider: 'venice:qwen-edit-uncensored', prompt: 'x' }, ctx),
+    /needs at least one input image/
+  );
+});
+
+test('a missing Venice key is named before anything is sent', async () => {
+  const ctx = { credentials: {}, capabilities: { direct: true }, readAssetDataUrl: async () => 'data:' };
+  await assert.rejects(
+    generateImage({ provider: 'venice:qwen-image-3-pro', prompt: 'x' }, ctx),
+    /Venice.ai API key is not configured/
+  );
+});
+
+// Every Venice model publishes its own aspect list and the siblings differ.
+// A ratio the model does not list has to send nothing rather than be passed
+// through, which is a 400 after the request has already gone out.
+test('a ratio the model does not list constrains nothing', () => {
+  assert.equal(veniceAspectRatio('qwen-image-3-pro', '21:9'), '21:9');
+  assert.equal(veniceAspectRatio('seedream-v5-pro', '21:9'), null);
+  assert.equal(veniceAspectRatio('seedream-v5-pro', '16:9'), '16:9');
+  // Pixel forms reduce to the ratio they are nearest.
+  assert.equal(veniceAspectRatio('qwen-image-3-pro', '1344x768'), '16:9');
+  assert.equal(veniceAspectRatio('qwen-image-3-pro', 'nonsense'), null);
+});
+
+test('the text-to-image body asks for PNG and carries the safety flag', () => {
+  const body = buildVeniceImageBody('qwen-image-3-pro', { prompt: 'x', resolution: '16:9', safetyChecker: false });
+  assert.equal(body.model, 'qwen-image-3-pro');
+  assert.equal(body.format, 'png');
+  assert.equal(body.aspect_ratio, '16:9');
+  // safe_mode blurs rather than refuses, so it has to follow the studio switch
+  // exactly — a default of "on" would quietly return unusable frames.
+  assert.equal(body.safe_mode, false);
+  assert.equal(buildVeniceImageBody('qwen-image-3-pro', { prompt: 'x' }).safe_mode, true);
+  assert.equal('images' in body, false);
+});
+
+test('the edit body keeps every reference and falls back to auto shape', () => {
+  const images = ['data:a', 'data:b', 'data:c'];
+  const body = buildVeniceEditBody('seedream-v5-pro-edit', { prompt: 'x', resolution: '16:9', imageDataUrls: images });
+  assert.equal(body.modelId, 'seedream-v5-pro-edit');
+  assert.deepEqual(body.images, images);
+  assert.equal(body.aspect_ratio, '16:9');
+  // A shape this model does not list means "keep the input's", not "guess".
+  assert.equal(buildVeniceEditBody('seedream-v5-pro-edit', { prompt: 'x', resolution: '21:9', imageDataUrls: images }).aspect_ratio, 'auto');
+});
+
+test('Venice i2v takes one first frame, ref2v takes the whole array', () => {
+  const images = ['data:a', 'data:b', 'data:c'];
+  const i2v = buildVeniceVideoBody('wan-2-7-image-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '10', imageDataUrls: images
+  });
+  assert.equal(i2v.image_url, 'data:a');
+  assert.equal('reference_image_urls' in i2v, false);
+  assert.equal(i2v.duration, '10s');
+
+  const r2v = buildVeniceVideoBody('minimax-h3-enhanced-reference-to-video', {
+    prompt: '@Image1 walks', resolution: '1280x720', duration: '8', imageDataUrls: images
+  });
+  assert.deepEqual(r2v.reference_image_urls, images);
+  assert.equal('image_url' in r2v, false);
+  assert.equal(isVeniceReferenceVideo('minimax-h3-enhanced-reference-to-video'), true);
+});
+
+// Wan publishes an empty aspect list because it takes the shape from the input
+// frame; MiniMax publishes a real one. Sending Wan a ratio is a field it has no
+// use for, and sending MiniMax none takes whatever it defaults to.
+test('the shape fields follow what the model publishes', () => {
+  const wan = buildVeniceVideoBody('wan-2-7-image-to-video', {
+    prompt: 'x', resolution: '1920x1080', duration: '5', imageDataUrls: ['data:a']
+  });
+  assert.equal('aspect_ratio' in wan, false);
+  assert.equal(wan.resolution, '1080p');
+
+  const minimax = buildVeniceVideoBody('minimax-h3-enhanced-reference-to-video', {
+    prompt: 'x', resolution: '1440x2560', duration: '5', imageDataUrls: ['data:a']
+  });
+  assert.equal(minimax.aspect_ratio, '9:16');
+  assert.equal(minimax.resolution, '2K');
+});
+
+// The two vocabularies do not line up: there is no '720p' on MiniMax, and the
+// truthful answer is the tier 48 pixels away rather than no tier at all.
+// A first frame already states the shape. Sending a ratio beside it asks the
+// model to reconcile "16:9" with a 1376x768 still that is not quite 16:9.
+test('an image-to-video request states no ratio beside its first frame', () => {
+  // Wan 3.0 publishes `adaptive` for this, which says it explicitly.
+  const wan3 = buildVeniceVideoBody('wan-3-0-image-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '5', imageDataUrls: ['https://host/a.jpg']
+  });
+  assert.equal(wan3.aspect_ratio, 'adaptive');
+
+  // Wan 2.7 has no such token, so it is sent nothing rather than a guess.
+  const wan27 = buildVeniceVideoBody('wan-2-7-image-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '5', imageDataUrls: ['https://host/a.jpg']
+  });
+  assert.equal('aspect_ratio' in wan27, false);
+
+  // With no frame there is nothing to take the shape from, so it is stated.
+  const t2v = buildVeniceVideoBody('wan-3-0-image-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '5', imageDataUrls: []
+  });
+  assert.equal(t2v.aspect_ratio, '16:9');
+});
+
+// Reference images are subjects, not a canvas — the output shape still has to
+// be stated or the model chooses one on its own.
+test('reference-to-video still states its shape', () => {
+  const r2v = buildVeniceVideoBody('minimax-h3-enhanced-reference-to-video', {
+    prompt: '@Image1 walks', resolution: '1440x2560', duration: '8',
+    imageDataUrls: ['https://host/a.jpg', 'https://host/b.jpg']
+  });
+  assert.equal(r2v.aspect_ratio, '9:16');
+  assert.equal(r2v.reference_image_urls.length, 2);
+});
+
+test('resolution tiers are named per model, nearest wins', () => {
+  assert.equal(veniceResolutionTier('minimax-h3-enhanced-reference-to-video', '1280x720'), '768P');
+  assert.equal(veniceResolutionTier('minimax-h3-enhanced-reference-to-video', '2560x1440'), '2K');
+  assert.equal(veniceResolutionTier('wan-2-7-image-to-video', '720x1280'), '720p');
+  assert.equal(veniceResolutionTier('wan-2-7-enhanced-image-to-video', '1080x1920'), '1080p');
+  // No size to match: the model's own cheapest tier, never its largest.
+  assert.equal(veniceResolutionTier('wan-2-7-image-to-video', undefined), '720p');
+  // An id with no published tiers asks for none.
+  assert.equal(veniceResolutionTier('some-unlisted-model', '1280x720'), null);
+});
+
+test('durations become Venice seconds strings', () => {
+  assert.equal(veniceDuration('10'), '10s');
+  assert.equal(veniceDuration(15), '15s');
+  assert.equal(veniceDuration(undefined), '5s');
+  assert.equal(veniceDuration('nonsense'), '5s');
+});
+
+test('a Venice error reads out its issues, not just its status', () => {
+  assert.match(
+    describeVeniceError('{"error":"Invalid request parameters","issues":[{"message":"aspect_ratio not supported"}]}'),
+    /Invalid request parameters — aspect_ratio not supported/
+  );
+  assert.equal(describeVeniceError('not json at all'), 'not json at all');
+});
+
+// Venice answers its two image endpoints in two different shapes — base64
+// inside JSON from /image/generate, raw bytes from /image/multi-edit — and the
+// host contract only knows how to save a URL. These two cover that bridge,
+// which is the part of the adapter no amount of reading the spec can check.
+
+/** A Response stand-in with just the surface the adapter touches. */
+function fakeResponse({ status = 200, contentType, json, bytes, text = '' }) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => (name.toLowerCase() === 'content-type' ? contentType : null) },
+    json: async () => json,
+    text: async () => text,
+    arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+  };
+}
+
+test('a generated image arrives as base64 in JSON and is saved as a PNG', async () => {
+  const sent = [];
+  const ctx = {
+    credentials: { veniceKey: 'k' },
+    capabilities: { direct: true },
+    readAssetDataUrl: async () => 'data:image/png;base64,AAA',
+    fetch: async (url, options) => {
+      sent.push({ url, body: JSON.parse(options.body) });
+      return fakeResponse({ contentType: 'application/json', json: { id: '1', images: ['QUJD'] } });
+    },
+    saveRemote: async (url, prefix, ext) => `assets/${prefix}${ext}:${url}`
+  };
+
+  const saved = await generateImage({
+    provider: 'venice:qwen-image-3-pro', prompt: 'a cat', resolution: '16:9', safetyChecker: false
+  }, ctx);
+
+  assert.equal(sent[0].url, 'https://api.venice.ai/api/v1/image/generate');
+  assert.equal(sent[0].body.model, 'qwen-image-3-pro');
+  assert.equal(saved, 'assets/img.png:data:image/png;base64,QUJD');
+});
+
+test('an edited image arrives as raw bytes and is wrapped into a data URL', async () => {
+  const ctx = {
+    credentials: { veniceKey: 'k' },
+    capabilities: { direct: true },
+    readAssetDataUrl: async (path) => `data:image/png;base64,${path}`,
+    fetch: async (url, options) => {
+      assert.equal(url, 'https://api.venice.ai/api/v1/image/multi-edit');
+      // Both references travel, in order, as the base image and its layer.
+      assert.deepEqual(JSON.parse(options.body).images,
+        ['data:image/png;base64,a.png', 'data:image/png;base64,b.png']);
+      return fakeResponse({ contentType: 'image/png', bytes: new Uint8Array([65, 66, 67]) });
+    },
+    saveRemote: async (url, prefix, ext) => `assets/${prefix}${ext}:${url}`
+  };
+
+  const saved = await generateImage({
+    provider: 'venice:seedream-v5-pro-edit', prompt: 'x', resolution: '16:9',
+    inputImagePaths: ['a.png', 'b.png']
+  }, ctx);
+
+  // "ABC" base64-encoded, under the content type Venice actually sent.
+  assert.equal(saved, 'assets/img.png:data:image/png;base64,QUJD');
+});
+
+test('a Venice failure quotes the reason, not just the status', async () => {
+  const ctx = {
+    credentials: { veniceKey: 'k' },
+    capabilities: { direct: true },
+    readAssetDataUrl: async () => 'data:',
+    fetch: async () => fakeResponse({
+      status: 400, contentType: 'application/json',
+      text: '{"error":"Invalid request parameters","issues":[{"message":"aspect_ratio not supported"}]}'
+    })
+  };
+  await assert.rejects(
+    generateImage({ provider: 'venice:qwen-image-3-pro', prompt: 'x' }, ctx),
+    /400.*aspect_ratio not supported/s
+  );
+});
+
+// Venice documents data: URLs for `image_url` and they are still the wrong
+// choice at project scale: a 5MB still is ~6.5MB of base64 that has to reach
+// Venice and then the backend actually running the model. These pin the fork.
+
+test('Venice video frames are hosted when a Fal key can host them', async () => {
+  const uploaded = [];
+  const ctx = {
+    credentials: { veniceKey: 'k', falKey: 'f' },
+    capabilities: { direct: true },
+    readAssetDataUrl: async () => { throw new Error('should not inline when a Fal key exists'); },
+    uploadPublicUrl: async (path) => { uploaded.push(path); return `https://fal.media/${path}`; },
+    fetch: async (url, options) => {
+      if (url.endsWith('/video/quote')) return fakeResponse({ contentType: 'application/json', json: { quote: 0.55 } });
+      if (url.endsWith('/video/queue')) {
+        assert.equal(JSON.parse(options.body).image_url, 'https://fal.media/first.png');
+        return fakeResponse({ contentType: 'application/json', json: {}, text: '{"queue_id":"q1"}' });
+      }
+      throw new Error('stop after queue');
+    },
+    saveRemote: async () => 'unused'
+  };
+
+  await assert.rejects(generateVideo({
+    provider: 'venice:wan-2-7-image-to-video', prompt: 'x',
+    imageUrls: ['first.png'], resolution: '1280x720', duration: '5'
+  }, ctx), /stop after queue/);
+  assert.deepEqual(uploaded, ['first.png']);
+});
+
+test('without a Fal key the frame still goes, inline, rather than being refused', async () => {
+  const ctx = {
+    credentials: { veniceKey: 'k' },
+    capabilities: { direct: true },
+    readAssetDataUrl: async (path) => `data:image/png;base64,${path}`,
+    uploadPublicUrl: async () => { throw new Error('no Fal key'); },
+    fetch: async (url, options) => {
+      if (url.endsWith('/video/quote')) return fakeResponse({ contentType: 'application/json', json: { quote: 0.55 } });
+      assert.equal(JSON.parse(options.body).image_url, 'data:image/png;base64,first.png');
+      throw new Error('stop after queue');
+    },
+    saveRemote: async () => 'unused'
+  };
+  await assert.rejects(generateVideo({
+    provider: 'venice:wan-2-7-image-to-video', prompt: 'x',
+    imageUrls: ['first.png'], resolution: '1280x720', duration: '5'
+  }, ctx), /stop after queue/);
+});
+
+// A 500 on /video/retrieve is Venice's "inference processing failed" — the job
+// died, the poll was fine. Reporting it as a failed status check sends you
+// looking at the network instead of at the request.
+test('a failed generation is not reported as a failed status check', async () => {
+  let polls = 0;
+  const ctx = {
+    credentials: { veniceKey: 'k' },
+    capabilities: { direct: true },
+    pollIntervalMs: 0,
+    readAssetDataUrl: async () => 'data:image/png;base64,AAA',
+    uploadPublicUrl: async () => { throw new Error('no Fal key'); },
+    fetch: async (url) => {
+      if (url.endsWith('/video/quote')) return fakeResponse({ contentType: 'application/json', json: { quote: 0.55 } });
+      if (url.endsWith('/video/queue')) {
+        return fakeResponse({ contentType: 'application/json', text: '{"queue_id":"q1"}' });
+      }
+      polls++;
+      return fakeResponse({ status: 500, contentType: 'application/json', text: '{"error":"An unknown error occurred"}' });
+    },
+    saveRemote: async () => 'unused'
+  };
+  await assert.rejects(generateVideo({
+    provider: 'venice:wan-2-7-image-to-video', prompt: 'x',
+    imageUrls: ['first.png'], resolution: '1280x720', duration: '5'
+  }, ctx), (error) => {
+    assert.match(error.message, /could not generate this video/);
+    assert.doesNotMatch(error.message, /status check failed/);
+    // It names the frame form, which is the lead worth following first.
+    assert.match(error.message, /inline data URLs/);
+    assert.match(error.message, /Fal.ai key/);
+    return true;
+  });
+  // A 500 is not taken at face value the first time: Venice answers one for a
+  // queue id that has not finished registering as well as for a dead job, and
+  // giving up on the first would abandon a generation already paid for.
+  assert.equal(polls, 4);
+});
+
+// The other half of that rule: a 500 that resolves was the job being early, and
+// the video still has to come back.
+test('an early 500 does not abandon a job that then runs', async () => {
+  let polls = 0;
+  const ctx = {
+    credentials: { veniceKey: 'k', falKey: 'f' },
+    capabilities: { direct: true },
+    pollIntervalMs: 0,
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    fetch: async (url) => {
+      if (url.endsWith('/video/quote')) return fakeResponse({ contentType: 'application/json', json: { quote: 0.09 } });
+      if (url.endsWith('/video/queue')) {
+        return fakeResponse({ contentType: 'application/json', text: '{"queue_id":"q1"}' });
+      }
+      polls++;
+      if (polls === 1) return fakeResponse({ status: 500, contentType: 'application/json', text: '{"error":"nope"}' });
+      if (polls === 2) return fakeResponse({ contentType: 'application/json', json: { status: 'PROCESSING' } });
+      return fakeResponse({ contentType: 'video/mp4', bytes: new Uint8Array([1, 2, 3]) });
+    },
+    saveRemote: async (url, prefix, ext) => `assets/${prefix}${ext}`
+  };
+
+  const saved = await generateVideo({
+    provider: 'venice:wan-2-7-image-to-video', prompt: 'x',
+    imageUrls: ['first.png'], resolution: '1280x720', duration: '5'
+  }, ctx);
+  assert.equal(saved, 'assets/vid.mp4');
+  assert.equal(polls, 3);
+});
+
+// The bug this pre-flight exists for, in full. A shot that carried 4s from a
+// previous model is accepted by /video/queue — whose duration enum spans every
+// model on the host, 1s to 30s — then billed, then killed in inference with a
+// bare "An unknown error occurred". /video/quote checks the same field against
+// the model actually being asked for, and costs nothing.
+test('settings this model cannot take are refused before anything is queued', async () => {
+  const called = [];
+  const ctx = {
+    credentials: { veniceKey: 'k', falKey: 'f' },
+    capabilities: { direct: true },
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    fetch: async (url) => {
+      called.push(url);
+      if (url.endsWith('/video/quote')) {
+        return fakeResponse({
+          status: 400, contentType: 'application/json',
+          text: '{"error":"Invalid request parameters","issues":[{"message":"Invalid enum value. Expected \'5s\' | \'10s\' | \'15s\', received \'4s\'"}]}'
+        });
+      }
+      throw new Error('nothing should be queued');
+    }
+  };
+
+  await assert.rejects(generateVideo({
+    provider: 'venice:wan-2-7-enhanced-image-to-video', prompt: 'x',
+    imageUrls: ['first.png'], resolution: '1280x720', duration: '4'
+  }, ctx), (error) => {
+    assert.match(error.message, /will not accept these settings/);
+    assert.match(error.message, /received '4s'/);
+    assert.match(error.message, /Nothing was queued or billed/);
+    return true;
+  });
+  // The point of the whole exercise: /video/queue was never reached.
+  assert.deepEqual(called.filter(url => url.endsWith('/video/queue')), []);
+});
+
+// A quote that fails for any reason other than validation must not stand
+// between a shot and a generation that would have worked.
+test('a quote that is merely unavailable does not block the generation', async () => {
+  const ctx = {
+    credentials: { veniceKey: 'k', falKey: 'f' },
+    capabilities: { direct: true },
+    pollIntervalMs: 0,
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    fetch: async (url) => {
+      if (url.endsWith('/video/quote')) return fakeResponse({ status: 500, contentType: 'application/json', text: '{"error":"down"}' });
+      if (url.endsWith('/video/queue')) return fakeResponse({ contentType: 'application/json', text: '{"queue_id":"q1"}' });
+      return fakeResponse({ contentType: 'video/mp4', bytes: new Uint8Array([9]) });
+    },
+    saveRemote: async (url, prefix, ext) => `assets/${prefix}${ext}`
+  };
+  assert.equal(await generateVideo({
+    provider: 'venice:wan-2-7-image-to-video', prompt: 'x',
+    imageUrls: ['first.png'], resolution: '1280x720', duration: '5'
+  }, ctx), 'assets/vid.mp4');
 });

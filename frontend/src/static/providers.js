@@ -13,6 +13,7 @@
 //   OpenAI    - allows browser requests.
 //   Anthropic - allows them only with the anthropic-dangerous-direct-browser-access header.
 //   Fal.ai    - queue.fal.run generally allows them.
+//   Venice.ai - api.venice.ai answers pre-flight with Access-Control-Allow-Origin: *.
 //   Higgsfield / Runway / Kling - undocumented for browser use; may be blocked.
 //
 // Anything blocked surfaces as a clear "CORS" error rather than a mystery

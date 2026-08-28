@@ -13,6 +13,7 @@ export const CREDENTIAL_FIELDS = [
   'runwayKey', 'klingKey', 'klingSecret',
   'higgsfieldKey', 'higgsfieldSecret',
   'atlasKey',
+  'veniceKey',
   'corsProxy'
 ];
 

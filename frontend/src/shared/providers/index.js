@@ -22,6 +22,7 @@ import { resolveRouting, routesToHiggsfield, routesToFal } from './routing.js';
 import * as fal from './fal.js';
 import * as higgsfield from './higgsfield.js';
 import * as atlas from './atlas.js';
+import * as venice from './venice.js';
 import * as google from './google.js';
 import * as openai from './openai.js';
 import * as anthropic from './anthropic.js';
@@ -37,6 +38,10 @@ export async function generateImage({ provider, providerFamily, prompt, resoluti
   const req = { modelPath, prompt, resolution, inputImagePaths: (inputImagePaths || []).filter(Boolean), safetyChecker };
 
   if (family === 'atlas') return atlas.generateImage(req, ctx);
+  // Venice splits every image model in two — a generator with no image input
+  // and an editor on a different endpoint — so the adapter, not this file,
+  // decides which of its endpoints an id belongs to.
+  if (family === 'venice') return venice.generateImage(req, ctx);
   if (routesToHiggsfield(family, modelPath)) return higgsfield.generateImage(req, ctx);
   // Both Gemini image ids go to the same adapter; which API model and how
   // many references it takes is decided there, from modelPath.
@@ -74,6 +79,7 @@ export async function generateVideo({ provider, providerFamily, videoModel, prom
       `shot's video model.`
     );
   }
+  if (family === 'venice') return venice.generateVideo(req, ctx);
   if (routesToHiggsfield(family, modelPath)) return higgsfield.generateVideo(req, ctx);
   if (modelPath === 'runway') return runway.generateVideo(req, ctx);
   if (modelPath === 'kling') return kling.generateVideo(req, ctx);

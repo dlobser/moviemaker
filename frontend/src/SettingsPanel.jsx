@@ -43,7 +43,8 @@ const KEY_FIELDS = [
   { id: 'klingKey', label: 'Kling AI', placeholder: 'Kling dev key…' },
   { id: 'higgsfieldKey', label: 'Higgsfield key', placeholder: 'from cloud.higgsfield.ai' },
   { id: 'higgsfieldSecret', label: 'Higgsfield secret', placeholder: 'paired secret' },
-  { id: 'atlasKey', label: 'Atlas Cloud key', placeholder: 'from atlascloud.ai — one key, 400+ models' }
+  { id: 'atlasKey', label: 'Atlas Cloud key', placeholder: 'from atlascloud.ai — one key, 400+ models' },
+  { id: 'veniceKey', label: 'Venice.ai key', placeholder: 'from venice.ai/settings/api — uncensored image + video' }
 ];
 
 /**
@@ -328,11 +329,13 @@ export default function SettingsPanel({
                 </section>
 
                 <section className="settings-section">
-                  <h3>Atlas Cloud</h3>
+                  <h3>Image safety filter</h3>
                   <p className="settings-note">
                     Atlas’s open-weight image models (FLUX, Qwen-Image, Z-Image) expose their safety checker as a
-                    request flag; closed partner models moderate upstream and ignore it. Turning it off only affects
-                    Atlas image generation, and Atlas’s own acceptable-use policy still applies to everything you make.
+                    request flag; closed partner models moderate upstream and ignore it. Venice sends the same switch
+                    as <code>safe_mode</code>, which <em>blurs</em> what it catches rather than refusing it — so a
+                    generation it flags is still billed and still saved, just unusable. Leave it off for Venice’s
+                    uncensored models. Each provider’s own acceptable-use policy still applies to everything you make.
                   </p>
                   <label className="settings-check">
                     <input
@@ -340,7 +343,7 @@ export default function SettingsPanel({
                       checked={atlasSafetyChecker !== false}
                       onChange={(e) => setAtlasSafetyChecker(e.target.checked)}
                     />
-                    <span>Safety checker on Atlas image models <em>provider default — on</em></span>
+                    <span>Safety filter on Atlas and Venice image models <em>provider default — on</em></span>
                   </label>
                 </section>
 

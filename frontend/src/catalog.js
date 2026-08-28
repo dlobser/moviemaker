@@ -26,6 +26,17 @@
 //             numbers belong here (DALL-E 3: 4000, per OpenAI's API docs).
 //             Never guess one — the studio warns on overflow, it never trims.
 
+// Venice publishes a per-model aspect list rather than one house set, and the
+// lists genuinely differ between siblings - Qwen Image 3 Pro takes 21:9 and
+// 4:5, Seedream V5 Pro takes neither. So each entry below carries its own,
+// straight from that model's `constraints.aspectRatios` on GET /api/v1/models.
+const RATIO_LABELS = {
+  '16:9': 'Landscape (16:9)', '9:16': 'Portrait (9:16)', '1:1': 'Square (1:1)',
+  '3:2': 'Photo (3:2)', '2:3': 'Portrait photo (2:3)', '21:9': 'Widescreen (21:9)',
+  '4:3': 'Standard (4:3)', '3:4': 'Tall (3:4)', '4:5': 'Social (4:5)'
+};
+const ratioSizes = (...ratios) => ratios.map(value => ({ value, label: RATIO_LABELS[value] || value }));
+
 export const IMAGE_MODELS = [
   // --- Fal.ai ---
   { id: 'fal-ai/flux/schnell', label: 'Flux Schnell (fast)', provider: 'fal-ai', price: 0.003, refImages: 0 },
@@ -112,7 +123,32 @@ export const IMAGE_MODELS = [
   // host's ceiling is the one that rejects the request, and `images` is
   // required there — /edit with nothing to edit is not a text-to-image call.
   { id: 'atlas:google/nano-banana-pro/text-to-image', label: 'Nano Banana Pro t2i (Atlas) — no refs', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 0 },
-  { id: 'atlas:google/nano-banana-pro/edit', label: 'Nano Banana Pro edit (Atlas) — up to 10 refs', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 10, refMode: 'required', refTagStyle: 'gemini' }
+  { id: 'atlas:google/nano-banana-pro/edit', label: 'Nano Banana Pro edit (Atlas) — up to 10 refs', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 10, refMode: 'required', refTagStyle: 'gemini' },
+
+  // --- Venice.ai ---
+  // The uncensored host. Every model listed here reports `uncensored: true` on
+  // GET /api/v1/models, which is the whole reason to route through Venice
+  // rather than reach the same weights through an aggregator that moderates.
+  //
+  // Venice splits each image model into a generator and an editor, and they are
+  // *different model ids on different endpoints*: `qwen-image-3-pro` is
+  // text-to-image with no image field at all, while `qwen-image-3-pro-edit`
+  // takes references through /image/multi-edit. Listing them together as one
+  // entry would mean picking a model, attaching references, and having them
+  // dropped by an endpoint with nowhere to put them — the same silent drop the
+  // Atlas Nano Banana pair above is split to prevent. Hence zero references on
+  // the generators, and a separate editor line for each.
+  //
+  // The reference ceilings are Venice's documented rule, not a guess:
+  // `constraints.maxInputImages` where the model publishes one, and otherwise
+  // the API's stated default of 3 for a model with `combineImages: true`.
+  { id: 'venice:qwen-image-3-pro', label: 'Qwen Image 3 Pro (Venice, uncensored) — no refs', provider: 'venice', price: 0.05, priceNote: '1K; $0.09 at 2K', refImages: 0, promptLimit: 10000, sizes: ratioSizes('16:9', '9:16', '1:1', '3:2', '2:3', '21:9', '3:4', '4:5') },
+  { id: 'venice:seedream-v5-pro', label: 'Seedream V5 Pro (Venice, uncensored) — no refs', provider: 'venice', price: 0.06, priceNote: '1K; $0.11 at 2K', refImages: 0, promptLimit: 10000, sizes: ratioSizes('16:9', '9:16', '1:1', '3:2', '2:3', '3:4') },
+  { id: 'venice:qwen-edit-uncensored', label: 'Qwen Edit Uncensored (Venice) — up to 3 refs', provider: 'venice', price: 0.04, refImages: 3, refMode: 'required', promptLimit: 1500, sizes: ratioSizes('16:9', '9:16', '1:1', '3:2', '2:3', '21:9', '3:4', '4:5') },
+  // The editing halves of the two generators above. Same weights, same
+  // uncensored flag; the only way to hand either model a reference image.
+  { id: 'venice:qwen-image-3-pro-edit', label: 'Qwen Image 3 Pro edit (Venice) — up to 3 refs', provider: 'venice', price: 0.05, priceNote: '1K; $0.09 at 2K, plus ~$0.003 per input image', refImages: 3, refMode: 'required', promptLimit: 10000, sizes: ratioSizes('16:9', '9:16', '1:1', '3:2', '2:3', '21:9', '3:4', '4:5') },
+  { id: 'venice:seedream-v5-pro-edit', label: 'Seedream V5 Pro edit (Venice) — up to 6 refs', provider: 'venice', price: 0.06, priceNote: '1K; $0.11 at 2K, first input image included', refImages: 6, refMode: 'required', promptLimit: 10000, sizes: ratioSizes('16:9', '9:16', '1:1', '3:2', '2:3', '3:4') }
 ];
 
 export const VIDEO_MODELS = [
@@ -193,7 +229,95 @@ export const VIDEO_MODELS = [
   // path on atlascloud.ai and the plain i2v id above verified verbatim, so the
   // spelling is not the problem. Gated variants usually need account
   // verification. Left listed, labelled, rather than silently removed.
-  { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas) — may need account verification', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, refMode: 'required', durations: ['4', '5', '6', '8', '10', '12'] }
+  { id: 'atlas:bytedance/seedance-v1.5-pro/image-to-video-spicy', label: 'Seedance 1.5 Pro i2v Spicy (Atlas) — may need account verification', provider: 'atlas', priceNote: 'see atlascloud.ai/pricing', refImages: 1, refMode: 'required', durations: ['4', '5', '6', '8', '10', '12'] },
+
+  // --- Venice.ai ---
+  // Async like Atlas: queue a job, poll it, take the mp4. What differs is where
+  // the images go, and it is decided by the endpoint rather than the vendor.
+  //
+  // The two Wan entries are `image-to-video`: one still, animated as the first
+  // frame, in `image_url`. They publish an *empty* aspect-ratio list because
+  // the shape comes from that frame — so the studio's setting picks the
+  // resolution tier and nothing else.
+  //
+  // MiniMax H3 R2V is the other kind: a flat `reference_image_urls` array whose
+  // members the prompt addresses as @Image1..@ImageN. Venice publishes no
+  // per-model ceiling for it, so 7 is taken from the highest documented flat
+  // R2V limit on the host (Grok Imagine R2V, 1-7) rather than from the API-wide
+  // maximum of 30. Erring high is deliberate: too many is refused at validation
+  // for free, while too few silently drops references from a video that is
+  // still billed in full.
+  { id: 'venice:wan-2-7-image-to-video', label: 'Wan 2.7 i2v (Venice, uncensored) — 1 first frame', provider: 'venice', priceNote: 'per-second — POST /video/quote for the exact figure', refImages: 1, refMode: 'required', durations: ['5', '10', '15'], sizes: [
+    { value: '1280x720', label: 'Landscape 720p (16:9)' },
+    { value: '720x1280', label: 'Portrait 720p (9:16)' },
+    { value: '1920x1080', label: 'Landscape 1080p (16:9)' },
+    { value: '1080x1920', label: 'Portrait 1080p (9:16)' }
+  ] },
+  // The Enhanced variant is Venice's own re-prompting pass in front of the same
+  // model — it is what their docs point you at when a prompt is rejected with
+  // a 422. It also generates its own audio, where plain Wan 2.7 instead accepts
+  // a music track as input.
+  //
+  // BROKEN AT VENICE as of 2026-08-26, and measured rather than inferred: run
+  // by hand with curl, outside this app, at a quote-validated 5s/720p and a
+  // publicly hosted frame, it accepts the job, reports PROCESSING for ~11
+  // seconds and then answers every retrieve with 500 "An unknown error
+  // occurred". The identical request shape and the identical frame produce a
+  // real video on longcat below, so the fault is not in the request. Left
+  // listed and labelled rather than deleted — the same treatment as the
+  // Seedance Spicy entry above — because this is a provider-side fault that may
+  // simply come back. Re-test before trusting it; it bills for every failure.
+  { id: 'venice:wan-2-7-enhanced-image-to-video', label: 'Wan 2.7 Enhanced i2v (Venice) — FAILING at Venice, verified 2026-08-26', provider: 'venice', priceNote: 'bills ~$0.64 / 5s even when it fails — re-test before use', refImages: 1, refMode: 'required', durations: ['5', '10', '15'], sizes: [
+    { value: '1280x720', label: 'Landscape 720p (16:9)' },
+    { value: '720x1280', label: 'Portrait 720p (9:16)' },
+    { value: '1920x1080', label: 'Landscape 1080p (16:9)' },
+    { value: '1080x1920', label: 'Portrait 1080p (9:16)' }
+  ] },
+  { id: 'venice:minimax-h3-enhanced-reference-to-video', label: 'MiniMax H3 Enhanced ref2v (Venice, uncensored) — up to 7 references', provider: 'venice', priceNote: 'from ~$0.45 / clip — POST /video/quote for the exact figure', refImages: 7, refMode: 'required', refTagStyle: 'venice', promptLimit: 7000, durations: ['5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'], sizes: [
+    { value: '1280x720', label: 'Landscape 768P (16:9)' },
+    { value: '720x1280', label: 'Portrait 768P (9:16)' },
+    { value: '2560x1440', label: 'Landscape 2K (16:9)' },
+    { value: '1440x2560', label: 'Portrait 2K (9:16)' },
+    { value: '1440x1440', label: 'Square 2K (1:1)' }
+  ] },
+
+  // Two more uncensored i2v models, added because Wan 2.7 Enhanced is down and
+  // two of the three video models originally wanted here are Wan 2.7.
+  //
+  // Longcat earns its place as a *smoke test*, not as a camera. It is the only
+  // entry in this catalog watched end to end against the live API — queued,
+  // polled, and the finished mp4 streamed back from /video/retrieve (6.5MB,
+  // 3.1 minutes, $0.09) — which makes it the cheapest way to answer "is Venice
+  // video working right now, and is my request shape sound" before spending
+  // twenty times as much on a real model. It is a distilled model capped at
+  // 720p and it looks it. Do not reach for it to shoot a scene.
+  { id: 'venice:longcat-distilled-image-to-video', label: 'Longcat Distilled i2v (Venice) — cheap smoke test, low quality', provider: 'venice', price: 0.09, priceNote: '5s at 720p — distilled, use it to check the pipeline, not for shots', refImages: 1, refMode: 'required', durations: ['5', '10', '15', '20', '30'], sizes: [
+    { value: '1280x720', label: 'Landscape 720p (16:9)' },
+    { value: '720x1280', label: 'Portrait 720p (9:16)' }
+  ] },
+  // MiniMax H3's plain image-to-video: the non-Wan escape hatch. Every Wan model
+  // tried on this host failed at inference while non-Wan ones ran, so having an
+  // uncensored first-frame animator that is not Wan is the difference between
+  // being stuck and being able to work. Sibling of the R2V entry above, so the
+  // shape and duration vocabulary is already known-good. Untested here.
+  { id: 'venice:minimax-h3-image-to-video', label: 'MiniMax H3 i2v (Venice, uncensored) — untested, non-Wan', provider: 'venice', price: 0.50, priceNote: '5s at 768P, per live quote', refImages: 1, refMode: 'required', promptLimit: 7000, durations: ['5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'], sizes: [
+    { value: '1280x720', label: 'Landscape 768P (16:9)' },
+    { value: '720x1280', label: 'Portrait 768P (9:16)' },
+    { value: '2560x1440', label: 'Landscape 2K (16:9)' },
+    { value: '1440x2560', label: 'Portrait 2K (9:16)' }
+  ] },
+  // Wan 3.0 is the current generation and a like-for-like replacement for the
+  // broken 2.7: same vendor, same uncensored flag, wider duration and
+  // resolution range. Untested here — listed on the strength of the models
+  // endpoint, priced from a live quote, and not claimed to work.
+  { id: 'venice:wan-3-0-image-to-video', label: 'Wan 3.0 i2v (Venice, uncensored) — untested, the current-gen Wan', provider: 'venice', price: 0.55, priceNote: '5s at 720p, per live quote', refImages: 1, refMode: 'required', promptLimit: 20000, durations: ['2', '5', '10', '15', '20', '25', '30'], sizes: [
+    { value: '1280x720', label: 'Landscape 720p (16:9)' },
+    { value: '720x1280', label: 'Portrait 720p (9:16)' },
+    { value: '1920x1080', label: 'Landscape 1080p (16:9)' },
+    { value: '1080x1920', label: 'Portrait 1080p (9:16)' },
+    { value: '854x480', label: 'Landscape 480p (16:9)' },
+    { value: '1080x1080', label: 'Square 1080p (1:1)' }
+  ] }
 ];
 
 export const IMAGE_ASPECT_RATIOS = [
@@ -231,7 +355,8 @@ export const LLM_PROVIDERS = [
 export const MODEL_FAMILIES = [
   { id: 'fal-ai', label: 'Fal.ai' },
   { id: 'higgsfield', label: 'Higgsfield' },
-  { id: 'atlas', label: 'Atlas Cloud' }
+  { id: 'atlas', label: 'Atlas Cloud' },
+  { id: 'venice', label: 'Venice.ai' }
 ];
 
 const FAMILY_ALIASES = {
@@ -243,7 +368,10 @@ const FAMILY_ALIASES = {
   hf: 'higgsfield',
   atlas: 'atlas',
   atlascloud: 'atlas',
-  'atlas-cloud': 'atlas'
+  'atlas-cloud': 'atlas',
+  venice: 'venice',
+  'venice-ai': 'venice',
+  veniceai: 'venice'
 };
 
 /** A family name normalised to a catalog family id, or null. */
@@ -410,6 +538,16 @@ const REF_TAG_FORMATS = {
     sample: '@imageN',
     list: (indices) => indices.map(index => `@image${index + 1}`).join(' ')
   },
+  // Venice's flat reference-to-video models (MiniMax H3 R2V here). Same idea as
+  // Seedance and a different spelling: Venice's docs capitalise the token as
+  // @Image1, and the tag is positional in upload order. Omitting the tags
+  // entirely is legal there — the backend then prepends a reference to every
+  // image — but that gives up saying *which* image is which, which is the
+  // whole point of having several.
+  venice: {
+    sample: '@ImageN',
+    list: (indices) => indices.map(index => `@Image${index + 1}`).join(' ')
+  },
   // Gemini image models (Nano Banana, Nano Banana Pro). This one is measured
   // rather than reasoned, and the measurement went against the documentation.
   //
@@ -538,5 +676,6 @@ export const PROVIDER_LABELS = {
   higgsfield: 'Higgsfield',
   runway: 'RunwayML',
   kling: 'Kling AI',
-  atlas: 'Atlas Cloud'
+  atlas: 'Atlas Cloud',
+  venice: 'Venice.ai'
 };

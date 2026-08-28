@@ -290,7 +290,12 @@ async function downloadFile(url, prefix, ext, destination = null) {
   const { absolutePath, relativePath } = await resolveWritePath(destination, prefix, ext);
   // If it's a data URL, handle base64
   if (url.startsWith('data:')) {
-    const matches = url.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    // Digits and dots belong in the character class: every media type that has
+    // reached here so far happened to be letters only ("image/png"), but a
+    // provider that hands back the file itself rather than a link to it can
+    // easily say "video/mp4", and this used to reject that as an invalid data
+    // URL after the generation had already been paid for.
+    const matches = url.match(/^data:([A-Za-z0-9-+.\/]+);base64,(.+)$/);
     if (!matches || matches.length !== 3) {
       throw new Error('Invalid data URL');
     }
@@ -336,7 +341,9 @@ app.get('/api/config', (req, res) => {
     klingKey: '',
     klingSecret: '',
     higgsfieldKey: '',
-    higgsfieldSecret: ''
+    higgsfieldSecret: '',
+    atlasKey: '',
+    veniceKey: ''
   });
   res.json(config);
 });

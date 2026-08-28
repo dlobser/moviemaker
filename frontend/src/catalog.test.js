@@ -19,6 +19,8 @@ import {
   normalizeFamily,
   parseModelId,
   refImageCapacity,
+  refTagSample,
+  refTagTokens,
   sizeOptions
 } from './catalog.js';
 
@@ -197,4 +199,41 @@ test('custom-path overrides lift the one-input assumption, catalog models ignore
   } finally {
     setCustomModelOverrides({});
   }
+});
+
+// Venice's flat reference-to-video models capitalise the pointer as @Image1,
+// where Seedance writes @image1. The token is positional in both, so spelling
+// it the other host's way means a prompt that points at nothing.
+test('Venice reference tokens are capitalised and positional', () => {
+  const id = 'venice:minimax-h3-enhanced-reference-to-video';
+  assert.equal(refTagSample('video', id), '@ImageN');
+  assert.equal(refTagTokens('video', id, [0, 2]), '@Image1 @Image3');
+  // Seedance keeps its own lower-case spelling.
+  assert.equal(refTagTokens('video', 'atlas:bytedance/seedance-2.0/reference-to-video', [0, 2]), '@image1 @image3');
+  // The i2v entries index nothing, so they get no pointer at all.
+  assert.equal(refTagTokens('video', 'venice:wan-2-7-image-to-video', [0]), '');
+});
+
+// The generator/editor split is the catalog's job to state: a generator that
+// claimed even one reference would let the UI attach images the endpoint has
+// nowhere to put.
+test('Venice generators declare no references, their editors declare the documented ceiling', () => {
+  assert.equal(refImageCapacity('image', 'venice:qwen-image-3-pro'), 0);
+  assert.equal(refImageCapacity('image', 'venice:seedream-v5-pro'), 0);
+  assert.equal(refImageCapacity('image', 'venice:qwen-edit-uncensored'), 3);
+  assert.equal(refImageCapacity('image', 'venice:qwen-image-3-pro-edit'), 3);
+  // The one model that publishes maxInputImages rather than taking the default.
+  assert.equal(refImageCapacity('image', 'venice:seedream-v5-pro-edit'), 6);
+  assert.equal(modelCapabilities('image', 'venice:qwen-edit-uncensored').refMode, 'required');
+  assert.equal(modelCapabilities('image', 'venice:qwen-image-3-pro').refMode, 'none');
+});
+
+test('Venice video lengths and shapes come from the model, not the studio defaults', () => {
+  assert.deepEqual(modelCapabilities('video', 'venice:wan-2-7-image-to-video').durations, ['5', '10', '15']);
+  assert.equal(modelCapabilities('video', 'venice:minimax-h3-enhanced-reference-to-video').durations.length, 11);
+  // Seedream V5 Pro publishes no 21:9, so the studio never offers it.
+  const shapes = sizeOptions('image', 'venice:seedream-v5-pro').map(option => option.value);
+  assert.equal(shapes.includes('21:9'), false);
+  assert.equal(shapes.includes('16:9'), true);
+  assert.equal(sizeOptions('image', 'venice:qwen-image-3-pro').map(o => o.value).includes('21:9'), true);
 });
