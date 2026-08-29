@@ -54,6 +54,34 @@ function projectNameFromPath(projectPath) {
 }
 
 /**
+ * Give a generically named project file its folder's name.
+ *
+ * A file literally called `project.mmproj.json` says nothing about which
+ * project it is, so a save landing in the wrong folder looks exactly like a
+ * save landing in the right one. The folder is the project's identity under
+ * the folder-per-project rule, so opening such a file renames it after its
+ * folder. Anything that stops the rename (the distinct name already taken,
+ * a locked file, a read-only share) just keeps the old name — opening still
+ * works.
+ */
+function migrateGenericProjectFile(projectPath) {
+  if (projectNameFromPath(projectPath).toLowerCase() !== 'project') return projectPath;
+  const dir = path.dirname(projectPath);
+  const folderName = path.basename(dir);
+  if (!folderName || folderName.toLowerCase() === 'project') return projectPath;
+  const distinct = path.join(dir, `${folderName}${PROJECT_EXT}`);
+  if (fs.existsSync(distinct)) return projectPath;
+  try {
+    fs.renameSync(projectPath, distinct);
+    console.log(`Renamed generic project file to ${distinct}`);
+    return distinct;
+  } catch (error) {
+    console.error(`Could not rename ${projectPath}:`, error.message);
+    return projectPath;
+  }
+}
+
+/**
  * Where the active project is, and whether we can actually see it.
  *
  * The distinction is the whole point. A project on a removable or network
@@ -608,20 +636,24 @@ app.post('/api/project/new', (req, res) => {
 });
 
 app.post('/api/project/open', (req, res) => {
-  const { path: projectPath } = req.body;
-  if (!projectPath) return res.status(400).json({ error: 'path is required' });
-  if (!fs.existsSync(projectPath)) {
-    return res.status(404).json({ error: `Project file not found: ${projectPath}` });
+  const { path: requestedPath } = req.body;
+  if (!requestedPath) return res.status(400).json({ error: 'path is required' });
+  if (!fs.existsSync(requestedPath)) {
+    return res.status(404).json({ error: `Project file not found: ${requestedPath}` });
   }
   try {
+    const projectPath = migrateGenericProjectFile(requestedPath);
     const project = readProjectFile(projectPath);
     setActiveProject(projectPath);
 
     const actualDir = path.dirname(projectPath);
     const moved = project.workingFolder && path.resolve(project.workingFolder) !== path.resolve(actualDir);
-    if (moved) {
-      // The folder was moved or copied — re-anchor to where the file actually is.
-      writeProjectFile(projectPath, project.state, project.name);
+    const renamed = projectPath !== requestedPath;
+    if (moved || renamed) {
+      // The folder was moved or copied, or the file was just renamed —
+      // re-anchor the recorded workingFolder and name to where the file
+      // actually is. The filename wins over whatever the payload said.
+      writeProjectFile(projectPath, project.state);
     }
 
     stampRevision(res, projectPath);
@@ -629,6 +661,7 @@ app.post('/api/project/open', (req, res) => {
       path: projectPath,
       name: projectNameFromPath(projectPath),
       workingFolder: actualDir,
+      renamedFrom: renamed ? requestedPath : null,
       relocatedFrom: moved ? project.workingFolder : null,
       state: project.state,
       revision: currentStateRevision(),

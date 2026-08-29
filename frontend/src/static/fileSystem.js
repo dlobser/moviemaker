@@ -3,7 +3,7 @@
 // A project is still a folder — the same shape as the desktop build — except
 // the browser holds a FileSystemDirectoryHandle instead of a path string:
 //
-//   <picked folder>/project.mmproj.json
+//   <picked folder>/<folder name>.mmproj.json
 //   <picked folder>/assets/*
 //
 // Handles are structured-cloneable, so they persist in IndexedDB across
@@ -17,7 +17,34 @@ const DB_NAME = 'moviemaker';
 const DB_STORE = 'handles';
 const ACTIVE_KEY = 'activeProject';
 const RECENT_KEY = 'recentProjects';
-export const PROJECT_FILENAME = 'project.mmproj.json';
+// Every project file used to share this one name, which made a save landing
+// in the wrong folder indistinguishable from a save landing in the right one.
+// New writes go to `<folder name>.mmproj.json`; this generic name survives
+// only as a read fallback and is cleaned up after the first save.
+export const LEGACY_PROJECT_FILENAME = 'project.mmproj.json';
+const PROJECT_EXT = '.mmproj.json';
+
+/** The distinct project filename for a folder — named after the folder itself. */
+export function projectFilenameFor(dirHandle) {
+  return `${dirHandle.name}${PROJECT_EXT}`;
+}
+
+/**
+ * The project file inside a folder: the distinct `<folder>.mmproj.json`
+ * first, then the legacy generic name, then any other `*.mmproj.json` (a
+ * folder renamed outside the app). Null when the folder holds none.
+ */
+export async function findProjectFileHandle(dirHandle) {
+  for (const name of [projectFilenameFor(dirHandle), LEGACY_PROJECT_FILENAME]) {
+    try {
+      return await dirHandle.getFileHandle(name);
+    } catch { /* keep looking */ }
+  }
+  for await (const [name, handle] of dirHandle.entries()) {
+    if (handle.kind === 'file' && name.toLowerCase().endsWith(PROJECT_EXT)) return handle;
+  }
+  return null;
+}
 
 export function isFileSystemAccessSupported() {
   return typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function';
@@ -186,19 +213,16 @@ async function getAssetsDir(create = true) {
 
 /** The saved state blob, or null when the folder holds no project yet. */
 export async function readProjectState() {
-  try {
-    const handle = await requireProject().getFileHandle(PROJECT_FILENAME);
-    const text = await (await handle.getFile()).text();
-    const parsed = JSON.parse(text);
-    return parsed.state && typeof parsed.state === 'object' ? parsed.state : parsed;
-  } catch (error) {
-    if (error.name === 'NotFoundError') return null;
-    throw error;
-  }
+  const handle = await findProjectFileHandle(requireProject());
+  if (!handle) return null;
+  const text = await (await handle.getFile()).text();
+  const parsed = JSON.parse(text);
+  return parsed.state && typeof parsed.state === 'object' ? parsed.state : parsed;
 }
 
 export async function writeProjectState(state) {
   const dir = requireProject();
+  const filename = projectFilenameFor(dir);
   const payload = {
     format: 'moviemaker-project',
     formatVersion: 1,
@@ -206,10 +230,20 @@ export async function writeProjectState(state) {
     savedAt: new Date().toISOString(),
     state: state || {}
   };
-  const handle = await dir.getFileHandle(PROJECT_FILENAME, { create: true });
+  const handle = await dir.getFileHandle(filename, { create: true });
   const writable = await handle.createWritable();
   await writable.write(JSON.stringify(payload, null, 2));
   await writable.close();
+
+  // The distinct file now holds the state, so the legacy generic one is just
+  // a stale twin waiting to be read by mistake. Only the generic name is
+  // removed — any other .mmproj.json could be a deliberate backup.
+  if (filename !== LEGACY_PROJECT_FILENAME) {
+    try {
+      await dir.removeEntry(LEGACY_PROJECT_FILENAME);
+    } catch { /* nothing legacy to clean up */ }
+  }
+
   await getAssetsDir(true); // make sure media has somewhere to land
 }
 

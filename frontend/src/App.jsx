@@ -3646,7 +3646,8 @@ export default function App() {
       try {
         // Pick the OTHER project's folder, read its library, copy its images here.
         const sourceHandle = await window.showDirectoryPicker({ id: 'moviemaker-import', mode: 'read' });
-        const fileHandle = await sourceHandle.getFileHandle(projectFs.PROJECT_FILENAME);
+        const fileHandle = await projectFs.findProjectFileHandle(sourceHandle);
+        if (!fileHandle) throw new Error(`No MovieMaker project file found in "${sourceHandle.name}".`);
         const raw = JSON.parse(await (await fileHandle.getFile()).text());
         const sourceState = raw.state && typeof raw.state === 'object' ? raw.state : raw;
         const incoming = sourceState.assetLibrary || [];
