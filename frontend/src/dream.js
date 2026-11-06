@@ -50,8 +50,21 @@ export function createDreamSettings(overrides = {}) {
     videoModel: null,
     videoResolution: null,
     videoDuration: null,
+    // Whether each clip's <Tag>s send their reference images along with the
+    // frame. null follows the project's "attach tagged images to videos"
+    // switch, which ships off — right for a plain image-to-video model, and
+    // exactly wrong for a dream on a reference model, where a clip prompt
+    // naming <Moth> then draws the moth from prose alone. The dream decides
+    // for itself: a run is one continuous piece and its cast should hold.
+    attachTaggedImages: null,
     ...overrides
   };
+}
+
+/** Whether a dream run sends tagged images with its clips. */
+export function dreamAttachesTags(settings, projectDefault = false) {
+  const chosen = settings ? settings.attachTaggedImages : null;
+  return chosen === null || chosen === undefined ? Boolean(projectDefault) : Boolean(chosen);
 }
 
 /** Only the fields worth writing into the project file. */

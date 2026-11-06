@@ -2,6 +2,60 @@
 
 import { assetToInlineImage, requireText } from './llmShared.js';
 
+// --- text models -----------------------------------------------------------
+//
+// Google retires Gemini text models by *refusing* them, not by delisting them:
+// on 2026-09-10 `gemini-2.5-flash` still appeared in GET /models on a working
+// key while every generateContent call answered "no longer available to new
+// users. Please update your code to use models/gemini-3.6-flash". A saved
+// project therefore keeps a dead id that passes the "is it in the list" check
+// and fails only when the dream, an auto-prompt or an import actually runs.
+//
+// Three defences, in order of how much they know:
+//   1. the default is the model Google named;
+//   2. ids Google has already retired are rewritten to it before the request;
+//   3. a refusal that names a replacement is retried once with that model, so
+//      the next retirement is survived without a code change.
+
+export const GEMINI_TEXT_DEFAULT = 'gemini-3.6-flash';
+
+// Retired ids and the replacement Google's own error message pointed at. Only
+// ids known to be refused belong here — a wrong guess would silently swap a
+// model the user chose and can still use.
+const RETIRED_GEMINI_TEXT_MODELS = {
+  'gemini-2.5-flash': GEMINI_TEXT_DEFAULT,
+  'gemini-1.5-flash': GEMINI_TEXT_DEFAULT,
+  'gemini-1.5-pro': GEMINI_TEXT_DEFAULT
+};
+
+// What the model picker offers when the live list cannot be fetched (no key,
+// no network). Ids seen on GET /models on 2026-09-10; the live list wins
+// whenever it is available.
+export const GEMINI_FALLBACK_MODELS = [
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash (Recommended)' },
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
+  { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview' }
+];
+
+/**
+ * The Gemini text model to ask for: the default when none is set, the current
+ * replacement for a retired id, and anything else — another provider's id
+ * included — exactly as given.
+ */
+export function resolveGeminiTextModel(model) {
+  const id = String(model || '').trim();
+  if (!id) return GEMINI_TEXT_DEFAULT;
+  return RETIRED_GEMINI_TEXT_MODELS[id] || id;
+}
+
+/** The replacement a Gemini refusal names, or null when it names none. */
+export function suggestedGeminiModel(errorMessage) {
+  // Dots only inside the id ("gemini-3.6-flash"), never the sentence's own.
+  const match = /no longer available[\s\S]*?models\/([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)/i
+    .exec(String(errorMessage || ''));
+  return match ? match[1] : null;
+}
+
 export async function generateText({ prompt, systemPrompt, model, imagePaths = [] }, ctx) {
   const apiKey = ctx.credentials.geminiKey;
   if (!apiKey) throw new Error('Gemini API key is not configured.');
@@ -10,26 +64,40 @@ export async function generateText({ prompt, systemPrompt, model, imagePaths = [
   // No system prompt has to mean *no system text at all*, not an empty one —
   // on Gemini an empty one leaves the user's text wearing a stray label.
   const system = String(systemPrompt || '').trim();
-  const targetModel = model || 'gemini-2.5-flash';
+  const body = JSON.stringify({
+    contents: [{
+      parts: [
+        { text: system ? `${system}\n\nUser text: ${prompt}` : prompt },
+        ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))
+      ]
+    }]
+  });
 
-  const res = await ctx.fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: system ? `${system}\n\nUser text: ${prompt}` : prompt },
-            ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } }))
-          ]
-        }]
-      })
-    },
-    'Gemini'
-  );
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message || 'Gemini API Error');
+  const ask = async (targetModel) => {
+    const res = await ctx.fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body },
+      'Gemini'
+    );
+    return res.json();
+  };
+
+  const targetModel = resolveGeminiTextModel(model);
+  let data = await ask(targetModel);
+  if (data.error) {
+    // Retired since this build shipped. Google says which model to use: use
+    // it, once, and say so if that fails too.
+    const replacement = suggestedGeminiModel(data.error.message);
+    if (!replacement || replacement === targetModel) throw new Error(data.error.message || 'Gemini API Error');
+    const retry = await ask(replacement);
+    if (retry.error) {
+      throw new Error(
+        `${data.error.message} The suggested ${replacement} was refused as well: ` +
+        `${retry.error.message || 'Gemini API Error'}. Pick a current model in Settings.`
+      );
+    }
+    data = retry;
+  }
   const candidate = data.candidates?.[0];
   return requireText(
     candidate?.content?.parts?.map(part => part.text).filter(Boolean).join('\n'),

@@ -19,7 +19,7 @@ const SCHEMA_EXAMPLE = `{
     "imageSystemPrompt": "You are a cinematographic prompt engineer. Output ONLY the final visual prompt.",
     "videoSystemPrompt": "You are a cinematographic prompt engineer. Output ONLY the final motion prompt.",
     "activeLlm": "gemini",
-    "llmModel": "gemini-2.5-flash",
+    "llmModel": "gemini-3.6-flash",
     "imageModel": "fal-ai/flux/dev",
     "imageResolution": "16:9",
     "videoModel": "fal-ai",
@@ -298,6 +298,7 @@ export function normalizeImportedShotList(raw) {
           selectedVideo: asString(shot.selectedVideo) || null,
           lipSyncAudio: asString(shot.lipSyncAudio) || null,
           audioRefs: Array.isArray(shot.audioRefs) ? shot.audioRefs.map(asString).filter(Boolean) : [],
+          videoRefs: Array.isArray(shot.videoRefs) ? shot.videoRefs.map(asString).filter(Boolean) : [],
           // Preserve generated history when re-importing a full project export.
           imagePrompts: Array.isArray(shot.imagePrompts) ? shot.imagePrompts : [],
           videoPrompts: Array.isArray(shot.videoPrompts) ? shot.videoPrompts : []

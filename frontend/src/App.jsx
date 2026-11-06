@@ -56,8 +56,10 @@ import {
   modelCapabilities,
   refAudioCapacity,
   refImageCapacity,
+  refVideoCapacity,
   setCustomModelOverrides,
-  sizeOptions
+  sizeOptions,
+  snapDuration
 } from './catalog.js';
 import {
   ASSET_TYPES,
@@ -72,6 +74,7 @@ import {
   extractTags,
   findAssetByTag,
   normalizeTag,
+  renderPromptTags,
   scanPromptTags,
   tagPreservationRule
 } from './promptTags.js';
@@ -84,6 +87,8 @@ import {
 import PromptEditor, { EffectivePrompt } from './PromptEditor.jsx';
 import { buildLlmImportPrompt, extractJsonDocument, normalizeImportedShotList } from './shotListImport.js';
 import { apiFetch, resolveAssetUrl, detectMode, isStatic } from './client.js';
+import { GEMINI_TEXT_DEFAULT, resolveGeminiTextModel } from './shared/providers/google.js';
+import { dreamAttachesTags } from './dream.js';
 import {
   createAudioTrack, createEmptyEdit, deriveAudioClipsForShots, deriveVideoClips, migrateEdit
 } from './edit/model.js';
@@ -94,6 +99,7 @@ import { autoAssignReferences } from './refAutoAssign.js';
 import PipelinePanel from './PipelinePanel.jsx';
 import EditView from './edit/EditView.jsx';
 import { AssetImage, AssetVideo, useAssetUrl } from './AssetMedia.jsx';
+import HoverPreview from './HoverPreview.jsx';
 import * as projectFs from './static/fileSystem.js';
 import {
   compactPromptSettings,
@@ -216,6 +222,198 @@ function ModelOptions({ models, unit }) {
   ));
 }
 
+/**
+ * The two kinds of positional media reference a shot can carry beside its
+ * images: what each is called, where it lives on the shot, and how a video
+ * model's capacity for it is read. Audio and video are the same mechanism —
+ * slots the prompt names by position — so they share one row component and
+ * one set of handlers, parameterised by this table.
+ */
+const MEDIA_REF_KINDS = {
+  audio: {
+    field: 'audioRefs', token: 'audio', noun: 'Audio', accept: 'audio/*', Icon: Music,
+    capacity: (modelId) => refAudioCapacity('video', modelId),
+    placeholder: 'https://…/vocal.mp3 or asset://…',
+    urlHint: 'A public mp3 or wav URL the model can fetch, or an asset:// id from the Atlas Asset Library. 15 seconds across all clips.',
+    fileHint: 'Upload a clip from disk. Works on the Fal models, which host it for you; the Atlas ones need a URL or an asset:// id.',
+    example: 'she sings @audio1',
+    use: 'sing, speak or cut to them'
+  },
+  video: {
+    field: 'videoRefs', token: 'video', noun: 'Video', accept: 'video/*', Icon: Film,
+    capacity: (modelId) => refVideoCapacity('video', modelId),
+    placeholder: 'https://…/move.mp4 or asset://…',
+    urlHint: 'A public mp4 or mov URL the model can fetch, or an asset:// id from the Atlas Asset Library. 2–15 seconds each; Seedance reads 15 seconds across all clips.',
+    fileHint: 'Upload a clip from disk. Works on the Fal models, which host it for you; the Atlas ones need a URL or an asset:// id.',
+    example: 'match the camera move of @video1',
+    use: 'borrow their motion, camera move or subject'
+  }
+};
+
+/**
+ * A reference's filename for a chip. References are paths or URLs, and a
+ * signed URL carries a query string longer than the filename — show the file,
+ * keep the whole thing in the tooltip.
+ */
+function mediaRefLabel(ref) {
+  const base = String(ref || '').split(/[?#]/)[0].split('/').pop().split('\\').pop();
+  return base || ref;
+}
+
+/**
+ * One row of positional media references on a shot — the chips, the URL field
+ * and the file button. Rendered only where the shot's video model has room for
+ * the kind; a model that takes none shows nothing.
+ */
+function MediaRefRow({ kind, clips, capacity, draft, onDraftChange, onAdd, onUpload, onRemove, uploading }) {
+  const spec = MEDIA_REF_KINDS[kind];
+  const Icon = spec.Icon;
+  const fileInput = useRef(null);
+  if (capacity === 0) return null;
+  return (
+    <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+      <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+        {spec.noun} refs {clips.length}/{capacity}
+      </span>
+      {clips.map((path, refIndex) => (
+        <span
+          key={path}
+          title={path}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.7rem',
+            padding: '3px 6px', borderRadius: 'var(--radius-sm)',
+            border: '1px solid var(--border-light)', background: 'var(--bg-card)'
+          }}
+        >
+          <Icon size={10} style={{ color: 'var(--accent)' }} />
+          <code style={{ color: 'var(--accent)' }}>@{spec.token}{refIndex + 1}</code>
+          <span style={{ maxWidth: '130px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
+            {mediaRefLabel(path)}
+          </span>
+          <button
+            className="btn btn-danger"
+            style={{ padding: '1px 3px' }}
+            onClick={() => onRemove(path)}
+          >
+            <X size={9} />
+          </button>
+        </span>
+      ))}
+      {clips.length < capacity && (
+        <>
+          <input
+            type="url"
+            className="input-field"
+            style={{ width: '230px', padding: '2px 6px', fontSize: '0.68rem' }}
+            placeholder={spec.placeholder}
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') onAdd(); }}
+            title={spec.urlHint}
+          />
+          <button
+            className="btn btn-secondary"
+            style={{ padding: '2px 8px', fontSize: '0.68rem' }}
+            onClick={onAdd}
+          >
+            <Plus size={10} /> Add
+          </button>
+          <input
+            type="file"
+            accept={spec.accept}
+            multiple
+            ref={fileInput}
+            onChange={onUpload}
+            style={{ display: 'none' }}
+          />
+          <button
+            className="btn btn-secondary"
+            style={{ padding: '2px 8px', fontSize: '0.68rem' }}
+            disabled={uploading}
+            onClick={() => fileInput.current?.click()}
+            title={spec.fileHint}
+          >
+            {uploading ? <RefreshCw className="spinner" size={10} /> : <Upload size={10} />} File
+          </button>
+        </>
+      )}
+      {clips.length > 0 && (
+        <span style={{ fontSize: '0.66rem', color: 'var(--text-dim)' }}>
+          Point the prompt at them by name, e.g. "{spec.example}".
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The audio or video a video request will carry, shown in the generation
+ * modal. Unlike the images these leave no trace in the prompt preview, so
+ * without this panel the only way to know a clip was sent was to watch the
+ * result. Capacity is the model chosen in the modal's, not the shot's,
+ * because that dropdown is what the request will actually use.
+ */
+function SentMediaPanel({ kind, clips, capacity, modelLabel }) {
+  const spec = MEDIA_REF_KINDS[kind];
+  const Icon = spec.Icon;
+  if (clips.length === 0 && capacity === 0) return null;
+  const overCapacity = clips.length > capacity;
+  return (
+    <div style={{ marginTop: '10px', border: `1px solid ${overCapacity ? 'var(--accent)' : 'var(--border-light)'}`, borderRadius: '6px', padding: '10px', background: 'rgba(0,0,0,0.18)' }}>
+      <div style={{ fontSize: '0.78rem', fontWeight: 'bold', marginBottom: clips.length ? '8px' : 0 }}>
+        {spec.noun} sent with this request
+        <span style={{ marginLeft: '6px', fontWeight: 'normal', color: 'var(--text-dim)' }}>
+          {clips.length} of {capacity} slot{capacity === 1 ? '' : 's'}
+        </span>
+      </div>
+
+      {clips.length === 0 ? (
+        <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+          None — this model takes reference {kind}. Add clips on the shot to {spec.use}.
+        </span>
+      ) : (
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+          {clips.map((path, refIndex) => (
+            <span
+              key={path}
+              title={path}
+              style={{
+                display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.72rem',
+                padding: '4px 7px', borderRadius: '4px', background: 'var(--bg-card)',
+                border: `2px solid ${refIndex < capacity ? 'var(--primary)' : 'var(--accent)'}`
+              }}
+            >
+              <Icon size={11} style={{ color: 'var(--accent)' }} />
+              <code style={{ color: 'var(--accent)' }}>@{spec.token}{refIndex + 1}</code>
+              <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
+                {mediaRefLabel(path)}
+              </span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {overCapacity && (
+        <div style={{ fontSize: '0.72rem', color: 'var(--accent)', marginTop: '8px', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
+          <AlertTriangle size={11} style={{ marginTop: '2px', flexShrink: 0 }} />
+          <span>
+            {capacity === 0
+              ? `${modelLabel} takes no reference ${kind} — only the reference-to-video endpoints do${kind === 'audio' ? ', and Atlas will not combine a first frame with reference media' : ''}. This will be refused before it is billed: pick a reference-to-video model above, or remove the clips.`
+              : `Only ${capacity} fit. This will be refused before it is billed — remove the extras on the shot.`}
+          </span>
+        </div>
+      )}
+
+      {clips.length > 0 && !overCapacity && (
+        <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginTop: '8px' }}>
+          Name them in the prompt to say what each is for — the model indexes them by position, so
+          "@{spec.token}1" is the only thing that ties a clip to the action.
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   // --- CORE STATE ---
   const [scenes, setScenes] = useState([]);
@@ -273,7 +471,7 @@ export default function App() {
 
   // --- SETTINGS ---
   const [activeLlm, setActiveLlm] = useState('gemini');
-  const [llmModel, setLlmModel] = useState('gemini-2.5-flash');
+  const [llmModel, setLlmModel] = useState(GEMINI_TEXT_DEFAULT);
   const [llmModelsList, setLlmModelsList] = useState([]);
   
   const [activeImageGenerator, setActiveImageGenerator] = useState('fal-ai');
@@ -490,9 +688,9 @@ export default function App() {
 
   // refs
   const audioInputRefs = useRef({});
-  const audioRefInputRefs = useRef({});
-  // Half-typed audio URLs, per shot — draft text, never saved with the project.
-  const [audioRefDrafts, setAudioRefDrafts] = useState({});
+  // Half-typed reference URLs, keyed `${kind}:${shotId}` — draft text, never
+  // saved with the project.
+  const [mediaRefDrafts, setMediaRefDrafts] = useState({});
 
   // Helper: Toast Alert
   const showToast = (message, type = 'info') => {
@@ -685,7 +883,9 @@ export default function App() {
     setWatermarkImage(state.watermarkImage || null);
     setWatermarkMotion(state.watermarkMotion === 'jump' ? 'jump' : 'drift');
     setActiveLlm(state.activeLlm || 'gemini');
-    setLlmModel(state.llmModel || 'gemini-2.5-flash');
+    // A retired Gemini id in a saved project is rewritten to its replacement
+    // here, so the picker and every LLM call agree on a model that answers.
+    setLlmModel(resolveGeminiTextModel(state.llmModel || GEMINI_TEXT_DEFAULT));
     setActiveImageGenerator(state.activeImageGenerator || 'fal-ai');
     setImageModel(state.imageModel || 'fal-ai/flux/schnell');
     setImageResolution(state.imageResolution || '16:9');
@@ -1100,6 +1300,7 @@ export default function App() {
           referenceImages: [],
           lipSyncAudio: null,
           audioRefs: [],
+          videoRefs: [],
           imagePrompts: [],
           videoPrompts: [],
           draftImagePrompt: '',
@@ -1174,6 +1375,7 @@ export default function App() {
       referenceImages: [],
       lipSyncAudio: null,
       audioRefs: [],
+      videoRefs: [],
       imagePrompts: [], 
       videoPrompts: [],
       draftImagePrompt: '',
@@ -1312,7 +1514,9 @@ export default function App() {
     // Shot overrides > scene defaults > project defaults, via the resolver.
     setGenModalModel(resolved.model);
     setGenModalRes(resolved.resolution);
-    if (type === 'video') setGenModalDuration(resolved.duration || videoDuration);
+    // The shot's length, rounded up to the closest length this model offers —
+    // the dropdown shows what will actually be asked for.
+    if (type === 'video') setGenModalDuration(snapDuration(resolved.model, resolved.duration || videoDuration));
 
     let initialPromptText = '';
     if (existingPromptId) {
@@ -1656,7 +1860,7 @@ export default function App() {
     type, shotId, shotName,
     // existingPromptId is no longer needed: groups are matched by their recipe,
     // so a generation lands in the right gallery regardless of where it started.
-    rawPrompt, model, resolution, duration,
+    rawPrompt, model, resolution, duration: requestedDuration,
     primaryImagePaths = [], attachTaggedImages = null,
     excludedImagePaths = [], usePrePrompt = true, usePostPrompt = true, promptOverride = null
   }) => {
@@ -1720,6 +1924,43 @@ export default function App() {
       return { ok: false, error };
     }
 
+    // Reference video is the same idea — clips the shot borrows motion, a
+    // camera move or a subject from — and only the reference-to-video
+    // endpoints take it.
+    const videoRefs = type === 'video'
+      ? ((shots.find(s => s.id === shotId) || {}).videoRefs || []).filter(Boolean)
+      : [];
+    if (videoRefs.length > (caps.maxRefVideo || 0)) {
+      const error = caps.maxRefVideo
+        ? `${caps.label} takes at most ${caps.maxRefVideo} reference video clip${caps.maxRefVideo === 1 ? '' : 's'}, and this shot has ${videoRefs.length}.`
+        : `${caps.label} does not take reference video, and this shot has ${videoRefs.length}. `
+          + `Only the reference-to-video endpoints do — Seedance 2.0 ref2v on Atlas or Fal, or Wan 2.6 ref2v on Fal. `
+          + `Switch the shot to one of those, or remove the clips.`;
+      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error } : j)));
+      showToast(error, 'error');
+      return { ok: false, error };
+    }
+    // Wan's reference endpoint has nothing to generate from without a clip.
+    if (type === 'video' && caps.refVideoMode === 'required' && videoRefs.length === 0) {
+      const error = `${caps.label} generates from reference videos and this shot has none. Add one to three clips to the shot's video refs first.`;
+      setBatchJobs(prev => prev.map(j => (j.id === jobId ? { ...j, status: 'failed', error } : j)));
+      showToast(error, 'error');
+      return { ok: false, error };
+    }
+
+    // The shot's length is the director's number; the model offers what it
+    // offers. A video request rounds up to the closest length the model does
+    // offer and says so. The recipe records the length actually asked for, so
+    // reopening the group reproduces the generation rather than the wish.
+    let duration = requestedDuration;
+    if (type === 'video') {
+      duration = snapDuration(model, requestedDuration);
+      const wanted = Number(requestedDuration);
+      if (Number.isFinite(wanted) && wanted > 0 && String(duration) !== String(wanted)) {
+        showToast(`${caps.label} does not offer ${wanted}s — requesting ${duration}s, the closest it does.`, 'info');
+      }
+    }
+
     // What the group is keyed on: exactly what the user chose, so reopening it
     // reproduces this generation byte for byte.
     const recipe = {
@@ -1750,7 +1991,7 @@ export default function App() {
     if (type === 'image') {
       return runAsyncImageJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta);
     }
-    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta, audioRefs);
+    return runAsyncVideoJob(jobId, shotId, composed.prompt, composed.inputImagePaths, recipe, meta, audioRefs, videoRefs);
   };
 
   /**
@@ -1891,7 +2132,7 @@ export default function App() {
   // order. It used to be a single path, which was fine while every video model
   // took one image and quietly wrong once Seedance 2.0's reference endpoint
   // took nine — the prompt pointed at @image3 and only @image1 was ever sent.
-  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}, meta = null, audioInputs = []) => {
+  const runAsyncVideoJob = async (jobId, shotId, promptText, imageInputs = [], recipe = {}, meta = null, audioInputs = [], videoInputs = []) => {
     const { model, resolution: resOption, duration } = recipe;
     const imageUrlsToSend = Array.isArray(imageInputs) ? imageInputs.filter(Boolean) : [imageInputs].filter(Boolean);
     const imageInput = imageUrlsToSend[0] || '';
@@ -1906,6 +2147,7 @@ export default function App() {
           prompt: promptText,
           imageUrls: imageUrlsToSend,
           audioUrls: audioInputs,
+          videoUrls: videoInputs,
           resolution: resOption,
           duration: duration,
           destination: shotDestination(shotId, 'video')
@@ -2412,6 +2654,7 @@ export default function App() {
       referenceImages: [],
       lipSyncAudio: null,
       audioRefs: [],
+      videoRefs: [],
       imagePrompts: [],
       videoPrompts: [],
       draftImagePrompt: '',
@@ -2513,6 +2756,8 @@ export default function App() {
     const videoModelId = settings.videoModel || videoModel;
     const videoRes = settings.videoResolution || videoResolution;
     const duration = settings.videoDuration || videoDuration;
+    // The dream's own choice, falling back to the project switch.
+    const attachTags = dreamAttachesTags(settings, attachTagsForVideos);
 
     dreamCancelRef.current = false;
     setDreamRun({ active: true, total, clip: 1, completed: 0, phase: 'starting', log: [], stopped: false, failed: false });
@@ -2647,7 +2892,7 @@ export default function App() {
             resolution: videoRes,
             duration,
             primaryImagePaths: currentImage ? [currentImage] : [],
-            attachTaggedImages: attachTagsForVideos
+            attachTaggedImages: attachTags
           });
           if (!result?.ok) throw new Error(result?.error || 'The clip failed to generate.');
           currentVideo = result.path;
@@ -2735,13 +2980,27 @@ export default function App() {
   );
 
   /**
-   * Compose an asset's generation prompt. Other assets' <Tag>s still resolve
-   * (an environment can reference a character), but the asset being generated
-   * is excluded from its own library so <Ralph> inside Ralph doesn't recurse.
+   * Compose an asset's generation prompt. Other assets' <Tag>s resolve the way
+   * they do in a shot — an environment can reference a character, and drags
+   * that character's images along. The asset's *own* tag is handled first and
+   * differently: it becomes the asset's name (and, in a hand-written prompt,
+   * its description) as plain text, and never pulls in images — the ticked
+   * inputs above are the user's explicit answer to that. Left to the composer
+   * it would either recurse (<Ralph> inside Ralph) or, excluded from the
+   * library as it used to be, go out to the model as a literal "<Ralph>" and
+   * be flagged as an undefined tag.
    */
   const buildAssetPrompt = (draft) => {
     const others = assetLibrary.filter(a => a.id !== draft.id);
     const modelId = assetEditorModel(draft);
+    const self = { ...draft, tag: String(draft.tag || '').trim().replace(/^<|>$/g, '') };
+    const rawPrompt = effectiveAssetPrompt(draft);
+    // A written prompt wants the whole subject where its tag sits; the fallback
+    // prompt is already built from the description, so there the tag is only
+    // the name — expanding it would repeat the description inside itself.
+    const selfText = draft.imagePrompt?.trim() ? assetPromptText(self) : (self.name || self.tag);
+    const selfScan = self.tag ? scanPromptTags(rawPrompt, [self]) : { occurrences: [] };
+    const prompt = renderPromptTags(rawPrompt, selfScan.occurrences, occurrence => (occurrence.asset ? selfText : null));
     // Only images still in the asset's pool can be sent — one deleted from the
     // grid must not keep riding along invisibly in the saved selection.
     const pool = draft.images || [];
@@ -2760,7 +3019,7 @@ export default function App() {
     }[wrap] || ['', ''];
 
     return composeGenerationPrompt({
-      prompt: effectiveAssetPrompt(draft),
+      prompt,
       prePrompt: wraps[0],
       postPrompt: wraps[1],
       assetLibrary: others,
@@ -2944,7 +3203,20 @@ export default function App() {
 
     const systemPrompt = promptText(promptSettings, 'assetWriterSystem');
 
-    const userPrompt = fillTemplate(promptText(promptSettings, 'assetWriterUser'), {
+    // Tags the user put in the asset's own description are deliberate —
+    // "dozens of girls identical to <EGirl>" — and the only way the written
+    // prompt ends up carrying EGirl's description and images is if the tag
+    // survives the rewrite, the same rule the shot writer works under. Script
+    // lines are not a source: they name whatever shares a shot with this
+    // subject, and reference art wants the subject alone. The asset's own tag
+    // is left out too; a subject need not point at itself.
+    const ownTag = normalizeTag(asset.tag);
+    const keptTags = extractTags(asset.description || '').filter(tag => normalizeTag(tag) !== ownTag);
+    const tagSource = keptTags.map(tag => `<${tag}>`).join(' ');
+    const tagRule = tagPreservationRule(tagSource);
+
+    const template = promptText(promptSettings, 'assetWriterUser');
+    let userPrompt = fillTemplate(template, {
       type: asset.type || 'character',
       tag: asset.tag || '',
       name: asset.name || asset.tag,
@@ -2954,8 +3226,11 @@ export default function App() {
         : '\n(This subject is not referenced in any shot yet — work from the name and description alone.)',
       styleHint: styleHint
         ? `\nProject look, for tone only — do NOT copy this into the reference prompt: ${styleHint}`
-        : ''
+        : '',
+      tags: tagRule
     });
+    // A template saved before {tags} existed still gets the rule.
+    if (tagRule && !template.includes('{tags}')) userPrompt = `${userPrompt}\n\n${tagRule}`;
 
     const res = await apiFetch(`/api/llm/generate`, {
       method: 'POST',
@@ -2966,22 +3241,26 @@ export default function App() {
     if (!res.ok) throw new Error(data.error || 'Prompt generation failed');
 
     const text = (data.text || '').trim();
+    // An instruction is not a guarantee: a tag the writer paraphrased away is
+    // reported, because losing it is invisible until the art comes back
+    // without the character in it.
+    const result = (imagePrompt, description) => ({
+      description, imagePrompt, lostTags: droppedTags(tagSource, imagePrompt)
+    });
     try {
       const parsed = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
-      if (parsed.imagePrompt) {
-        return { description: parsed.description || '', imagePrompt: parsed.imagePrompt };
-      }
+      if (parsed.imagePrompt) return result(parsed.imagePrompt, parsed.description || '');
     } catch {
       // Not JSON — fall through and use the raw reply.
     }
-    return { description: '', imagePrompt: text };
+    return result(text, '');
   };
 
   const handleAutoWriteAssetPrompt = async () => {
     if (!assetEditor) return;
     setLoadingStates(prev => ({ ...prev, asset_llm: true }));
     try {
-      const { description, imagePrompt } = await writeAssetPromptWithLlm(assetEditor);
+      const { description, imagePrompt, lostTags } = await writeAssetPromptWithLlm(assetEditor);
       setAssetEditor(prev => (prev ? {
         ...prev,
         imagePrompt,
@@ -2990,6 +3269,9 @@ export default function App() {
       } : prev));
       const used = gatherAssetContext(assetEditor).length;
       showToast(`Reference prompt written${used ? ` from ${used} script reference${used === 1 ? '' : 's'}` : ''}.`, 'success');
+      if (lostTags.length > 0) {
+        showToast(`The writer dropped <${lostTags.join('>, <')}> from the prompt — put ${lostTags.length === 1 ? 'it' : 'them'} back or that asset's description and images will not travel.`, 'warning');
+      }
     } catch (err) {
       console.error(err);
       showToast(`Prompt failed: ${err.message}`, 'error');
@@ -3035,7 +3317,10 @@ export default function App() {
       const needsPrompt = rewriteExisting || !asset.imagePrompt?.trim();
       if (useLlm && needsPrompt) {
         try {
-          const { description, imagePrompt } = await writeAssetPromptWithLlm(asset);
+          const { description, imagePrompt, lostTags } = await writeAssetPromptWithLlm(asset);
+          if (lostTags.length > 0) {
+            showToast(`<${asset.tag}>: the writer dropped <${lostTags.join('>, <')}> — that asset's description and images will not travel.`, 'warning');
+          }
           promptOverride = imagePrompt;
           const filledDescription = asset.description?.trim() ? asset.description : (description || asset.description);
           const descriptionChanged = (filledDescription || '') !== (asset.description || '');
@@ -3418,6 +3703,7 @@ export default function App() {
       // Audio references may be URLs or asset:// ids, which `add` ignores —
       // only the ones uploaded into the project are files to copy.
       (shot.audioRefs || []).forEach(add);
+      (shot.videoRefs || []).forEach(add);
       [...(shot.imagePrompts || []), ...(shot.videoPrompts || [])].forEach(group => {
         (group.outputs || []).forEach(out => add(out.path));
         (group.inputImagePaths || []).forEach(add);
@@ -4099,7 +4385,7 @@ export default function App() {
     }
 
     if (project.activeLlm) setActiveLlm(project.activeLlm);
-    if (project.llmModel) setLlmModel(project.llmModel);
+    if (project.llmModel) setLlmModel(resolveGeminiTextModel(project.llmModel));
     if (project.imageModel) setImageModel(project.imageModel);
     if (project.imageResolution) setImageResolution(project.imageResolution);
     if (project.videoModel) setVideoModel(project.videoModel);
@@ -4541,6 +4827,7 @@ export default function App() {
       referenceImages: [],
       lipSyncAudio: null,
       audioRefs: [],
+      videoRefs: [],
       imagePrompts: [],
       videoPrompts: [],
       draftImagePrompt: '',
@@ -4720,30 +5007,52 @@ export default function App() {
    * not generating anything, and still depended on an Atlas endpoint that
    * refused API keys. Hosting it yourself is fewer moving parts than any of it.
    */
-  /** Room left for another clip on this shot, by its resolved video model. */
-  const audioRefRoom = (shot) => (
-    refAudioCapacity('video', resolveShotModelSettings('video', shot).model) - (shot?.audioRefs || []).length
-  );
+  /** Room left for another clip of this kind on this shot, by its resolved video model. */
+  const mediaRefRoom = (kind, shot) => {
+    const spec = MEDIA_REF_KINDS[kind];
+    return spec.capacity(resolveShotModelSettings('video', shot).model) - (shot?.[spec.field] || []).length;
+  };
 
-  const attachAudioRef = (shotId, ref) => {
+  /**
+   * Attach clips to a shot's slots of one kind — audio or video — in a single
+   * state update. One update rather than one per clip because a batch of
+   * uploads attached one at a time from the same stale closure kept only the
+   * last file: each write started from a list that did not yet hold the
+   * previous one.
+   */
+  const attachMediaRefs = (kind, shotId, refs) => {
+    const spec = MEDIA_REF_KINDS[kind];
     const shot = shots.find(s => s.id === shotId);
-    const existing = shot?.audioRefs || [];
-    if (existing.includes(ref)) {
+    const existing = shot?.[spec.field] || [];
+    const capacity = spec.capacity(resolveShotModelSettings('video', shot).model);
+    const fresh = refs.filter((ref, index) => ref && !existing.includes(ref) && refs.indexOf(ref) === index);
+    if (fresh.length === 0) {
       showToast('That clip is already on this shot.', 'warning');
       return false;
     }
-    if (audioRefRoom(shot) <= 0) {
-      const capacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
-      showToast(`This shot already has the ${capacity} reference clip${capacity === 1 ? '' : 's'} the model accepts.`, 'warning');
+    const room = capacity - existing.length;
+    if (room <= 0) {
+      showToast(`This shot already has the ${capacity} reference ${kind} clip${capacity === 1 ? '' : 's'} the model accepts.`, 'warning');
       return false;
     }
-    handleUpdateShotField(shotId, 'audioRefs', [...existing, ref]);
-    showToast(`Attached as @audio${existing.length + 1}.`, 'success');
+    const accepted = fresh.slice(0, room);
+    setScenes(prev => prev.map(scene => ({
+      ...scene,
+      shots: (scene.shots || []).map(s => {
+        if (s.id !== shotId) return s;
+        const current = s[spec.field] || [];
+        return { ...s, [spec.field]: [...current, ...accepted.filter(ref => !current.includes(ref))] };
+      })
+    })));
+    const slots = accepted.map((ref, index) => `@${spec.token}${existing.length + index + 1}`).join(', ');
+    const left = fresh.length - accepted.length;
+    showToast(`Attached as ${slots}.${left ? ` ${left} more did not fit.` : ''}`, 'success');
     return true;
   };
 
-  const handleAddAudioRef = (shotId) => {
-    const url = String(audioRefDrafts[shotId] || '').trim();
+  const handleAddMediaRef = (kind, shotId) => {
+    const key = `${kind}:${shotId}`;
+    const url = String(mediaRefDrafts[key] || '').trim();
     if (!url) return;
     // Either a link the model host can fetch, or an id for a clip already
     // uploaded to Atlas's own Asset Library.
@@ -4751,36 +5060,38 @@ export default function App() {
       showToast('Needs a full https:// URL, or an asset:// id from the Atlas Asset Library.', 'warning');
       return;
     }
-    if (attachAudioRef(shotId, url)) setAudioRefDrafts(prev => ({ ...prev, [shotId]: '' }));
+    if (attachMediaRefs(kind, shotId, [url])) setMediaRefDrafts(prev => ({ ...prev, [key]: '' }));
   };
 
   /**
-   * Attach a clip from disk. Only Fal can use one: it uploads the file to its
+   * Attach clips from disk. Only Fal can use one: it uploads the file to its
    * own storage and hands the model that address, where Atlas forwards the
    * string untouched and needs somewhere already reachable.
    */
-  const handleAudioRefUpload = async (shotId, e) => {
+  const handleMediaRefUpload = async (kind, shotId, e) => {
     const files = Array.from(e.target.files || []);
     e.target.value = '';
     if (!files.length) return;
 
-    const room = audioRefRoom(shots.find(s => s.id === shotId));
+    const room = mediaRefRoom(kind, shots.find(s => s.id === shotId));
     if (room <= 0) {
       showToast('No slots left for another clip on this shot.', 'warning');
       return;
     }
 
-    const key = `audioref_${shotId}`;
+    const key = `${kind}ref_${shotId}`;
     setLoadingStates(prev => ({ ...prev, [key]: true }));
     try {
+      const uploaded = [];
       for (const file of files.slice(0, room)) {
         const formData = new FormData();
         formData.append('file', file);
         const res = await apiFetch(`/api/upload`, { method: 'POST', body: formData });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Upload failed');
-        attachAudioRef(shotId, data.filePath);
+        uploaded.push(data.filePath);
       }
+      attachMediaRefs(kind, shotId, uploaded);
     } catch (err) {
       console.error(err);
       showToast(`Upload failed: ${err.message}`, 'error');
@@ -4791,12 +5102,13 @@ export default function App() {
 
   // Removal renumbers everything after it, so a prompt pointing at @audio2
   // starts addressing a different clip. Worth saying out loud.
-  const handleRemoveAudioRef = (shotId, path) => {
+  const handleRemoveMediaRef = (kind, shotId, path) => {
+    const spec = MEDIA_REF_KINDS[kind];
     const shot = shots.find(s => s.id === shotId);
-    const remaining = (shot?.audioRefs || []).filter(p => p !== path);
-    handleUpdateShotField(shotId, 'audioRefs', remaining);
+    const remaining = (shot?.[spec.field] || []).filter(p => p !== path);
+    handleUpdateShotField(shotId, spec.field, remaining);
     if (remaining.length > 0) {
-      showToast('Removed — the clips after it have shifted up a slot, so check any @audio pointers in the prompt.', 'info');
+      showToast(`Removed — the clips after it have shifted up a slot, so check any @${spec.token} pointers in the prompt.`, 'info');
     }
   };
 
@@ -5002,9 +5314,6 @@ export default function App() {
     return p.split('/').pop().split('\\').pop();
   };
 
-  // Audio references are URLs, and a signed one carries a query string longer
-  // than the filename. Show the file, keep the whole thing in the tooltip.
-  const audioRefLabel = (url) => pathBaseName(String(url || '').split(/[?#]/)[0]) || url;
 
   // --- EXTERNAL FILE UPLOADS TO GALLERY OVERLAYS ---
   const handleGalleryImageUpload = async (e, dest = 'gallery') => {
@@ -6330,13 +6639,22 @@ export default function App() {
                           stale
                         </span>
                       )}
+                      <span
+                        title="Shot length"
+                        style={{ fontSize: '0.65rem', color: 'var(--text-dim)', whiteSpace: 'nowrap', display: 'inline-flex', alignItems: 'center', gap: '3px' }}
+                      >
+                        <Clock size={10} /> {resolveShotModelSettings('video', shot).duration || videoDuration || '5'}s
+                      </span>
                       <span className="shot-collapsed-desc">{shot.description || '(No description)'}</span>
                     </div>
 
                     <div className="shot-collapsed-previews" onClick={(e) => e.stopPropagation()}>
-                      <div
+                      <HoverPreview
                         className="mini-preview"
-                        title="Active Image Select"
+                        path={shot.selectedImage}
+                        kind="image"
+                        label={`${shot.name || 'Shot'} — selected image`}
+                        title={shot.selectedImage ? undefined : 'Active Image Select'}
                         onDoubleClick={() => shot.selectedImage && handleImageDoubleClick(shot.selectedImage, shot.name)}
                       >
                         {shot.selectedImage ? (
@@ -6344,15 +6662,21 @@ export default function App() {
                         ) : (
                           'No Image'
                         )}
-                      </div>
+                      </HoverPreview>
 
-                      <div className="mini-preview" title="Active Video Select">
+                      <HoverPreview
+                        className="mini-preview"
+                        path={shot.selectedVideo}
+                        kind="video"
+                        label={`${shot.name || 'Shot'} — selected video`}
+                        title={shot.selectedVideo ? undefined : 'Active Video Select'}
+                      >
                         {shot.selectedVideo ? (
                           <AssetVideo path={shot.selectedVideo} />
                         ) : (
                           'No Video'
                         )}
-                      </div>
+                      </HoverPreview>
 
                       {shot.lipSyncAudio && (
                         <span style={{ fontSize: '0.65rem', background: 'rgba(16, 185, 129, 0.15)', color: 'var(--success)', padding: '2px 6px', borderRadius: '4px' }}>
@@ -6481,7 +6805,7 @@ export default function App() {
                           persists, so a batch run sends exactly this set. */}
                       {/* Which models this shot resolves to and why; click to
                           override on the shot, pick Inherit to clear. */}
-                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '10px' }}>
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '10px', flexWrap: 'wrap' }}>
                         <ModelPill
                           type="image"
                           resolved={resolveShotModelSettings('image', shot)}
@@ -6494,6 +6818,44 @@ export default function App() {
                           value={shot.videoModel}
                           onChange={(v) => handleUpdateShotField(shot.id, 'videoModel', v)}
                         />
+                        {/* How long the shot runs, in seconds — the director's
+                            number, not a model's menu. A video request rounds it
+                            up to the closest length the model offers, and the
+                            timeline holds a still for exactly this long. Clearing
+                            the field inherits the project default. */}
+                        {(() => {
+                          const resolvedVideo = resolveShotModelSettings('video', shot);
+                          const own = shot.videoDuration !== undefined && shot.videoDuration !== null && shot.videoDuration !== '';
+                          const effective = own ? shot.videoDuration : (resolvedVideo.duration || videoDuration || '5');
+                          const requested = snapDuration(resolvedVideo.model, effective);
+                          const offered = durationOptions(resolvedVideo.model).map(o => o.value).join(', ');
+                          return (
+                            <label
+                              title={`Shot length in seconds — ${own ? 'set on this shot; clear it to inherit' : `inherited from the ${resolvedVideo.sources.duration}`}. A video request rounds up to the closest length the model offers.`}
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '0.68rem', color: 'var(--text-dim)' }}
+                            >
+                              <Clock size={11} />
+                              <input
+                                type="number"
+                                min="1"
+                                step="1"
+                                className="input-field shot-length-input"
+                                style={{ width: '54px', padding: '1px 4px', fontSize: '0.68rem', textAlign: 'right', opacity: own ? 1 : 0.75 }}
+                                value={effective}
+                                onChange={(e) => handleUpdateShotField(shot.id, 'videoDuration', e.target.value === '' ? null : e.target.value)}
+                              />
+                              <span>s</span>
+                              {String(requested) !== String(effective) && (
+                                <em
+                                  style={{ fontStyle: 'normal', color: 'var(--accent)' }}
+                                  title={`${modelCapabilities('video', resolvedVideo.model).label} offers ${offered} seconds — ${effective}s rounds up to ${requested}s when the video is requested.`}
+                                >
+                                  → {requested}s
+                                </em>
+                              )}
+                            </label>
+                          );
+                        })()}
                       </div>
 
                       <div style={{ marginTop: '12px' }}>
@@ -6505,88 +6867,24 @@ export default function App() {
                         />
                       </div>
 
-                      {/* Reference audio, shown only where the shot's video model
-                          takes it. Slots are positional and the prompt names them,
-                          so each clip wears its own @audioN. */}
-                      {(() => {
-                        const audioCapacity = refAudioCapacity('video', resolveShotModelSettings('video', shot).model);
-                        if (audioCapacity === 0) return null;
-                        const clips = shot.audioRefs || [];
-                        return (
-                          <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                            <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                              Audio refs {clips.length}/{audioCapacity}
-                            </span>
-                            {clips.map((path, audioIndex) => (
-                              <span
-                                key={path}
-                                title={path}
-                                style={{
-                                  display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.7rem',
-                                  padding: '3px 6px', borderRadius: 'var(--radius-sm)',
-                                  border: '1px solid var(--border-light)', background: 'var(--bg-card)'
-                                }}
-                              >
-                                <Music size={10} style={{ color: 'var(--accent)' }} />
-                                <code style={{ color: 'var(--accent)' }}>@audio{audioIndex + 1}</code>
-                                <span style={{ maxWidth: '130px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
-                                  {audioRefLabel(path)}
-                                </span>
-                                <button
-                                  className="btn btn-danger"
-                                  style={{ padding: '1px 3px' }}
-                                  onClick={() => handleRemoveAudioRef(shot.id, path)}
-                                >
-                                  <X size={9} />
-                                </button>
-                              </span>
-                            ))}
-                            {clips.length < audioCapacity && (
-                              <>
-                                <input
-                                  type="url"
-                                  className="input-field"
-                                  style={{ width: '230px', padding: '2px 6px', fontSize: '0.68rem' }}
-                                  placeholder="https://…/vocal.mp3 or asset://…"
-                                  value={audioRefDrafts[shot.id] || ''}
-                                  onChange={(e) => setAudioRefDrafts(prev => ({ ...prev, [shot.id]: e.target.value }))}
-                                  onKeyDown={(e) => { if (e.key === 'Enter') handleAddAudioRef(shot.id); }}
-                                  title="A public mp3 or wav URL the model can fetch, or an asset:// id from the Atlas Asset Library. 15 seconds across all clips."
-                                />
-                                <button
-                                  className="btn btn-secondary"
-                                  style={{ padding: '2px 8px', fontSize: '0.68rem' }}
-                                  onClick={() => handleAddAudioRef(shot.id)}
-                                >
-                                  <Plus size={10} /> Add
-                                </button>
-                                <input
-                                  type="file"
-                                  accept="audio/*"
-                                  multiple
-                                  ref={el => audioRefInputRefs.current[shot.id] = el}
-                                  onChange={(e) => handleAudioRefUpload(shot.id, e)}
-                                  style={{ display: 'none' }}
-                                />
-                                <button
-                                  className="btn btn-secondary"
-                                  style={{ padding: '2px 8px', fontSize: '0.68rem' }}
-                                  disabled={loadingStates[`audioref_${shot.id}`]}
-                                  onClick={() => audioRefInputRefs.current[shot.id]?.click()}
-                                  title="Upload a clip from disk. Works on the Fal Seedance models, which host it for you; the Atlas ones need a URL or an asset:// id."
-                                >
-                                  {loadingStates[`audioref_${shot.id}`] ? <RefreshCw className="spinner" size={10} /> : <Upload size={10} />} File
-                                </button>
-                              </>
-                            )}
-                            {clips.length > 0 && (
-                              <span style={{ fontSize: '0.66rem', color: 'var(--text-dim)' }}>
-                                Point the prompt at them by name, e.g. "she sings @audio1".
-                              </span>
-                            )}
-                          </div>
-                        );
-                      })()}
+                      {/* Reference audio and video, shown only where the shot's
+                          video model takes them. Slots are positional and the
+                          prompt names them, so each clip wears its own @audioN
+                          or @videoN. */}
+                      {['audio', 'video'].map(kind => (
+                        <MediaRefRow
+                          key={kind}
+                          kind={kind}
+                          clips={shot[MEDIA_REF_KINDS[kind].field] || []}
+                          capacity={MEDIA_REF_KINDS[kind].capacity(resolveShotModelSettings('video', shot).model)}
+                          draft={mediaRefDrafts[`${kind}:${shot.id}`] || ''}
+                          onDraftChange={(value) => setMediaRefDrafts(prev => ({ ...prev, [`${kind}:${shot.id}`]: value }))}
+                          onAdd={() => handleAddMediaRef(kind, shot.id)}
+                          onUpload={(e) => handleMediaRefUpload(kind, shot.id, e)}
+                          onRemove={(path) => handleRemoveMediaRef(kind, shot.id, path)}
+                          uploading={Boolean(loadingStates[`${kind}ref_${shot.id}`])}
+                        />
+                      ))}
 
                       {/* Active Previews and Generate Actions Grid */}
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginTop: '12px', marginBottom: '12px' }}>
@@ -7274,72 +7572,24 @@ export default function App() {
                       )}
                     </div>
 
-                    {/* Audio goes with a video request too, and unlike the
-                        images it leaves no trace in the prompt preview — so
-                        without this panel the only way to know it was sent was
-                        to watch the result. Capacity is read off the model
+                    {/* Audio and video go with a video request too, and unlike
+                        the images they leave no trace in the prompt preview — so
+                        without these panels the only way to know a clip was sent
+                        was to watch the result. Capacity is read off the model
                         chosen *here*, not the shot's, because this dropdown is
                         what the request will actually use. */}
                     {generationModal.type === 'video' && (() => {
                       const modalShot = shots.find(s => s.id === generationModal.shotId);
-                      const clips = modalShot?.audioRefs || [];
-                      const capacity = refAudioCapacity('video', genModalModel);
-                      if (clips.length === 0 && capacity === 0) return null;
-                      const overCapacity = clips.length > capacity;
-                      return (
-                        <div style={{ marginTop: '10px', border: `1px solid ${overCapacity ? 'var(--accent)' : 'var(--border-light)'}`, borderRadius: '6px', padding: '10px', background: 'rgba(0,0,0,0.18)' }}>
-                          <div style={{ fontSize: '0.78rem', fontWeight: 'bold', marginBottom: clips.length ? '8px' : 0 }}>
-                            Audio sent with this request
-                            <span style={{ marginLeft: '6px', fontWeight: 'normal', color: 'var(--text-dim)' }}>
-                              {clips.length} of {capacity} slot{capacity === 1 ? '' : 's'}
-                            </span>
-                          </div>
-
-                          {clips.length === 0 ? (
-                            <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
-                              None — this model takes reference audio. Add clips on the shot to sing, speak or cut to them.
-                            </span>
-                          ) : (
-                            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-                              {clips.map((path, audioIndex) => (
-                                <span
-                                  key={path}
-                                  title={path}
-                                  style={{
-                                    display: 'flex', alignItems: 'center', gap: '5px', fontSize: '0.72rem',
-                                    padding: '4px 7px', borderRadius: '4px', background: 'var(--bg-card)',
-                                    border: `2px solid ${audioIndex < capacity ? 'var(--primary)' : 'var(--accent)'}`
-                                  }}
-                                >
-                                  <Music size={11} style={{ color: 'var(--accent)' }} />
-                                  <code style={{ color: 'var(--accent)' }}>@audio{audioIndex + 1}</code>
-                                  <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
-                                    {audioRefLabel(path)}
-                                  </span>
-                                </span>
-                              ))}
-                            </div>
-                          )}
-
-                          {overCapacity && (
-                            <div style={{ fontSize: '0.72rem', color: 'var(--accent)', marginTop: '8px', display: 'flex', alignItems: 'flex-start', gap: '4px' }}>
-                              <AlertTriangle size={11} style={{ marginTop: '2px', flexShrink: 0 }} />
-                              <span>
-                                {capacity === 0
-                                  ? `${modelCapabilities('video', genModalModel).label} takes no reference audio — Atlas will not combine a first frame with reference media, so only the ref2v models can carry it. This will be refused before it is billed: pick a Seedance 2.0 ref2v model above, or remove the clips.`
-                                  : `Only ${capacity} fit. This will be refused before it is billed — remove the extras on the shot.`}
-                              </span>
-                            </div>
-                          )}
-
-                          {clips.length > 0 && !overCapacity && (
-                            <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginTop: '8px' }}>
-                              Name them in the prompt to say what each is for — the model indexes them by position, so
-                              "@audio1" is the only thing that ties a clip to the action.
-                            </div>
-                          )}
-                        </div>
-                      );
+                      const modelLabel = modelCapabilities('video', genModalModel).label;
+                      return ['audio', 'video'].map(kind => (
+                        <SentMediaPanel
+                          key={kind}
+                          kind={kind}
+                          clips={modalShot?.[MEDIA_REF_KINDS[kind].field] || []}
+                          capacity={MEDIA_REF_KINDS[kind].capacity(genModalModel)}
+                          modelLabel={modelLabel}
+                        />
+                      ));
                     })()}
                   </div>
               )}
@@ -7355,9 +7605,14 @@ export default function App() {
                         setGenModalModel('');
                         return;
                       }
-                      setGenModalModel(e.target.value);
-                      if (generationModal.type === 'image') setImageModel(e.target.value);
-                      else setVideoModel(e.target.value);
+                      const nextModel = e.target.value;
+                      setGenModalModel(nextModel);
+                      if (generationModal.type === 'image') setImageModel(nextModel);
+                      else {
+                        setVideoModel(nextModel);
+                        // Keep the length on offer: re-snap to what this model takes.
+                        setGenModalDuration(prev => snapDuration(nextModel, prev));
+                      }
                     }}
                   >
                     <ModelOptions
@@ -7614,7 +7869,12 @@ export default function App() {
                             background: 'rgba(255,255,255,0.02)', display: 'flex', flexDirection: 'column'
                           }}
                         >
-                          <div style={{ position: 'relative', aspectRatio: '16 / 9', background: '#000' }}>
+                          <HoverPreview
+                            path={shot.selectedImage}
+                            kind="image"
+                            label={`${sceneIndex + 1}.${shotIndex + 1} ${shot.name || ''}`.trim()}
+                            style={{ position: 'relative', aspectRatio: '16 / 9', background: '#000' }}
+                          >
                             {shot.selectedImage ? (
                               <AssetImage
                                 path={shot.selectedImage}
@@ -7634,7 +7894,7 @@ export default function App() {
                                 <Film size={10} />
                               </span>
                             )}
-                          </div>
+                          </HoverPreview>
                           <div style={{ padding: '7px 8px' }}>
                             <div style={{ fontSize: '0.76rem', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                               {shot.name || `Shot ${shotIndex + 1}`}
@@ -8259,7 +8519,7 @@ export default function App() {
                         style={{ minHeight: '70px', fontSize: '0.85rem' }}
                         value={assetEditor.imagePrompt || ''}
                         onChange={(e) => setAssetEditor({ ...assetEditor, imagePrompt: e.target.value })}
-                        placeholder={defaultAssetPrompt(assetEditor) || 'Describe the reference image to generate...'}
+                        placeholder={defaultAssetPrompt(assetEditor, promptSettings) || 'Describe the reference image to generate...'}
                       />
                       <span className="input-help" style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>
                         Leave blank to use the auto-built {assetEditor.type} reference prompt shown as placeholder.
@@ -8327,7 +8587,10 @@ export default function App() {
                       ) : (
                         <>
                           <span>
-                            Sending <strong>{picked.length}</strong> of up to <strong>{capacity}</strong> reference image{capacity === 1 ? '' : 's'}.
+                            Sending <strong>{preview.inputImagePaths.length}</strong> of up to <strong>{capacity}</strong> reference image{capacity === 1 ? '' : 's'}
+                            {preview.imageSources.some(entry => entry.origin !== 'primary')
+                              ? <> — <strong>{Math.min(picked.length, capacity)}</strong> ticked here, <strong>{preview.imageSources.filter(entry => entry.origin !== 'primary').length}</strong> from tagged assets.</>
+                              : '.'}
                           </span>
                           {picked.length > capacity && (
                             <span style={{ color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '4px' }}>
@@ -8380,6 +8643,44 @@ export default function App() {
                       {preview.missingTags.length > 0 && (
                         <div style={{ fontSize: '0.72rem', color: 'var(--accent)', marginTop: '5px', display: 'flex', alignItems: 'center', gap: '4px' }}>
                           <AlertTriangle size={11} /> Undefined tag(s): &lt;{preview.missingTags.join('&gt;, &lt;')}&gt;
+                        </div>
+                      )}
+
+                      {/* Exactly which images go with the generation, in send
+                          order: the ticks above and whatever a <Tag> in the
+                          prompt drags in. A bare count left the second kind
+                          invisible — a style tagged into a prop's description
+                          attached its image and nothing in the editor said so. */}
+                      {preview.capacity > 0 && preview.imageSources.length > 0 && (
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
+                          {preview.imageSources.map((entry, index) => (
+                            <div
+                              key={entry.path}
+                              title={`${entry.origin === 'primary' ? 'Ticked above' : `From ${entry.label}`}${entry.token ? ` — the prompt calls it ${entry.token}` : ''}`}
+                              style={{ width: '86px', textAlign: 'center' }}
+                            >
+                              <div style={{ position: 'relative', height: '58px', borderRadius: '4px', overflow: 'hidden', border: `2px solid ${entry.origin === 'primary' ? 'var(--primary)' : 'var(--warning, #f59e0b)'}`, background: '#000' }}>
+                                <AssetImage path={entry.path} alt={entry.label} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                                <span style={{ position: 'absolute', top: '2px', left: '2px', fontSize: '0.6rem', fontWeight: 'bold', background: entry.token ? 'var(--primary)' : 'rgba(0,0,0,0.75)', color: '#fff', borderRadius: '3px', padding: '0 4px' }}>
+                                  {entry.token || index + 1}
+                                </span>
+                              </div>
+                              <div style={{ fontSize: '0.62rem', color: 'var(--text-dim)', marginTop: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {entry.origin === 'primary' ? 'ticked' : entry.label}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {preview.droppedImageSources.length > 0 && (
+                        <div style={{ fontSize: '0.72rem', color: 'var(--accent)', marginTop: '5px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <AlertTriangle size={11} />
+                          {preview.droppedImageSources.length} more did not fit this model's {preview.capacity} slot{preview.capacity === 1 ? '' : 's'}: {preview.droppedImageSources.map(entry => entry.label).join(', ')}
+                        </div>
+                      )}
+                      {preview.taggedAssets.filter(tagged => !assetPrimaryImage(tagged)).length > 0 && (
+                        <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', marginTop: '5px' }}>
+                          {preview.taggedAssets.filter(tagged => !assetPrimaryImage(tagged)).map(tagged => `<${tagged.tag}>`).join(', ')} {preview.taggedAssets.filter(tagged => !assetPrimaryImage(tagged)).length === 1 ? 'has' : 'have'} no reference image yet, so only the description travels.
                         </div>
                       )}
                     </div>
@@ -8800,7 +9101,7 @@ export default function App() {
           onChange={setDreamSettings}
           scenes={scenes}
           assetLibrary={assetLibrary}
-          defaults={{ imageModel, imageResolution, videoModel, videoResolution, videoDuration }}
+          defaults={{ imageModel, imageResolution, videoModel, videoResolution, videoDuration, attachTagsForVideos }}
           run={dreamRun}
           onRun={handleRunDream}
           onStop={handleStopDream}

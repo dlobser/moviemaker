@@ -21,7 +21,9 @@ import {
   refImageCapacity,
   refTagSample,
   refTagTokens,
-  sizeOptions
+  refVideoCapacity,
+  sizeOptions,
+  snapDuration
 } from './catalog.js';
 
 test('a plain path declares no host', () => {
@@ -236,4 +238,69 @@ test('Venice video lengths and shapes come from the model, not the studio defaul
   assert.equal(shapes.includes('21:9'), false);
   assert.equal(shapes.includes('16:9'), true);
   assert.equal(sizeOptions('image', 'venice:qwen-image-3-pro').map(o => o.value).includes('21:9'), true);
+});
+
+// --- reference video ---------------------------------------------------------
+//
+// The third kind of reference, with the same default as audio: none unless the
+// host documents it. Seedance 2.0's ref2v endpoints take three alongside their
+// images and audio; Wan 2.6's takes three and nothing else.
+
+test('only the reference-to-video endpoints report reference video', () => {
+  assert.equal(refVideoCapacity('video', 'fal:bytedance/seedance-2.0/reference-to-video'), 3);
+  assert.equal(refVideoCapacity('video', 'fal:bytedance/seedance-2.0/fast/reference-to-video'), 3);
+  assert.equal(refVideoCapacity('video', 'atlas:bytedance/seedance-2.0/reference-to-video'), 3);
+  assert.equal(refVideoCapacity('video', 'atlas:bytedance/seedance-2.0-fast/reference-to-video'), 3);
+  assert.equal(refVideoCapacity('video', 'atlas:bytedance/seedance-2.0/image-to-video'), 0);
+  assert.equal(refVideoCapacity('video', 'fal-ai/kling-video'), 0);
+  assert.equal(refVideoCapacity('video', 'venice:wan-2-7-image-to-video'), 0);
+  assert.equal(refVideoCapacity('video', 'atlas:something/brand/new'), 0);
+  assert.equal(modelCapabilities('video', 'fal-ai/kling-video').refVideoMode, 'none');
+  assert.equal(modelCapabilities('video', 'fal:bytedance/seedance-2.0/reference-to-video').refVideoMode, 'optional');
+});
+
+test('Wan 2.6 ref2v is video-only: three clips required, no images, 5 or 10 seconds', () => {
+  const caps = modelCapabilities('video', 'fal:wan/v2.6/reference-to-video');
+  assert.equal(caps.known, true);
+  assert.equal(caps.maxRefVideo, 3);
+  assert.equal(caps.refVideoMode, 'required');
+  assert.equal(caps.maxRefImages, 0);
+  assert.equal(caps.refMode, 'none');
+  assert.deepEqual(caps.durations, ['5', '10']);
+  assert.equal(parseModelId('fal:wan/v2.6/reference-to-video').family, 'fal-ai');
+});
+
+// --- shot length -------------------------------------------------------------
+//
+// A shot's length is the director's number and no model offers every integer.
+// The request asks for the closest length the model does offer, rounding up: a
+// clip that runs long can be trimmed on the timeline, one that runs short
+// cannot be stretched.
+
+test('a shot length rounds up to the closest length the model offers', () => {
+  assert.equal(snapDuration('fal-ai/veo3.1', '7'), '8');
+  assert.equal(snapDuration('fal-ai/veo3.1', 5), '5');
+  assert.equal(snapDuration('atlas:bytedance/seedance-2.0/reference-to-video', '7'), '8');
+  assert.equal(snapDuration('atlas:bytedance/seedance-2.0/reference-to-video', '11'), '12');
+  assert.equal(snapDuration('fal-ai/kling-video', '7'), '10');
+  assert.equal(snapDuration('fal:wan/v2.6/reference-to-video', '3'), '5');
+  // Exactly on an offered length is left alone.
+  assert.equal(snapDuration('venice:wan-3-0-image-to-video', '15'), '15');
+});
+
+test('past the longest length the model offers, the longest is asked for', () => {
+  assert.equal(snapDuration('fal-ai/veo3.1', '30'), '8');
+  assert.equal(snapDuration('venice:wan-3-0-image-to-video', '45'), '30');
+});
+
+test('an unknown model is asked for the shot length as written', () => {
+  // There is no list to snap to; the provider says whether it takes it.
+  assert.equal(snapDuration('atlas:brand/new/thing', '7'), '7');
+});
+
+test('a missing or nonsense length falls back to five seconds', () => {
+  assert.equal(snapDuration('fal-ai/veo3.1', undefined), '5');
+  assert.equal(snapDuration('fal-ai/veo3.1', 'soon'), '5');
+  assert.equal(snapDuration('fal-ai/veo3.1', '0'), '5');
+  assert.equal(snapDuration('atlas:brand/new/thing', ''), '5');
 });

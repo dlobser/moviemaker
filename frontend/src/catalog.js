@@ -22,6 +22,12 @@
 //             'optional' when refImages > 0 and 'none' when it is 0.
 // refKinds  - which reference-board kinds are worth sending to this model
 //             (e.g. a character-identity model only reads faces). Unset = all.
+// refAudio  - how many reference audio clips the model takes (0 = none).
+// refVideo  - how many reference video clips the model takes (0 = none). The
+//             same positional idea as images and audio: the prompt points at
+//             them as @video1..@videoN.
+// refVideoMode - 'required' when the model cannot run without a reference
+//             video (Wan's reference-to-video endpoints take nothing else).
 // promptLimit - documented character ceiling on the prompt. Only *verified*
 //             numbers belong here (DALL-E 3: 4000, per OpenAI's API docs).
 //             Never guess one — the studio warns on overflow, it never trims.
@@ -170,8 +176,19 @@ export const VIDEO_MODELS = [
   // 404s on the remainder after the generation has already been paid for. But
   // a bare `bytedance/…` is exactly what the prefix heuristic routes to
   // Higgsfield. Only the explicit host gets both right.
-  { id: 'fal:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Fal) — up to 9 refs + audio', provider: 'fal-ai', priceNote: 'per Fal rates', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'fal:bytedance/seedance-2.0/fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Fal) — up to 9 refs + audio', provider: 'fal-ai', priceNote: 'per Fal rates', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  // `refVideo` is the third kind of reference these endpoints take: up to three
+  // clips, 2–15 seconds combined, sent as `video_urls` and addressed from the
+  // prompt as @video1..@video3. Fal hosts a local file the same way it hosts
+  // audio, so a clip from disk works here where Atlas needs a URL.
+  { id: 'fal:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Fal) — up to 9 refs + audio + video', provider: 'fal-ai', priceNote: 'per Fal rates', refImages: 9, refAudio: 3, refVideo: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'fal:bytedance/seedance-2.0/fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Fal) — up to 9 refs + audio + video', provider: 'fal-ai', priceNote: 'per Fal rates', refImages: 9, refAudio: 3, refVideo: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  // Wan 2.6's reference endpoint takes *only* videos — one to three clips of
+  // the subjects, 2–30s each, addressed as @Video1..@Video3 — and no images at
+  // all, which is why refImages is zero and the video is marked required. Id
+  // from fal.ai/models/wan/v2.6/reference-to-video; the `fal:` host is needed
+  // for the same reason as Seedance's, a bare `wan/…` would route nowhere.
+  // Untested here: listed from the schema page, not from a run.
+  { id: 'fal:wan/v2.6/reference-to-video', label: 'Wan 2.6 ref2v (Fal) — 1-3 reference videos, no images, untested', provider: 'fal-ai', priceNote: 'per Fal rates', refImages: 0, refVideo: 3, refVideoMode: 'required', promptLimit: 1500, durations: ['5', '10'] },
 
   // --- Direct provider APIs ---
   { id: 'runway', label: 'RunwayML Gen-3', provider: 'runway', priceNote: 'per Runway credit rates', refImages: 1 },
@@ -214,8 +231,12 @@ export const VIDEO_MODELS = [
   // combination locally instead of letting Atlas fail it a second later.
   { id: 'atlas:bytedance/seedance-2.0/image-to-video', label: 'Seedance 2.0 i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.112 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0-fast/image-to-video', label: 'Seedance 2.0 Fast i2v (Atlas) — 1 first frame', provider: 'atlas', priceNote: '$0.09 / s', refImages: 1, refMode: 'required', refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
-  { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refAudio: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  //
+  // `refVideo` is the same again for clips: Atlas documents `reference_videos`
+  // at 1–3 (mp4/mov, 15s total) on the ref2v endpoints, for editing, extension
+  // or motion reference. Like audio, a video has to be a URL Atlas can fetch.
+  { id: 'atlas:bytedance/seedance-2.0/reference-to-video', label: 'Seedance 2.0 ref2v (Atlas) — up to 9 references + audio + video', provider: 'atlas', priceNote: '$0.112 / s', refImages: 9, refAudio: 3, refVideo: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
+  { id: 'atlas:bytedance/seedance-2.0-fast/reference-to-video', label: 'Seedance 2.0 Fast ref2v (Atlas) — up to 9 references + audio + video', provider: 'atlas', priceNote: '$0.09 / s', refImages: 9, refAudio: 3, refVideo: 3, refTagStyle: 'seedance', durations: ['4', '5', '6', '8', '10', '12', '15'] },
   { id: 'atlas:bytedance/seedance-2.0/text-to-video', label: 'Seedance 2.0 t2v (Atlas)', provider: 'atlas', priceNote: '$0.112 / s', refImages: 0, durations: ['4', '5', '6', '8', '10', '12', '15'] },
   // Seedance 1.5 Pro's plain image-to-video, id taken verbatim from the cURL
   // sample on its atlascloud.ai model page. It is also the control for the
@@ -468,15 +489,21 @@ export function modelCapabilities(type, id) {
   const maxRefAudio = model
     ? (model.refAudio || 0)
     : (Number.isFinite(override?.refAudio) ? override.refAudio : 0);
+  // Video references follow the same rule as audio: none unless documented.
+  const maxRefVideo = model
+    ? (model.refVideo || 0)
+    : (Number.isFinite(override?.refVideo) ? override.refVideo : 0);
   return {
     id,
     label: model?.label || id,
     known: Boolean(model),
     maxRefImages,
     maxRefAudio,
+    maxRefVideo,
     refTagStyle: model?.refTagStyle || null,
     promptLimit: model?.promptLimit ?? null,
     refMode: model?.refMode ?? (maxRefImages > 0 ? 'optional' : 'none'),
+    refVideoMode: model?.refVideoMode ?? (maxRefVideo > 0 ? 'optional' : 'none'),
     refKinds: model?.refKinds ?? null,
     durations: type === 'video' ? (model?.durations || DEFAULT_VIDEO_DURATIONS) : null,
     sizes: model?.sizes || (type === 'image' ? IMAGE_ASPECT_RATIOS : VIDEO_RESOLUTIONS)
@@ -491,6 +518,11 @@ export function refImageCapacity(type, id) {
 /** How many reference audio clips this model will accept — 0 for most. */
 export function refAudioCapacity(type, id) {
   return modelCapabilities(type, id).maxRefAudio;
+}
+
+/** How many reference video clips this model will accept — 0 for most. */
+export function refVideoCapacity(type, id) {
+  return modelCapabilities(type, id).maxRefVideo;
 }
 
 // --- REFERENCE TAGGING -----------------------------------------------------
@@ -637,6 +669,39 @@ export function durationOptions(id, selected) {
   const options = (durations || DEFAULT_VIDEO_DURATIONS)
     .map(value => ({ value: String(value), label: `${value} seconds` }));
   return withSelected(options, selected);
+}
+
+/**
+ * The length this model should actually be asked for, given the length the
+ * shot wants.
+ *
+ * A shot's length is the director's number — seven seconds because that is
+ * how long the beat takes — and no model offers every integer. The rule is
+ * "the closest the model offers, rounding up": 7 becomes 8 on Seedance and
+ * Veo, 10 on Kling and Wan. Up rather than nearest because a clip that runs a
+ * second long can be trimmed on the timeline and a clip that runs short cannot
+ * be stretched. Past the model's longest option the longest is all there is.
+ *
+ * A model the catalog does not know has no list to snap to, so the request
+ * carries the shot's own number and the provider says whether it takes it —
+ * the same thing a custom path has always done.
+ *
+ * Returns a string, because that is how durations are stored everywhere else.
+ */
+export function snapDuration(id, requested) {
+  const wanted = Number(requested);
+  const caps = modelCapabilities('video', id);
+  if (!Number.isFinite(wanted) || wanted <= 0) {
+    return caps.known ? snapDuration(id, 5) : '5';
+  }
+  if (!caps.known) return String(requested);
+  const offered = (caps.durations || DEFAULT_VIDEO_DURATIONS)
+    .map(Number)
+    .filter(value => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  if (offered.length === 0) return String(requested);
+  const roundedUp = offered.find(value => value >= wanted);
+  return String(roundedUp ?? offered[offered.length - 1]);
 }
 
 /** The aspect (image) or resolution (video) options for a model. */

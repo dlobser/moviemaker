@@ -58,9 +58,10 @@ export async function callAtlasModel(endpoint, candidates, ctx) {
   // that names neither the clip nor the reason, and a stale server sending the
   // previous build's data: URL looks identical from here — so the value goes in
   // the error, truncated, rather than being guessed at from the outside.
-  const audioValues = [bodies[acceptedIndex].reference_audio].flat().filter(Boolean);
+  const audioValues = [bodies[acceptedIndex].reference_audio, bodies[acceptedIndex].reference_videos]
+    .flat().filter(Boolean);
   const audioSummary = audioValues.length
-    ? `; audio ${audioValues.map(value => `"${String(value).slice(0, 72)}${String(value).length > 72 ? '…' : ''}"`).join(', ')}`
+    ? `; reference media ${audioValues.map(value => `"${String(value).slice(0, 72)}${String(value).length > 72 ? '…' : ''}"`).join(', ')}`
     : '';
 
   for (let attempt = 0; attempt < 150; attempt++) {
@@ -177,7 +178,7 @@ export function buildAtlasImageBodies(modelPath, { prompt, resolution, imageData
   ];
 }
 
-export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration, imageDataUrls = [], audioAssetRefs = [] }) {
+export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration, imageDataUrls = [], audioAssetRefs = [], videoAssetRefs = [] }) {
   const aspect = resolution === '720x1280' ? '9:16' : '16:9';
   const core = { model: modelPath, prompt, duration: Number(duration) || 5 };
 
@@ -209,7 +210,7 @@ export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration,
     candidates.push(core);                                                  // last resort: the common fields
   }
 
-  if (audioAssetRefs.length === 0) return candidates;
+  if (audioAssetRefs.length === 0 && videoAssetRefs.length === 0) return candidates;
 
   // One shape, not a ladder. Reshaping until something is accepted works for
   // the aspect fields, where a wrong guess is rejected outright — but Atlas
@@ -218,10 +219,16 @@ export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration,
   // and then dies, so audio gets the shape the evidence supports and nothing
   // else. Every candidate still carries it: a body that quietly dropped the
   // audio would produce a silent video at full price.
-  return candidates.map(body => ({ ...body, reference_audio: audioAssetRefs }));
+  //
+  // Video goes the same way, as `reference_videos` — the field Atlas documents
+  // on the ref2v endpoints at 1–3 clips, 15 seconds total.
+  const media = {};
+  if (audioAssetRefs.length > 0) media.reference_audio = audioAssetRefs;
+  if (videoAssetRefs.length > 0) media.reference_videos = videoAssetRefs;
+  return candidates.map(body => ({ ...body, ...media }));
 }
 
-// --- audio references ------------------------------------------------------
+// --- audio and video references --------------------------------------------
 //
 // Images and audio look symmetrical and are not. Handed an inline data: URL,
 // Atlas ingests the image into its own library and rewrites the field to
@@ -231,19 +238,26 @@ export function buildAtlasVideoBodies(modelPath, { prompt, resolution, duration,
 //
 // So audio is the one input the studio cannot carry for you. It has to live at
 // an address the model host can reach, which is why the shot takes a URL
-// rather than a file.
+// rather than a file. Reference video is documented the same way (URLs or
+// asset references, never inline), so it gets the same check.
 
-/** Check an audio reference is something ByteDance can actually fetch. */
-export async function resolveAudioReference(audioRef, ctx) {
+const MEDIA_REFERENCE_KINDS = {
+  audio: { noun: 'Audio', accepts: /^(audio|application\/octet-stream)/i },
+  video: { noun: 'Video', accepts: /^(video|application\/octet-stream)/i }
+};
+
+/** Check an audio or video reference is something ByteDance can actually fetch. */
+export async function resolveMediaReference(mediaRef, ctx, kind = 'audio') {
+  const words = MEDIA_REFERENCE_KINDS[kind] || MEDIA_REFERENCE_KINDS.audio;
   // A clip already in Atlas's own Asset Library, uploaded through their
   // dashboard. Nothing to verify and nothing that could be verified — the id
   // only resolves inside Atlas — but it is the sturdiest form of all, because
   // the file then sits on storage the model host is known to reach.
-  if (/^asset:\/\//i.test(audioRef)) return audioRef;
+  if (/^asset:\/\//i.test(mediaRef)) return mediaRef;
 
-  if (!/^https?:\/\//i.test(audioRef)) {
+  if (!/^https?:\/\//i.test(mediaRef)) {
     throw new Error(
-      `Audio reference "${audioRef}" is not a URL. Unlike images, audio is not uploaded with the ` +
+      `${words.noun} reference "${mediaRef}" is not a URL. Unlike images, ${kind} is not uploaded with the ` +
       `request — the model fetches it itself — so the clip has to be hosted somewhere public and ` +
       `added to the shot as an https:// link, or uploaded to the Atlas Asset Library and added ` +
       `here as its asset:// id.`
@@ -252,22 +266,28 @@ export async function resolveAudioReference(audioRef, ctx) {
 
   // One cheap read before anything is billed. ByteDance's own complaint for a
   // dead or wrong link is "invalid url", which says nothing about which of the
-  // three clips was wrong or why.
-  const res = await ctx.fetch(audioRef, {}, 'the audio host');
+  // three clips was wrong or why. Only the headers are read; the body is let go.
+  const res = await ctx.fetch(mediaRef, {}, `the ${kind} host`);
   if (!res.ok) {
     throw new Error(
-      `Could not read the audio reference (${res.status}): ${audioRef} — it has to be reachable ` +
+      `Could not read the ${kind} reference (${res.status}): ${mediaRef} — it has to be reachable ` +
       `without a login. On GitHub that means the raw.githubusercontent.com address, not /blob/.`
     );
   }
   const contentType = res.headers?.get?.('content-type') || '';
-  if (contentType && !/^(audio|application\/octet-stream)/i.test(contentType)) {
+  try { await res.body?.cancel?.(); } catch { /* the check was the headers */ }
+  if (contentType && !words.accepts.test(contentType)) {
     throw new Error(
-      `${audioRef} served "${contentType}" rather than audio. If that is a GitHub link, ` +
+      `${mediaRef} served "${contentType}" rather than ${kind}. If that is a GitHub link, ` +
       `use the raw.githubusercontent.com address instead of the /blob/ page.`
     );
   }
-  return audioRef;
+  return mediaRef;
+}
+
+/** The audio half of resolveMediaReference, kept under its original name. */
+export function resolveAudioReference(audioRef, ctx) {
+  return resolveMediaReference(audioRef, ctx, 'audio');
 }
 
 // --- generation ------------------------------------------------------------
@@ -282,17 +302,22 @@ export async function generateImage({ modelPath, prompt, resolution, inputImageP
   return ctx.saveRemote(url, 'img', '.png');
 }
 
-export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths = [] }, ctx) {
+export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths = [], inputVideoPaths = [] }, ctx) {
   // Atlas takes frames inline, so unlike Fal there is no upload step.
   const imageDataUrls = await Promise.all(inputImagePaths.map(ctx.readAssetDataUrl));
-  // Audio does not: it is forwarded to ByteDance as a URL to fetch, so all
-  // that happens here is checking each link is real before anything is billed.
+  // Audio and video do not: they are forwarded to ByteDance as URLs to fetch,
+  // so all that happens here is checking each link is real before anything is
+  // billed.
   const audioUrls = [];
   for (const audioRef of inputAudioPaths) {
-    audioUrls.push(await resolveAudioReference(audioRef, ctx));
+    audioUrls.push(await resolveMediaReference(audioRef, ctx, 'audio'));
+  }
+  const videoUrls = [];
+  for (const videoRef of inputVideoPaths) {
+    videoUrls.push(await resolveMediaReference(videoRef, ctx, 'video'));
   }
   const bodies = buildAtlasVideoBodies(modelPath, {
-    prompt, resolution, duration, imageDataUrls, audioAssetRefs: audioUrls
+    prompt, resolution, duration, imageDataUrls, audioAssetRefs: audioUrls, videoAssetRefs: videoUrls
   });
   const url = await callAtlasModel('generateVideo', bodies, ctx);
   return ctx.saveRemote(url, 'vid', '.mp4');

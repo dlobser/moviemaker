@@ -190,6 +190,7 @@ function shotPaths(shot) {
   });
   SHOT_MEDIA_FIELDS.forEach(field => add(shot[field]));
   (shot.audioRefs || []).forEach(add);
+  (shot.videoRefs || []).forEach(add);
   return found;
 }
 

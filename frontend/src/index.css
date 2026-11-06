@@ -312,8 +312,8 @@ body.light-theme .shot-number {
 }
 
 .mini-preview {
-  width: 50px;
-  height: 30px;
+  width: 96px;
+  height: 54px;
   border-radius: 4px;
   border: 1px solid var(--border-light);
   overflow: hidden;
@@ -329,6 +329,39 @@ body.light-theme .shot-number {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* The floating preview a thumbnail opens on hover (HoverPreview.jsx). Fixed
+   so it floats over the row list and modals alike; pointer-events none so it
+   never captures the hover that opened it. */
+.hover-preview {
+  position: fixed;
+  z-index: 1200;
+  pointer-events: none;
+  background: #000;
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.hover-preview img,
+.hover-preview video {
+  display: block;
+  width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+  background: #000;
+}
+
+.hover-preview-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  background: var(--bg-panel);
+  padding: 4px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Preview Slots in Expanded Row */
@@ -1494,4 +1527,17 @@ body.light-theme .effective-prompt { background: rgba(15, 23, 42, 0.05); }
   resize: vertical;
   outline: none;
   min-height: 90px;
+}
+
+/* The shot-length field is a number input so the arrow keys and the wheel
+   still step it, but the browser's own spinner buttons clash with the dark
+   chrome and are hidden. */
+.shot-length-input::-webkit-inner-spin-button,
+.shot-length-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.shot-length-input {
+  -moz-appearance: textfield;
+  appearance: textfield;
 }

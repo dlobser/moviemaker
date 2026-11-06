@@ -150,12 +150,22 @@ export function resolveFalVideoModel(modelPath, hasImage) {
 
 /**
  * Seedance 2.0's reference endpoints take arrays — `image_urls` for up to nine
- * stills and `audio_urls` for up to three clips — where every other video model
- * here takes a single `image_url` first frame. The prompt addresses both by
- * position, as @image1 and @audio1.
+ * stills, `audio_urls` for up to three clips and `video_urls` for up to three
+ * more — where every other video model here takes a single `image_url` first
+ * frame. The prompt addresses all three by position, as @image1, @audio1 and
+ * @video1. Wan 2.6's reference endpoint is the same shape with only the
+ * `video_urls` half.
  */
 export function isFalReferenceEndpoint(modelId) {
   return /reference-to-video/.test(String(modelId));
+}
+
+/**
+ * Wan's reference endpoint generates *from* its clips and takes no images at
+ * all, so a request without a video has nothing to make a video of.
+ */
+export function isFalVideoOnlyReference(modelId) {
+  return /^wan\/.*reference-to-video/.test(String(modelId));
 }
 
 export function buildFalVideoRequest(modelPath, { prompt, resolution, duration, hasImage }) {
@@ -195,34 +205,47 @@ export async function generateImage({ modelPath, prompt, resolution, inputImageP
 }
 
 /**
- * An audio reference as a URL Fal can hand the model.
+ * An audio or video reference as a URL Fal can hand the model.
  *
  * A file in the project is uploaded to Fal storage, which is the whole reason
- * audio works here and not on Atlas: the model is given a fal.media address
- * rather than whatever host you happened to have.
+ * a clip from disk works here and not on Atlas: the model is given a fal.media
+ * address rather than whatever host you happened to have.
  */
-async function falAudioUrl(audioRef, ctx) {
-  if (/^asset:\/\//i.test(audioRef)) {
+async function falMediaUrl(mediaRef, ctx) {
+  if (/^asset:\/\//i.test(mediaRef)) {
     throw new Error(
-      `"${audioRef}" is an Atlas Asset Library id and means nothing to Fal. Add the clip as a file ` +
+      `"${mediaRef}" is an Atlas Asset Library id and means nothing to Fal. Add the clip as a file ` +
       `or an https:// URL, or point this shot at one of the Atlas Seedance models.`
     );
   }
-  if (/^https?:\/\//i.test(audioRef)) return audioRef;
-  return ctx.uploadPublicUrl(audioRef);
+  if (/^https?:\/\//i.test(mediaRef)) return mediaRef;
+  return ctx.uploadPublicUrl(mediaRef);
 }
 
-export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths = [] }, ctx) {
+export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths = [], inputVideoPaths = [] }, ctx) {
   const hasImage = inputImagePaths.length > 0;
   const { modelId, input } = buildFalVideoRequest(modelPath, { prompt, resolution, duration, hasImage });
 
   if (isFalReferenceEndpoint(modelId)) {
+    // Refused here, for free, rather than by Fal after the request went out.
+    if (isFalVideoOnlyReference(modelId) && inputVideoPaths.length === 0) {
+      throw new Error(
+        `${modelId} generates from reference videos and this shot has none. Add one to three ` +
+        `clips of the subject to the shot's video refs first.`
+      );
+    }
     // Every reference goes, in slot order: the prompt points at them by
     // position, so sending a subset silently re-aims every pointer past the gap.
-    input.image_urls = await Promise.all(inputImagePaths.map(path => ctx.uploadPublicUrl(path)));
+    // Only fields with something in them are sent — Wan's endpoint has no
+    // `image_urls` to receive an empty list.
+    if (hasImage) input.image_urls = await Promise.all(inputImagePaths.map(path => ctx.uploadPublicUrl(path)));
     if (inputAudioPaths.length > 0) {
       input.audio_urls = [];
-      for (const audioRef of inputAudioPaths) input.audio_urls.push(await falAudioUrl(audioRef, ctx));
+      for (const audioRef of inputAudioPaths) input.audio_urls.push(await falMediaUrl(audioRef, ctx));
+    }
+    if (inputVideoPaths.length > 0) {
+      input.video_urls = [];
+      for (const videoRef of inputVideoPaths) input.video_urls.push(await falMediaUrl(videoRef, ctx));
     }
   } else if (hasImage) {
     input.image_url = await ctx.uploadPublicUrl(inputImagePaths[0]);

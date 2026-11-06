@@ -64,6 +64,16 @@ test('legacy per-shot referenceImages surface as edges-to-be, not as the dead fi
   ]);
 });
 
+test('audio and video references survive a round trip through the importer', () => {
+  const result = normalizeImportedShotList({
+    scenes: [{ name: 'Act 1', shots: [{ name: '1.1', audioRefs: ['https://x/a.mp3'], videoRefs: ['assets/move.mp4', '', 'asset://v1'] }] }]
+  });
+  assert.deepEqual(result.scenes[0].shots[0].audioRefs, ['https://x/a.mp3']);
+  assert.deepEqual(result.scenes[0].shots[0].videoRefs, ['assets/move.mp4', 'asset://v1']);
+  const bare = normalizeImportedShotList({ scenes: [{ shots: [{ name: 'x' }] }] });
+  assert.deepEqual(bare.scenes[0].shots[0].videoRefs, []);
+});
+
 test('the extractor feeds the normaliser unchanged', () => {
   const pasted = '```json\n' + JSON.stringify({
     project: { prePrompt: 'cinematic film still,' },

@@ -31,6 +31,7 @@ import * as kling from './kling.js';
 
 export { resolveRouting, routesToHiggsfield, routesToFal, isHiggsfieldModel } from './routing.js';
 export { runLipSync } from './fal.js';
+export { GEMINI_TEXT_DEFAULT, GEMINI_FALLBACK_MODELS, resolveGeminiTextModel } from './google.js';
 
 /** Returns the project-relative path of the generated image. */
 export async function generateImage({ provider, providerFamily, prompt, resolution, inputImagePaths = [], safetyChecker }, ctx) {
@@ -59,13 +60,16 @@ export async function generateImage({ provider, providerFamily, prompt, resoluti
  * `imageUrls` keeps its historical name (it carries project-relative asset
  * paths, not URLs) because it is part of the /api/video/generate shape.
  * `audioUrls` is the same idea for reference audio, which only Seedance 2.0
- * currently accepts.
+ * currently accepts, and `videoUrls` for reference video — clips the model
+ * borrows motion, a camera move or a subject from — which the
+ * reference-to-video endpoints take.
  */
-export async function generateVideo({ provider, providerFamily, videoModel, prompt, imageUrls = [], audioUrls = [], resolution, duration }, ctx) {
+export async function generateVideo({ provider, providerFamily, videoModel, prompt, imageUrls = [], audioUrls = [], videoUrls = [], resolution, duration }, ctx) {
   const { family, path: modelPath } = resolveRouting(provider, providerFamily);
   const inputImagePaths = (imageUrls || []).filter(Boolean);
   const inputAudioPaths = (audioUrls || []).filter(Boolean);
-  const req = { modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths };
+  const inputVideoPaths = (videoUrls || []).filter(Boolean);
+  const req = { modelPath, prompt, resolution, duration, inputImagePaths, inputAudioPaths, inputVideoPaths };
 
   if (family === 'atlas') return atlas.generateVideo(req, ctx);
   // Everywhere else, audio references would be dropped without a word. Say so
@@ -77,6 +81,19 @@ export async function generateVideo({ provider, providerFamily, videoModel, prom
       `${modelPath} does not take reference audio — only the Seedance 2.0 reference-to-video ` +
       `models do, on Atlas or Fal. Remove the audio reference from this shot, or switch the ` +
       `shot's video model.`
+    );
+  }
+  // Reference video has the same rule and one more home: Venice's
+  // reference-to-video endpoints document a `reference_video_urls` array.
+  if (
+    inputVideoPaths.length > 0
+    && !fal.isFalReferenceEndpoint(modelPath)
+    && !(family === 'venice' && venice.isVeniceReferenceVideo(modelPath))
+  ) {
+    throw new Error(
+      `${modelPath} does not take reference video — only the reference-to-video endpoints do ` +
+      `(Seedance 2.0 on Atlas or Fal, Wan 2.6 on Fal). Remove the video reference from this shot, ` +
+      `or switch the shot's video model.`
     );
   }
   if (family === 'venice') return venice.generateVideo(req, ctx);

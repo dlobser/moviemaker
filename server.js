@@ -971,12 +971,9 @@ app.get('/api/llm/models', async (req, res) => {
         }
       }
       if (models.length === 0) {
-        models = [
-          { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (Recommended)' },
-          { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
-          { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash' },
-          { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro' }
-        ];
+        // The same fallback the static build shows — one list, kept with the
+        // Gemini adapter, so a retired id cannot linger in a second copy.
+        models = (await getProviders()).GEMINI_FALLBACK_MODELS;
       }
 
     } else if (provider === 'chatgpt') {

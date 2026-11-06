@@ -90,6 +90,9 @@ export default function DreamDialog({
   const videoModelId = resolveModel(settings.videoModel, defaults.videoModel);
   const imageModelId = resolveModel(settings.imageModel, defaults.imageModel);
   const videoModel = getVideoModel(videoModelId);
+  // null follows the project's video switch; true/false is the dream's own call.
+  const followsProjectTags = settings.attachTaggedImages === null || settings.attachTaggedImages === undefined;
+  const attachTags = followsProjectTags ? Boolean(defaults.attachTagsForVideos) : Boolean(settings.attachTaggedImages);
 
   // What the run will actually pay for: every clip needs a video, and the first
   // one needs a still too unless the starting shot already has one.
@@ -285,6 +288,28 @@ export default function DreamDialog({
                   .map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
               </select>
             </div>
+            {/* Whether every <Tag> in a clip prompt sends its reference images
+                after the frame. The project switch ships off, which is right
+                for a plain image-to-video model and wrong for a dream on a
+                reference model: the LLM names <Moth>, and without the pictures
+                the moth is drawn from prose. */}
+            <label style={{ flex: '1 1 100%', display: 'flex', alignItems: 'flex-start', gap: '8px', fontSize: '0.82rem', cursor: running ? 'default' : 'pointer' }}>
+              <input
+                type="checkbox"
+                disabled={running}
+                checked={attachTags}
+                onChange={(e) => set({ attachTaggedImages: e.target.checked })}
+                style={{ marginTop: '3px' }}
+              />
+              <span>
+                Attach tagged images to each clip
+                <span style={{ color: 'var(--text-dim)' }}>
+                  {' '}— the frame goes first, then the reference images of every &lt;Tag&gt; in the clip prompt, up to
+                  what the model takes. A first-frame-only model gets the frame alone.
+                  {followsProjectTags ? ' Following the project setting.' : ''}
+                </span>
+              </span>
+            </label>
           </div>
 
           <button

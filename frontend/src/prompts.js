@@ -53,7 +53,8 @@ export const DEFAULT_ASSET_WRITER_USER = `Subject type: {type}
 Name: {name}
 Existing description: {description}
 {context}
-{styleHint}`;
+{styleHint}
+{tags}`;
 
 // Reference art wants the opposite of a cinematic frame: neutral pose, plain
 // background, even light — anything the model can lift the subject cleanly out of.
@@ -225,9 +226,9 @@ export const PROMPT_SLOTS = [
     id: 'assetWriterUser',
     group: 'asset',
     label: 'Asset prompt writer — user message',
-    description: 'What the writer is told about this asset. {context} expands to the script lines that mention it.',
+    description: 'What the writer is told about this asset. {context} expands to the script lines that mention it; {tags} to an instruction to keep any other asset tags written in its description — empty when there are none.',
     default: DEFAULT_ASSET_WRITER_USER,
-    placeholders: ['{type}', '{name}', '{tag}', '{description}', '{context}', '{styleHint}'],
+    placeholders: ['{type}', '{name}', '{tag}', '{description}', '{context}', '{styleHint}', '{tags}'],
     rows: 6
   },
   {
@@ -305,16 +306,42 @@ export function promptDefault(slotId) {
 }
 
 /**
+ * True for the slots that are templates — text with {placeholders} the studio
+ * fills in — as opposed to prose that is sent as written.
+ */
+function isTemplateSlot(slotId) {
+  const slot = SLOT_BY_ID.get(slotId);
+  return Boolean(slot && Array.isArray(slot.placeholders) && slot.placeholders.length);
+}
+
+/**
+ * True when an override should be ignored: a template that has been emptied.
+ *
+ * Blank is honoured on a prose slot — the pre/post pair especially is
+ * legitimately empty, and a user who clears one means it. A template is
+ * different. Emptied, it has nothing to put the description into, so every
+ * asset of that type without a hand-written prompt generated from *nothing*:
+ * its description, tags and all, silently went unused, and the editor's
+ * placeholder (built from the shipped template) promised otherwise. The
+ * settings box shows the shipped default as its placeholder too, so an
+ * emptied template reads as "back to the default" to the person who emptied
+ * it. Treat it as exactly that.
+ */
+function isBlankTemplateOverride(slotId, override) {
+  return typeof override === 'string' && override.trim() === '' && isTemplateSlot(slotId);
+}
+
+/**
  * The effective text for a slot: the project's override when it has one,
  * otherwise the default.
  *
- * An override of '' is honoured, not treated as absent — several slots
- * (the pre/post pair especially) are legitimately empty, and a user who clears
- * one means it.
+ * An override of '' is honoured on a prose slot, not treated as absent — see
+ * isBlankTemplateOverride for the one exception.
  */
 export function promptText(promptSettings, slotId) {
   const override = promptSettings ? promptSettings[slotId] : undefined;
-  return typeof override === 'string' ? override : promptDefault(slotId);
+  if (typeof override !== 'string' || isBlankTemplateOverride(slotId, override)) return promptDefault(slotId);
+  return override;
 }
 
 /** Same, as a number — for the numeric slots. */
@@ -326,7 +353,9 @@ export function promptNumber(promptSettings, slotId) {
 /** True when the project has changed this slot away from its default. */
 export function isPromptOverridden(promptSettings, slotId) {
   const override = promptSettings ? promptSettings[slotId] : undefined;
-  return typeof override === 'string' && override !== promptDefault(slotId);
+  return typeof override === 'string'
+    && override !== promptDefault(slotId)
+    && !isBlankTemplateOverride(slotId, override);
 }
 
 /**
@@ -374,6 +403,8 @@ export function compactPromptSettings(promptSettings) {
   Object.entries(promptSettings || {}).forEach(([key, value]) => {
     if (typeof value !== 'string') return;
     if (value === promptDefault(key)) return;
+    // An emptied template is not a setting — see isBlankTemplateOverride.
+    if (isBlankTemplateOverride(key, value)) return;
     out[key] = value;
   });
   return out;

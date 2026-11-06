@@ -233,6 +233,18 @@ test('a claim on something outside the media root is not a claim at all', () => 
   assert.deepEqual(collectClaims(state), []);
 });
 
+test('a reference clip uploaded into the project is filed with its shot', () => {
+  const state = {
+    scenes: [{
+      name: 'Cold Open', number: 1,
+      shots: [{ id: 's1', name: 'Insert', videoRefs: ['assets/move.mp4', 'https://example.com/ref.mp4'] }]
+    }]
+  };
+  const { mapping } = planAssetLayout(state);
+  assert.equal(mapping.get('assets/move.mp4'), 'assets/shots/01-cold-open/01-insert/video/insert_v01.mp4');
+  assert.equal(mapping.has('https://example.com/ref.mp4'), false);
+});
+
 // --- writing new files in the right place ----------------------------------
 
 test('a generation destined for a shot resolves to that shot folder', () => {

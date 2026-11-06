@@ -117,12 +117,8 @@ export const runLipSync = (req, credentials) => shared.runLipSync(req, buildCtx(
 
 export async function listModels(provider, credentials) {
   const fallbacks = {
-    gemini: [
-      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (Recommended)' },
-      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
-      { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash' },
-      { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro' }
-    ],
+    // Kept with the Gemini adapter, so the server and this build agree.
+    gemini: shared.GEMINI_FALLBACK_MODELS,
     chatgpt: [
       { id: 'gpt-4o-mini', name: 'GPT-4o Mini (Recommended)' },
       { id: 'gpt-4o', name: 'GPT-4o' },

@@ -7,6 +7,7 @@ import {
   compactDreamSettings,
   createDreamSettings,
   describeAssetLibrary,
+  dreamAttachesTags,
   parseDreamReply
 } from './dream.js';
 
@@ -90,6 +91,21 @@ test('createDreamSettings defaults to inventing rather than chaining', () => {
 test('compactDreamSettings stores a chain run but not the default mode', () => {
   assert.equal(compactDreamSettings(createDreamSettings()).mode, undefined);
   assert.equal(compactDreamSettings(createDreamSettings({ mode: 'chain' })).mode, 'chain');
+});
+
+// A dream on a reference model whose clips do not carry the tagged images
+// draws its cast from prose — the project's video switch ships off, and it
+// used to be the only say. The dream now decides for itself.
+test('a dream follows the project switch for tagged images until told otherwise', () => {
+  assert.equal(createDreamSettings().attachTaggedImages, null);
+  assert.equal(dreamAttachesTags(createDreamSettings(), false), false);
+  assert.equal(dreamAttachesTags(createDreamSettings(), true), true);
+  assert.equal(dreamAttachesTags(createDreamSettings({ attachTaggedImages: true }), false), true);
+  assert.equal(dreamAttachesTags(createDreamSettings({ attachTaggedImages: false }), true), false);
+  // An explicit choice is saved either way; following the project is not.
+  assert.equal(compactDreamSettings(createDreamSettings()).attachTaggedImages, undefined);
+  assert.equal(compactDreamSettings(createDreamSettings({ attachTaggedImages: false })).attachTaggedImages, false);
+  assert.equal(compactDreamSettings(createDreamSettings({ attachTaggedImages: true })).attachTaggedImages, true);
 });
 
 test('parseDreamReply reads the JSON object', () => {

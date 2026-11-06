@@ -10,18 +10,21 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { resolveRouting, routesToHiggsfield, routesToFal } from './routing.js';
-import { buildFalImageRequest, buildFalVideoRequest, resolveFalVideoModel, falImageSize, isFalReferenceEndpoint, falQueueBase, describeFalError } from './fal.js';
+import { buildFalImageRequest, buildFalVideoRequest, resolveFalVideoModel, falImageSize, isFalReferenceEndpoint, isFalVideoOnlyReference, falQueueBase, describeFalError } from './fal.js';
 import { buildHiggsfieldImageRequest, buildHiggsfieldVideoRequest } from './higgsfield.js';
 import {
   buildAtlasImageBodies, buildAtlasVideoBodies, atlasImageSize, resolveAudioReference,
-  isAtlasGeminiImage, usesAtlasImageArray
+  resolveMediaReference, isAtlasGeminiImage, usesAtlasImageArray
 } from './atlas.js';
 import {
   buildVeniceImageBody, buildVeniceEditBody, buildVeniceVideoBody,
   veniceAspectRatio, veniceResolutionTier, veniceDuration,
   isVeniceEditModel, isVeniceReferenceVideo, describeVeniceError
 } from './venice.js';
-import { buildGeminiImageBodies, geminiAspectRatio, geminiImageModel, referenceImageParts } from './google.js';
+import {
+  buildGeminiImageBodies, geminiAspectRatio, geminiImageModel, referenceImageParts,
+  GEMINI_TEXT_DEFAULT, resolveGeminiTextModel, suggestedGeminiModel
+} from './google.js';
 import { dalleSize } from './openai.js';
 import { generateImage, generateVideo, generateText } from './index.js';
 
@@ -980,4 +983,172 @@ test('a quote that is merely unavailable does not block the generation', async (
     provider: 'venice:wan-2-7-image-to-video', prompt: 'x',
     imageUrls: ['first.png'], resolution: '1280x720', duration: '5'
   }, ctx), 'assets/vid.mp4');
+});
+
+// --- reference video ---------------------------------------------------------
+//
+// The third kind of reference. Fal hosts a clip from disk the way it hosts
+// audio; Atlas wants a URL it can fetch and checks it serves video; anything
+// that is not a reference-to-video endpoint has nowhere to put one and says so.
+
+test('reference videos travel to the Fal reference endpoint as video_urls', async () => {
+  const seen = {};
+  const ctx = {
+    credentials: { falKey: 'k' },
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    fetch: async (url, options) => {
+      seen.input = JSON.parse(options.body);
+      return { ok: false, status: 400, text: async () => 'inspected' };
+    }
+  };
+  await assert.rejects(() => generateVideo({
+    provider: 'fal:bytedance/seedance-2.0/reference-to-video',
+    providerFamily: null,
+    prompt: '@image1 moves like @video1',
+    imageUrls: ['assets/a.png'],
+    videoUrls: ['assets/move.mp4', 'https://example.com/ref.mp4'],
+    resolution: '1280x720',
+    duration: '8'
+  }, ctx));
+  assert.deepEqual(seen.input.image_urls, ['https://fal.media/assets/a.png']);
+  assert.deepEqual(seen.input.video_urls, ['https://fal.media/assets/move.mp4', 'https://example.com/ref.mp4']);
+  assert.equal('audio_urls' in seen.input, false);
+});
+
+test('a model that cannot take video refuses rather than dropping it', async () => {
+  await assert.rejects(
+    () => generateVideo({ provider: 'fal-ai/kling-video', prompt: 'x', videoUrls: ['assets/move.mp4'] }, { credentials: {} }),
+    /does not take reference video/
+  );
+  // A Venice first-frame model has no reference array at all.
+  await assert.rejects(
+    () => generateVideo({ provider: 'venice:wan-2-7-image-to-video', prompt: 'x', videoUrls: ['assets/move.mp4'] }, { credentials: { veniceKey: 'k' } }),
+    /does not take reference video/
+  );
+});
+
+test('Wan ref2v is video-only: no clip is refused before Fal, clips go without image_urls', async () => {
+  assert.equal(isFalVideoOnlyReference('wan/v2.6/reference-to-video'), true);
+  assert.equal(isFalVideoOnlyReference('bytedance/seedance-2.0/reference-to-video'), false);
+  const seen = {};
+  const ctx = {
+    credentials: { falKey: 'k' },
+    uploadPublicUrl: async (path) => `https://fal.media/${path}`,
+    fetch: async (url, options) => {
+      seen.url = url;
+      seen.input = JSON.parse(options.body);
+      return { ok: false, status: 400, text: async () => 'inspected' };
+    }
+  };
+  await assert.rejects(() => generateVideo({
+    provider: 'fal:wan/v2.6/reference-to-video', providerFamily: null,
+    prompt: '@Video1 walks in', resolution: '1280x720', duration: '5'
+  }, ctx), /generates from reference videos and this shot has none/);
+  assert.equal(seen.url, undefined);
+
+  await assert.rejects(() => generateVideo({
+    provider: 'fal:wan/v2.6/reference-to-video', providerFamily: null,
+    prompt: '@Video1 walks in', videoUrls: ['assets/move.mp4'], resolution: '720x1280', duration: '5'
+  }, ctx), /inspected/);
+  assert.equal(seen.url, 'https://queue.fal.run/wan/v2.6/reference-to-video');
+  assert.deepEqual(seen.input.video_urls, ['https://fal.media/assets/move.mp4']);
+  assert.equal('image_urls' in seen.input, false);
+  assert.equal(seen.input.resolution, '720p');
+  assert.equal(seen.input.aspect_ratio, '9:16');
+  assert.equal(seen.input.duration, '5');
+});
+
+test('every Atlas candidate carries the reference videos it was given', () => {
+  const bodies = buildAtlasVideoBodies('bytedance/seedance-2.0/reference-to-video', {
+    prompt: 'the camera move of video 1', resolution: '1280x720', duration: '5',
+    imageDataUrls: ['data:a'], videoAssetRefs: ['https://example.com/move.mp4', 'asset://v2']
+  });
+  assert.equal(bodies.length, 3);
+  bodies.forEach(body => assert.deepEqual(body.reference_videos, ['https://example.com/move.mp4', 'asset://v2']));
+  // No audio was given, so no audio field is invented.
+  bodies.forEach(body => assert.equal('reference_audio' in body, false));
+});
+
+test('a video reference is checked the way an audio one is', async () => {
+  const mp4 = { fetch: async () => ({ ok: true, headers: { get: () => 'video/mp4' } }) };
+  assert.equal(await resolveMediaReference('https://example.com/move.mp4', mp4, 'video'), 'https://example.com/move.mp4');
+  const page = { fetch: async () => ({ ok: true, headers: { get: () => 'text/html' } }) };
+  await assert.rejects(() => resolveMediaReference('https://github.com/u/r/blob/main/move.mp4', page, 'video'), /rather than video/);
+  await assert.rejects(() => resolveMediaReference('assets/move.mp4', {}, 'video'), /Video reference .* is not a URL/);
+  // An mp3 where a video was promised is the wrong kind, not the wrong host.
+  const mp3 = { fetch: async () => ({ ok: true, headers: { get: () => 'audio/mpeg' } }) };
+  await assert.rejects(() => resolveMediaReference('https://example.com/vo.mp3', mp3, 'video'), /rather than video/);
+  // And the audio check still answers to its old name.
+  await assert.rejects(() => resolveAudioReference('https://example.com/move.mp4', mp4), /rather than audio/);
+});
+
+test('Venice reference-to-video carries its clips as reference_video_urls', () => {
+  const r2v = buildVeniceVideoBody('minimax-h3-enhanced-reference-to-video', {
+    prompt: '@Image1 walks', resolution: '1280x720', duration: '8',
+    imageDataUrls: ['https://host/a.jpg'], videoUrls: ['https://host/move.mp4']
+  });
+  assert.deepEqual(r2v.reference_video_urls, ['https://host/move.mp4']);
+  assert.deepEqual(r2v.reference_image_urls, ['https://host/a.jpg']);
+  const i2v = buildVeniceVideoBody('wan-2-7-image-to-video', {
+    prompt: 'x', resolution: '1280x720', duration: '5',
+    imageDataUrls: ['https://host/a.jpg'], videoUrls: ['https://host/move.mp4']
+  });
+  assert.equal('reference_video_urls' in i2v, false);
+});
+
+// --- Gemini text models -------------------------------------------------------
+//
+// Google retires a text model by refusing it while still listing it, so a
+// saved id passes every "is it in the list" check and dies at generation time
+// — as gemini-2.5-flash did on 2026-09-10, mid-dream.
+
+test('a retired Gemini text id is rewritten to the model Google named', () => {
+  assert.equal(resolveGeminiTextModel('gemini-2.5-flash'), 'gemini-3.6-flash');
+  assert.equal(resolveGeminiTextModel(''), GEMINI_TEXT_DEFAULT);
+  assert.equal(resolveGeminiTextModel(undefined), GEMINI_TEXT_DEFAULT);
+  // A current id, or another provider's, is left exactly alone.
+  assert.equal(resolveGeminiTextModel('gemini-3.8-flash'), 'gemini-3.8-flash');
+  assert.equal(resolveGeminiTextModel('gpt-4o-mini'), 'gpt-4o-mini');
+});
+
+test('a refusal that names a replacement is retried once with it', async () => {
+  const asked = [];
+  const ctx = {
+    credentials: { geminiKey: 'k' },
+    fetch: async (url) => {
+      asked.push(url);
+      if (url.includes('/models/gemini-2.5-pro:')) {
+        return { json: async () => ({ error: { message: 'This model models/gemini-2.5-pro is no longer available to new users. Please update your code to use models/gemini-3.6-flash for the latest features and improvements.' } }) };
+      }
+      return { json: async () => ({ candidates: [{ content: { parts: [{ text: 'hello' }] } }] }) };
+    }
+  };
+  assert.equal(await generateText({ provider: 'gemini', model: 'gemini-2.5-pro', prompt: 'x' }, ctx), 'hello');
+  assert.equal(asked.length, 2);
+  assert.match(asked[1], /\/models\/gemini-3\.6-flash:generateContent/);
+  assert.equal(suggestedGeminiModel('Resource has been exhausted'), null);
+});
+
+test('a retirement whose replacement also fails says so, once', async () => {
+  let calls = 0;
+  const ctx = {
+    credentials: { geminiKey: 'k' },
+    fetch: async () => {
+      calls++;
+      return { json: async () => ({ error: { message: 'This model models/x is no longer available to new users. Please update your code to use models/gemini-9-flash.' } }) };
+    }
+  };
+  await assert.rejects(
+    generateText({ provider: 'gemini', model: 'x', prompt: 'x' }, ctx),
+    /gemini-9-flash was refused as well/
+  );
+  assert.equal(calls, 2);
+});
+
+test('an ordinary Gemini error is reported as it was', async () => {
+  const ctx = {
+    credentials: { geminiKey: 'k' },
+    fetch: async () => ({ json: async () => ({ error: { message: 'Resource has been exhausted' } }) })
+  };
+  await assert.rejects(generateText({ provider: 'gemini', model: 'gemini-3.6-flash', prompt: 'x' }, ctx), /Resource has been exhausted/);
 });

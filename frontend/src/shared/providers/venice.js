@@ -213,10 +213,17 @@ export function buildVeniceEditBody(modelPath, { prompt, resolution, imageDataUr
  * takes one still in `image_url` and treats it as the first frame. Reference
  * models are never reduced to a single frame — that body would be accepted and
  * would produce a video missing every reference the prompt points at.
+ *
+ * Reference clips go in `reference_video_urls`, the array Venice documents on
+ * its reference-to-video endpoints. No catalog model claims them yet — the
+ * models endpoint reports `video_input: false` on every ref2v id — so this is
+ * the wiring, ready for one that does.
  */
-export function buildVeniceVideoBody(modelPath, { prompt, resolution, duration, imageDataUrls = [] }) {
+export function buildVeniceVideoBody(modelPath, { prompt, resolution, duration, imageDataUrls = [], videoUrls = [] }) {
   const images = (imageDataUrls || []).filter(Boolean);
+  const videos = (videoUrls || []).filter(Boolean);
   const body = { model: modelPath, prompt, duration: veniceDuration(duration) };
+  if (videos.length && isVeniceReferenceVideo(modelPath)) body.reference_video_urls = videos;
 
   const tier = veniceResolutionTier(modelPath, resolution);
   if (tier) body.resolution = tier;
@@ -393,15 +400,39 @@ async function videoFrameUrls(inputImagePaths, ctx) {
   return { urls: await Promise.all(paths.map(ctx.uploadPublicUrl)), hosted: true };
 }
 
-export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths = [] }, ctx) {
+/**
+ * Reference clips as links. A clip is never inlined: a five second mp4 is tens
+ * of megabytes of base64, far past what the video backends read, so a project
+ * file is hosted on Fal storage or refused with the reason.
+ */
+async function videoReferenceUrls(inputVideoPaths, ctx) {
+  const urls = [];
+  for (const ref of (inputVideoPaths || []).filter(Boolean)) {
+    if (/^https?:\/\//i.test(ref)) { urls.push(ref); continue; }
+    if (/^asset:\/\//i.test(ref)) {
+      throw new Error(`"${ref}" is an Atlas Asset Library id and means nothing to Venice. Add the clip as a file or an https:// URL.`);
+    }
+    if (!ctx.credentials.falKey) {
+      throw new Error(
+        `A reference video from the project has to be hosted at a URL for Venice to fetch, and hosting ` +
+        `it needs a Fal.ai key. Add one in Settings, or add the clip to the shot as an https:// link.`
+      );
+    }
+    urls.push(await ctx.uploadPublicUrl(ref));
+  }
+  return urls;
+}
+
+export async function generateVideo({ modelPath, prompt, resolution, duration, inputImagePaths = [], inputVideoPaths = [] }, ctx) {
   const headers = veniceHeaders(ctx);
   const { urls: images, hosted } = await videoFrameUrls(inputImagePaths, ctx);
+  const videos = await videoReferenceUrls(inputVideoPaths, ctx);
 
   if (isVeniceImageVideo(modelPath) && !images.length) {
     throw new Error(`${modelPath} animates a still and needs one input image.`);
   }
 
-  const body = buildVeniceVideoBody(modelPath, { prompt, resolution, duration, imageDataUrls: images });
+  const body = buildVeniceVideoBody(modelPath, { prompt, resolution, duration, imageDataUrls: images, videoUrls: videos });
   await quoteBeforeQueueing(body, headers, ctx);
 
   const submit = await ctx.fetch(`${VENICE_BASE}/video/queue`, {
@@ -425,7 +456,7 @@ export async function generateVideo({ modelPath, prompt, resolution, duration, i
   // anybody pastes it — which cost a round of chasing a hosting bug that did
   // not exist. Only inlined data is abbreviated, and it is labelled as such.
   const describeValue = (value) => {
-    if (Array.isArray(value)) return `${value.length} image(s)`;
+    if (Array.isArray(value)) return `${value.length} item(s)`;
     const text = String(value);
     if (text.startsWith('data:')) return `<inline ${text.slice(5, text.indexOf(';')) || 'data'}, ${text.length} chars>`;
     return text;
