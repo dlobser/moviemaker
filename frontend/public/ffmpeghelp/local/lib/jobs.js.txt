@@ -1,0 +1,331 @@
+'use strict';
+// Job queue: runs plan steps through ffmpeg and turns its progress output into a percentage.
+const { spawn } = require('child_process');
+const EventEmitter = require('events');
+const fs = require('fs');
+const path = require('path');
+const { FFMPEG } = require('./media');
+const { GLOBAL_ARGS } = require('./ops');
+
+const RUN_ARGS = ['-nostdin', '-progress', 'pipe:1', '-nostats', '-stats_period', '0.5'];
+const LOG_LINES = 400;
+
+class Cancelled extends Error {}
+
+function lines(stream, onLine) {
+  let buf = '';
+  stream.setEncoding('utf8');
+  stream.on('data', (chunk) => {
+    buf += chunk;
+    const parts = buf.split(/\r\n|\n|\r/);
+    buf = parts.pop();
+    for (const l of parts) if (l) onLine(l);
+  });
+  stream.on('end', () => buf && onLine(buf));
+}
+
+const mtime = (p) => fs.promises.stat(p).then((s) => s.mtimeMs, () => null);
+
+class Jobs extends EventEmitter {
+  constructor({ concurrency = 2 } = {}) {
+    super();
+    this.concurrency = concurrency;
+    this.jobs = new Map();
+    this.queue = [];
+    this.running = 0;
+    this.seq = 0;
+  }
+
+  create(plan, op) {
+    const id = `j${++this.seq}`;
+    const job = {
+      id,
+      op,
+      title: plan.title,
+      status: 'queued',
+      progress: 0,
+      indeterminate: false,
+      step: 0,
+      steps: plan.steps.length,
+      stepLabel: '',
+      speed: null,
+      eta: null,
+      createdAt: Date.now(),
+      startedAt: null,
+      finishedAt: null,
+      outputs: plan.outputs,
+      reveal: plan.reveal,
+      notes: plan.notes || [],
+      error: null,
+      result: null,
+      commands: plan.commands,
+      log: [],
+      _plan: plan,
+      _procs: new Set(),
+      _cancel: false,
+    };
+    this.jobs.set(id, job);
+    this.queue.push(job);
+    this.emitJob(job, true);
+    this.pump();
+    return job;
+  }
+
+  pump() {
+    while (this.running < this.concurrency && this.queue.length) {
+      const job = this.queue.shift();
+      this.running++;
+      this.run(job).finally(() => {
+        this.running--;
+        this.pump();
+      });
+    }
+  }
+
+  async run(job) {
+    const plan = job._plan;
+    job.status = 'running';
+    job.startedAt = Date.now();
+    this.emitJob(job, true);
+    const steps = plan.steps;
+    const weight = (s) => s.weight ?? 1;
+    const total = steps.reduce((a, s) => a + weight(s), 0) || 1;
+    // plan.parallel > 1 runs that many independent steps at once (e.g. one ffmpeg per image).
+    const par = Math.max(1, Math.min(plan.parallel || 1, steps.length));
+    let done = 0;
+    const live = new Map(); // running step -> its progress fraction
+    const touched = new Map(); // output -> mtime before its step started, until the step succeeds
+    const failed = []; // with plan.keepGoing, steps that failed while the rest carried on
+    const showProgress = () => {
+      let sum = done;
+      for (const [s, frac] of live) sum += frac * weight(s);
+      job.progress = Math.min(1, sum / total);
+    };
+    const removePartial = async (o) => {
+      const now = await mtime(o);
+      if (now !== null && now !== touched.get(o)) await fs.promises.rm(o, { force: true }).catch(() => {});
+      touched.delete(o);
+    };
+    const runStep = async (step, i) => {
+      job.step = i + 1;
+      job.stepLabel = step.label || '';
+      const outs = step.outputs || [];
+      for (const o of outs) {
+        await fs.promises.mkdir(path.dirname(o), { recursive: true });
+        touched.set(o, await mtime(o));
+      }
+      live.set(step, 0);
+      try {
+        job._state = await this.ffmpeg(job, step, (frac) => {
+          live.set(step, frac);
+          showProgress();
+        }, par > 1 ? `[${step.label || i + 1}] ` : '');
+        for (const o of outs) touched.delete(o);
+      } catch (e) {
+        if (!plan.keepGoing || job._cancel || e instanceof Cancelled) throw e;
+        for (const o of outs) await removePartial(o);
+        failed.push({ step, error: e.message });
+      } finally {
+        live.delete(step);
+        done += weight(step);
+        showProgress();
+      }
+    };
+    try {
+      for (const file of plan.files) {
+        await fs.promises.mkdir(path.dirname(file.path), { recursive: true });
+        await fs.promises.writeFile(file.path, file.content);
+      }
+      for (const dir of plan.mkdirs || []) await fs.promises.mkdir(dir, { recursive: true });
+      let next = 0;
+      let firstErr = null;
+      const worker = async () => {
+        while (!firstErr && !job._cancel && next < steps.length) {
+          const i = next++;
+          try {
+            await runStep(steps[i], i);
+          } catch (e) {
+            if (!firstErr) {
+              firstErr = e;
+              for (const p of job._procs) p.kill(); // stop the other steps running alongside
+            }
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: par }, worker));
+      if (job._cancel) throw new Cancelled();
+      if (firstErr) throw firstErr;
+      if (failed.length) {
+        const n = steps.length;
+        const lines = failed.slice(0, 5).map((f) => `${f.step.label || 'step'}: ${keyLine(f.error)}`);
+        if (failed.length > 5) lines.push(`… and ${failed.length - 5} more (see Log)`);
+        throw new Error(`${failed.length} of ${n} failed${failed.length < n ? ` (the other ${n - failed.length} were saved)` : ''}:\n${lines.join('\n')}`);
+      }
+      if (plan.after) job.result = (await plan.after(job, job._state)) ?? null;
+      job.status = 'done';
+      job.progress = 1;
+      job.indeterminate = false;
+    } catch (e) {
+      if (e instanceof Cancelled || job._cancel) {
+        job.status = 'cancelled';
+      } else {
+        job.status = 'error';
+        job.error = e.message;
+      }
+      // Remove half-written output of the interrupted step(s) (only files those steps touched).
+      for (const o of [...touched.keys()]) await removePartial(o);
+    } finally {
+      job.finishedAt = Date.now();
+      job.eta = null;
+      fs.promises.rm(plan.tmpDir, { recursive: true, force: true }).catch(() => {});
+      this.emitJob(job, true);
+    }
+  }
+
+  ffmpeg(job, step, onFrac, logPrefix = '') {
+    return new Promise((resolve, reject) => {
+      const proc = spawn(FFMPEG, [...GLOBAL_ARGS, ...RUN_ARGS, ...step.args], { windowsHide: true });
+      job._procs.add(proc);
+      const stepLog = []; // this process's lines only, for its error message
+      const st = { outTime: 0, frame: 0, speed: null, infoCount: 0, infoTime: 0 };
+      let best = 0;
+      let lastInfo = 0;
+      let empty = false;
+      const update = () => {
+        let fr = step.progress ? step.progress(st) : null;
+        if (fr == null || !Number.isFinite(fr)) {
+          job.indeterminate = true;
+        } else {
+          job.indeterminate = false;
+          fr = Math.min(1, Math.max(best, fr));
+          best = fr;
+          onFrac(fr);
+        }
+        job.speed = st.speed;
+        const elapsed = (Date.now() - job.startedAt) / 1000;
+        job.eta = job.progress > 0.01 && elapsed > 1 ? (elapsed * (1 - job.progress)) / job.progress : null;
+        this.emitJob(job);
+      };
+
+      lines(proc.stdout, (line) => {
+        const i = line.indexOf('=');
+        if (i < 0) return;
+        const k = line.slice(0, i);
+        const v = line.slice(i + 1).trim();
+        if (k === 'out_time_us') {
+          const n = Number(v);
+          if (Number.isFinite(n) && n >= 0) st.outTime = n / 1e6;
+        } else if (k === 'frame') {
+          const n = Number(v);
+          if (Number.isFinite(n)) st.frame = n;
+        } else if (k === 'speed') {
+          const n = parseFloat(v);
+          st.speed = Number.isFinite(n) ? n : null;
+        } else if (k === 'progress') {
+          update();
+        }
+      });
+
+      lines(proc.stderr, (line) => {
+        if (line.includes('Parsed_showinfo_')) {
+          const m = line.match(/\sn:\s*(\d+)\s+pts:\s*\S+\s+pts_time:\s*(-?[\d.]+)/);
+          if (m) {
+            st.infoCount = +m[1] + 1;
+            st.infoTime = +m[2];
+            const now = Date.now();
+            if (now - lastInfo > 200) {
+              lastInfo = now;
+              update();
+            }
+          }
+          return; // per-frame noise; keep it out of the log
+        }
+        if (step.onStderr) step.onStderr(line);
+        if (line.includes('Output file is empty, nothing was encoded')) empty = true;
+        stepLog.push(line);
+        if (stepLog.length > LOG_LINES) stepLog.shift();
+        job.log.push(logPrefix + line);
+        if (job.log.length > LOG_LINES) job.log.splice(0, job.log.length - LOG_LINES);
+      });
+
+      proc.on('error', (e) => {
+        job._procs.delete(proc);
+        reject(e.code === 'ENOENT' ? new Error('ffmpeg not found — install it or set FFMPEG_PATH') : e);
+      });
+      proc.on('close', (code) => {
+        job._procs.delete(proc);
+        if (job._cancel) return reject(new Cancelled());
+        if (code === 0 && empty) return reject(new Error('ffmpeg produced an empty file — check the start/end times and input.'));
+        if (code === 0) {
+          onFrac(1);
+          return resolve(st);
+        }
+        reject(new Error(errorSummary(stepLog) || `ffmpeg exited with code ${code}`));
+      });
+    });
+  }
+
+  cancel(id) {
+    const job = this.jobs.get(id);
+    if (!job) return false;
+    job._cancel = true;
+    if (job.status === 'queued') {
+      this.queue = this.queue.filter((j) => j !== job);
+      job.status = 'cancelled';
+      job.finishedAt = Date.now();
+      this.emitJob(job, true);
+    } else {
+      for (const p of job._procs) p.kill();
+    }
+    return true;
+  }
+
+  cancelAll() {
+    for (const job of this.jobs.values()) if (job.status === 'queued' || job.status === 'running') this.cancel(job.id);
+  }
+
+  clearFinished() {
+    for (const [id, job] of this.jobs) if (job.status !== 'queued' && job.status !== 'running') this.jobs.delete(id);
+  }
+
+  list() {
+    return [...this.jobs.values()].map((j) => this.public(j));
+  }
+
+  public(job) {
+    const out = {};
+    for (const [k, v] of Object.entries(job)) if (k[0] !== '_' && k !== 'log' && k !== 'commands') out[k] = v;
+    return out;
+  }
+
+  emitJob(job, force) {
+    const now = Date.now();
+    if (!force && now - (job._lastEmit || 0) < 150) {
+      if (!job._timer) job._timer = setTimeout(() => this.emitJob(job, true), 150);
+      return;
+    }
+    clearTimeout(job._timer);
+    job._timer = null;
+    job._lastEmit = now;
+    job.rev = (job.rev || 0) + 1; // lets the UI drop out-of-order updates
+    this.emit('job', this.public(job));
+  }
+}
+
+/** Last meaningful lines of ffmpeg's stderr, for the error message. */
+function errorSummary(log) {
+  const tail = log.slice(-12).filter((l) => !/^\s*(Stream mapping|Press \[q\]|Input #|Output #|Metadata|Duration|Stream #)/.test(l));
+  const important = tail.filter((l) => /error|invalid|no such|not found|failed|unable|cannot|could not|unknown|does not|incompatible/i.test(l));
+  return (important.length ? important : tail).slice(-6).join('\n').trim();
+}
+
+/** The most telling line of an ffmpeg error, for one-line-per-file summaries. */
+function keyLine(msg) {
+  const lines = msg
+    .split('\n')
+    .map((l) => l.replace(/^\[[^\]]*@ [^\]]*\]\s*/, '').trim()) // drop "[png @ 0x…]"
+    .filter((l) => l && !/^Conversion failed/i.test(l));
+  return lines.find((l) => /invalid|no such|not found|denied|unsupported/i.test(l)) || lines[lines.length - 1] || msg;
+}
+
+module.exports = { Jobs };

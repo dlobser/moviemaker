@@ -1,0 +1,53 @@
+{
+  "root": "ffmpeg-helper",
+  "files": [
+    {
+      "path": "start.bat",
+      "src": "start.bat.txt"
+    },
+    {
+      "path": "server.js",
+      "src": "server.js.txt"
+    },
+    {
+      "path": "package.json",
+      "src": "package.json.txt"
+    },
+    {
+      "path": "README.md",
+      "src": "README.md.txt"
+    },
+    {
+      "path": "lib/dialog.js",
+      "src": "lib/dialog.js.txt"
+    },
+    {
+      "path": "lib/jobs.js",
+      "src": "lib/jobs.js.txt"
+    },
+    {
+      "path": "lib/media.js",
+      "src": "lib/media.js.txt"
+    },
+    {
+      "path": "lib/ops.js",
+      "src": "lib/ops.js.txt"
+    },
+    {
+      "path": "public/index.html",
+      "src": "public/index.html.txt"
+    },
+    {
+      "path": "public/app.js",
+      "src": "public/app.js.txt"
+    },
+    {
+      "path": "public/fx.js",
+      "src": "public/fx.js.txt"
+    },
+    {
+      "path": "public/style.css",
+      "src": "public/style.css.txt"
+    }
+  ]
+}

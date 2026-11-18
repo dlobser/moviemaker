@@ -1,0 +1,6 @@
+ffmpeg-core.js and ffmpeg-core.*.bin (the .wasm file, split into parts) are @ffmpeg/core 0.12.10:
+FFmpeg compiled to WebAssembly by the ffmpeg.wasm project.
+
+License: GPL-2.0-or-later (FFmpeg is built with GPL components such as x264 and x265).
+Source code: https://github.com/ffmpegwasm/ffmpeg.wasm and https://ffmpeg.org/download.html
+Package: https://www.npmjs.com/package/@ffmpeg/core/v/0.12.10

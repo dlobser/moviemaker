@@ -1,0 +1,218 @@
+'use strict';
+// ffprobe wrapper, image-sequence detection and small shared helpers.
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe';
+
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp', '.exr', '.tga', '.dpx', '.jxl']);
+const isImagePath = (f) => IMAGE_EXT.has(path.extname(f).toLowerCase());
+
+/** Validation problem the user can fix; shown verbatim in the UI. */
+class UserError extends Error {}
+
+function capture(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { windowsHide: true });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (err += d));
+    p.on('error', (e) =>
+      reject(e.code === 'ENOENT' ? new Error(`${cmd} not found. Install ffmpeg or set FFMPEG_PATH / FFPROBE_PATH.`) : e)
+    );
+    p.on('close', (code) =>
+      code === 0 ? resolve(out) : reject(new Error(err.trim().split(/\r?\n/).slice(-3).join('\n') || `${cmd} exited with ${code}`))
+    );
+  });
+}
+
+/** "90", "1:30", "0:01:30.5" -> seconds. Empty -> null. */
+function parseTime(v) {
+  if (v === undefined || v === null) return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const parts = s.split(':');
+  if (parts.length > 3) throw new UserError(`Invalid time "${s}"`);
+  let total = 0;
+  for (const part of parts) {
+    if (!/^\d+(\.\d*)?$|^\.\d+$/.test(part.trim())) throw new UserError(`Invalid time "${s}" (use seconds or h:mm:ss.s)`);
+    total = total * 60 + parseFloat(part);
+  }
+  return total;
+}
+
+function parseRate(r) {
+  if (!r || r === '0/0') return null;
+  const [a, b] = String(r).split('/').map(Number);
+  const v = b ? a / b : a;
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+const ALPHA_PIX = /^(yuva|rgba|bgra|argb|abgr|gbrap|ya[0-9]|pal8)/;
+
+function summarize(file, j, size) {
+  const fmt = j.format || {};
+  const streams = j.streams || [];
+  const vs = streams.find((s) => s.codec_type === 'video' && !(s.disposition && s.disposition.attached_pic));
+  const as = streams.find((s) => s.codec_type === 'audio');
+  let duration = parseFloat(fmt.duration);
+  if (!Number.isFinite(duration)) duration = parseFloat((vs && vs.duration) || (as && as.duration));
+  if (!Number.isFinite(duration)) duration = null;
+
+  let video = null;
+  if (vs) {
+    const tags = vs.tags || {};
+    const alphaMode = (tags.alpha_mode || tags.ALPHA_MODE) === '1';
+    const fps = parseRate(vs.avg_frame_rate) || parseRate(vs.r_frame_rate);
+    const nb = parseInt(vs.nb_frames, 10);
+    video = {
+      codec: vs.codec_name,
+      width: vs.width,
+      height: vs.height,
+      fps,
+      pixFmt: vs.pix_fmt,
+      hasAlpha: alphaMode || ALPHA_PIX.test(vs.pix_fmt || ''),
+      alphaMode,
+      duration: parseFloat(vs.duration) || null,
+      frames: Number.isFinite(nb) && nb > 0 ? nb : duration && fps ? Math.round(duration * fps) : null,
+      bitrate: parseInt(vs.bit_rate, 10) || null,
+    };
+  }
+  const audio = as
+    ? {
+        codec: as.codec_name,
+        sampleRate: parseInt(as.sample_rate, 10) || null,
+        channels: as.channels,
+        layout: as.channel_layout || null,
+        bitrate: parseInt(as.bit_rate, 10) || null,
+        bits: parseInt(as.bits_per_raw_sample, 10) || parseInt(as.bits_per_sample, 10) || null,
+      }
+    : null;
+  return {
+    path: file,
+    size,
+    duration,
+    format: fmt.format_name,
+    formatLong: fmt.format_long_name,
+    bitrate: parseInt(fmt.bit_rate, 10) || null,
+    isImage: isImagePath(file),
+    video,
+    audio,
+    streams: streams.map((s) => ({
+      index: s.index,
+      type: s.codec_type,
+      codec: s.codec_name,
+      profile: s.profile,
+      width: s.width,
+      height: s.height,
+      pixFmt: s.pix_fmt,
+      fps: s.codec_type === 'video' ? parseRate(s.avg_frame_rate) || parseRate(s.r_frame_rate) : undefined,
+      sampleRate: s.sample_rate ? parseInt(s.sample_rate, 10) : undefined,
+      channels: s.channels,
+      layout: s.channel_layout,
+      bitrate: parseInt(s.bit_rate, 10) || undefined,
+      language: s.tags && s.tags.language,
+      coverArt: !!(s.disposition && s.disposition.attached_pic),
+    })),
+  };
+}
+
+const probeCache = new Map();
+async function probe(file) {
+  if (!file) throw new UserError('Choose an input file');
+  const st = await fs.promises.stat(file).catch(() => null);
+  if (!st || !st.isFile()) throw new UserError(`File not found: ${file}`);
+  const key = `${file}|${st.mtimeMs}|${st.size}`;
+  if (probeCache.has(key)) return probeCache.get(key);
+  const json = await capture(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file]);
+  const info = summarize(file, JSON.parse(json), st.size);
+  if (probeCache.size > 300) probeCache.clear();
+  probeCache.set(key, info);
+  return info;
+}
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Given one frame of a numbered sequence (e.g. render_0042.png), find the rest.
+ * Returns the ffmpeg image2 pattern, number range and any gaps.
+ */
+async function detectSequence(file) {
+  if (!file) throw new UserError('Choose an image');
+  const st = await fs.promises.stat(file).catch(() => null);
+  if (!st || !st.isFile()) throw new UserError(`File not found: ${file}`);
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  const ext = path.extname(base);
+  const stem = base.slice(0, base.length - ext.length);
+  const m = stem.match(/^(.*?)(\d+)(\D*)$/);
+  const first = await probe(file);
+  const frameInfo = {
+    width: first.video && first.video.width,
+    height: first.video && first.video.height,
+    hasAlpha: !!(first.video && first.video.hasAlpha),
+    pixFmt: first.video && first.video.pixFmt,
+  };
+  if (!m) {
+    // No number in the name: treat as a one-frame "sequence" (image2 reads a plain filename fine).
+    return { single: true, dir, prefix: stem, suffix: ext, pattern: file, first: 0, last: 0, runEnd: 0, count: 1, missing: 0, firstMissing: null, gaps: [], ...frameInfo };
+  }
+  const [, prefix, digits, tail] = m;
+  const suffix = tail + ext;
+  const re = new RegExp('^' + escapeRe(prefix) + '(\\d+)' + escapeRe(suffix) + '$', 'i');
+  const padded = digits.length > 1 && digits[0] === '0';
+  const nums = [];
+  for (const e of await fs.promises.readdir(dir)) {
+    const mm = e.match(re);
+    if (!mm) continue;
+    const d = mm[1];
+    // A padded pattern (%04d) only matches names of exactly that width; %d only matches unpadded names.
+    if (padded ? d.length !== digits.length : d.length > 1 && d[0] === '0') continue;
+    nums.push(parseInt(d, 10));
+  }
+  nums.sort((a, b) => a - b);
+  const set = new Set(nums);
+  const firstN = nums[0];
+  const lastN = nums[nums.length - 1];
+  let runEnd = firstN;
+  while (set.has(runEnd + 1)) runEnd++;
+  const gaps = [];
+  for (let i = 1; i < nums.length && gaps.length < 200; i++) {
+    if (nums[i] > nums[i - 1] + 1) gaps.push([nums[i - 1] + 1, nums[i] - 1]);
+  }
+  const firstMissing = gaps.length ? gaps[0][0] : null;
+  const esc = (s) => s.replace(/%/g, '%%');
+  const pattern = path.join(esc(dir), esc(prefix) + (padded ? `%0${digits.length}d` : '%d') + esc(suffix));
+  return {
+    single: false,
+    dir,
+    prefix,
+    suffix,
+    padWidth: padded ? digits.length : 0,
+    pattern,
+    first: firstN,
+    last: lastN,
+    runEnd,
+    count: nums.length,
+    missing: lastN - firstN + 1 - nums.length,
+    firstMissing,
+    gaps,
+    frameName: (n) => prefix + (padded ? String(n).padStart(digits.length, '0') : String(n)) + suffix,
+    ...frameInfo,
+  };
+}
+
+async function ffmpegVersion() {
+  try {
+    const out = await capture(FFMPEG, ['-hide_banner', '-version']);
+    return out.split(/\r?\n/)[0];
+  } catch (e) {
+    return null;
+  }
+}
+
+module.exports = { FFMPEG, FFPROBE, IMAGE_EXT, isImagePath, UserError, capture, parseTime, probe, detectSequence, ffmpegVersion };

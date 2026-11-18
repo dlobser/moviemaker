@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ffmpeg helper</title>
+  <link rel="icon" id="favicon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l10.5-6.5z"/></svg>
+        </div>
+        <div class="brand-text">
+          <b>ffmpeg helper</b>
+          <small id="ffver">connecting…</small>
+        </div>
+      </div>
+      <select id="navSelect" aria-label="Tool"></select>
+      <nav id="nav"></nav>
+    </aside>
+
+    <main class="main">
+      <div class="main-inner">
+        <div id="banner" class="banner" hidden></div>
+        <header class="tool-head">
+          <h1 id="toolName"></h1>
+          <p id="toolDesc"></p>
+        </header>
+        <form id="form" class="form" autocomplete="off" onsubmit="return false"></form>
+
+        <section id="cmdBox" class="cmd-box">
+          <div class="cmd-head">
+            <span>ffmpeg command</span>
+            <button type="button" id="copyCmd" class="btn mini ghost">Copy</button>
+          </div>
+          <div id="notes" class="notes"></div>
+          <div id="cmdErr" class="cmd-err" hidden></div>
+          <pre id="cmd" class="cmd"></pre>
+        </section>
+      </div>
+      <div class="actions" id="actions">
+        <span class="kbd-hint">Ctrl + Enter</span>
+        <button type="button" id="runBtn" class="btn primary run">Run</button>
+      </div>
+    </main>
+
+    <aside class="jobs">
+      <div class="jobs-head">
+        <h2>Jobs <span id="jobCount" class="count" hidden></span></h2>
+        <span id="conn" class="conn" hidden>reconnecting…</span>
+        <button type="button" id="clearJobs" class="btn mini ghost">Clear finished</button>
+      </div>
+      <div id="jobList" class="job-list"></div>
+      <div id="jobsEmpty" class="jobs-empty">Jobs you run show up here with live progress.</div>
+    </aside>
+  </div>
+  <div id="toasts" aria-live="polite"></div>
+  <script src="fx.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

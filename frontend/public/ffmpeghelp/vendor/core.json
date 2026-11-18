@@ -1,0 +1,10 @@
+{
+  "version": "0.12.10",
+  "size": 32232419,
+  "parts": [
+    "ffmpeg-core.1.bin",
+    "ffmpeg-core.2.bin",
+    "ffmpeg-core.3.bin",
+    "ffmpeg-core.4.bin"
+  ]
+}

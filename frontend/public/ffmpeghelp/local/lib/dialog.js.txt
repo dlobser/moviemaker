@@ -1,0 +1,156 @@
+'use strict';
+// Native open/save/folder dialogs. Browsers can't hand us real file paths, so the server pops the OS dialog.
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const EXT = {
+  video: 'mp4;mov;mkv;webm;avi;m4v;wmv;flv;mpg;mpeg;ts;mts;m2ts;3gp;gif',
+  audio: 'mp3;wav;flac;m4a;aac;ogg;oga;opus;wma;aif;aiff;aifc;caf;alac;ape;wv;tta;mka;ac3;eac3;dts;mp2;amr;au;m4b',
+  image: 'png;jpg;jpeg;bmp;tif;tiff;webp;exr;tga;dpx',
+};
+const star = (list) => list.split(';').map((e) => '*.' + e).join(';');
+
+function winFilter(kind) {
+  const all = 'All files|*.*';
+  switch (kind) {
+    case 'video':
+      return `Video files|${star(EXT.video)}|${all}`;
+    case 'audio':
+      return `Audio files|${star(EXT.audio)}|${all}`;
+    case 'image':
+      return `Images|${star(EXT.image)}|${all}`;
+    case 'visual':
+      return `Video or image sequence|${star(EXT.video + ';' + EXT.image)}|Video|${star(EXT.video)}|Images|${star(EXT.image)}|${all}`;
+    case 'media':
+      return `Audio or video|${star(EXT.audio + ';' + EXT.video)}|Audio|${star(EXT.audio)}|Video|${star(EXT.video)}|${all}`;
+    default:
+      if (kind && kind.startsWith('.')) return `${kind.slice(1).toUpperCase()} file|*${kind}|${all}`;
+      return all;
+  }
+}
+
+// Parameters arrive through environment variables, so nothing user-supplied is spliced into the script.
+const PS_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$mode = $env:FFH_MODE
+if ($mode -eq 'save') {
+  $d = New-Object System.Windows.Forms.SaveFileDialog
+  $d.OverwritePrompt = $false
+} else {
+  $d = New-Object System.Windows.Forms.OpenFileDialog
+  $d.Multiselect = ($mode -eq 'many')
+}
+if ($mode -eq 'folder') {
+  $d.ValidateNames = $false
+  $d.CheckFileExists = $false
+  $d.CheckPathExists = $true
+  $d.FileName = 'Select this folder'
+  $d.Filter = 'Folders|*.this-folder'
+} else {
+  $d.Filter = $env:FFH_FILTER
+  if ($env:FFH_NAME) { $d.FileName = $env:FFH_NAME }
+}
+if ($env:FFH_TITLE) { $d.Title = $env:FFH_TITLE }
+if ($env:FFH_DIR) { $d.InitialDirectory = $env:FFH_DIR }
+if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+  if ($mode -eq 'folder') { [System.IO.Path]::GetDirectoryName($d.FileName) }
+  elseif ($mode -eq 'many') { $d.FileNames -join [char]10 }
+  else { $d.FileName }
+}
+$owner.Dispose()
+`;
+
+function runPicker(cmd, args, env) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { env: { ...process.env, ...env } });
+    let out = '';
+    let err = '';
+    p.stdout.setEncoding('utf8');
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (err += d));
+    p.on('error', reject);
+    p.on('close', (code) => {
+      const paths = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      // osascript/zenity exit non-zero when the user cancels.
+      if (code !== 0 && !paths.length && err && !/cancel/i.test(err)) {
+        // PowerShell reports errors as CLIXML when its streams are redirected; keep just the message text.
+        const msgs = [...err.matchAll(/<S S="Error">([^<]*)<\/S>/g)].map((m) => m[1].replace(/_x000D__x000A_/g, ' ').trim());
+        return reject(new Error('File dialog failed: ' + (msgs.join(' ') || err.trim()).slice(0, 300)));
+      }
+      resolve(paths);
+    });
+  });
+}
+
+function initialDir(initial) {
+  if (!initial) return '';
+  try {
+    if (fs.statSync(initial).isDirectory()) return initial;
+  } catch {}
+  const dir = path.dirname(initial);
+  try {
+    if (fs.statSync(dir).isDirectory()) return dir;
+  } catch {}
+  return '';
+}
+
+let busy = false;
+
+/**
+ * @param {{mode: 'open'|'many'|'folder'|'save', filter?: string, initial?: string, title?: string}} o
+ * @returns {Promise<string[]>} chosen paths, empty if cancelled
+ */
+async function pick(o) {
+  if (busy) throw new Error('A file dialog is already open (it may be behind this window).');
+  busy = true;
+  try {
+    const mode = ['open', 'many', 'folder', 'save'].includes(o.mode) ? o.mode : 'open';
+    const dir = initialDir(o.initial);
+    const name = mode === 'save' && o.initial ? path.basename(o.initial) : '';
+    const title = o.title || '';
+
+    if (process.platform === 'win32') {
+      const encoded = Buffer.from(PS_SCRIPT, 'utf16le').toString('base64');
+      return await runPicker('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+        FFH_MODE: mode,
+        FFH_FILTER: winFilter(mode === 'save' ? path.extname(name).toLowerCase() || o.filter : o.filter),
+        FFH_DIR: dir,
+        FFH_NAME: name,
+        FFH_TITLE: title,
+      });
+    }
+
+    if (process.platform === 'darwin') {
+      const q = (s) => '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+      const loc = dir ? ` default location (POSIX file ${q(dir)})` : '';
+      const prompt = title ? ` with prompt ${q(title)}` : '';
+      let script;
+      if (mode === 'folder') script = `POSIX path of (choose folder${prompt}${loc})`;
+      else if (mode === 'save') script = `POSIX path of (choose file name${prompt}${loc} default name ${q(name || 'output')})`;
+      else if (mode === 'many')
+        script = `set fs to (choose file${prompt}${loc} with multiple selections allowed)\nset out to ""\nrepeat with f in fs\nset out to out & POSIX path of f & linefeed\nend repeat\nreturn out`;
+      else script = `POSIX path of (choose file${prompt}${loc})`;
+      return await runPicker('osascript', ['-e', script], {});
+    }
+
+    const args = ['--file-selection'];
+    if (title) args.push(`--title=${title}`);
+    if (mode === 'folder') args.push('--directory');
+    if (mode === 'many') args.push('--multiple', '--separator=\n');
+    if (mode === 'save') args.push('--save');
+    if (dir || name) args.push(`--filename=${path.join(dir || '.', name || '')}${name ? '' : path.sep}`);
+    return await runPicker('zenity', args, {});
+  } finally {
+    busy = false;
+  }
+}
+
+module.exports = { pick };

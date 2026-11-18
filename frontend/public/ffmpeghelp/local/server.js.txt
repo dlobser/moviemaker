@@ -1,0 +1,284 @@
+'use strict';
+// ffmpeg helper — local web UI for common ffmpeg jobs. Zero dependencies: `node server.js`.
+const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const media = require('./lib/media');
+const { buildPlan, UserError } = require('./lib/ops');
+const { Jobs } = require('./lib/jobs');
+const { pick } = require('./lib/dialog');
+
+const PUBLIC = path.join(__dirname, 'public');
+const APP_TMP = path.join(os.tmpdir(), 'ffmpeg-helper');
+const START_PORT = Number(process.env.PORT) || 8642;
+const NO_OPEN = process.argv.includes('--no-open');
+let port = START_PORT;
+
+const jobs = new Jobs({ concurrency: Number(process.env.FFH_CONCURRENCY) || 2 });
+const versionP = media.ffmpegVersion();
+
+// ---------------------------------------------------------------- helpers
+
+const STATIC_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const MEDIA_TYPES = {
+  '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.bmp': 'image/bmp',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.flac': 'audio/flac', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.ogg': 'audio/ogg', '.opus': 'audio/ogg',
+};
+
+function json(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(body);
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > 5e6) {
+        reject(new UserError('Request too large'));
+        req.destroy();
+      } else chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {});
+      } catch {
+        reject(new UserError('Bad JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+const clean = (p) => (typeof p === 'string' ? p.trim().replace(/^"(.*)"$/, '$1') : '');
+
+// Only this UI may call the API: block other hosts (DNS rebinding) and cross-site requests.
+function hostOk(req) {
+  const host = (req.headers.host || '').toLowerCase();
+  return [`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`].includes(host);
+}
+function sameOrigin(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') return false;
+  const origin = req.headers.origin;
+  return !origin || origin === `http://${req.headers.host}`;
+}
+
+function serveStatic(req, res, pathname) {
+  const rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+  const file = path.join(PUBLIC, rel);
+  if (!file.startsWith(PUBLIC + path.sep)) return json(res, 403, { error: 'Forbidden' });
+  fs.readFile(file, (err, data) => {
+    if (err) return json(res, 404, { error: 'Not found' });
+    res.writeHead(200, { 'Content-Type': STATIC_TYPES[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+    res.end(data);
+  });
+}
+
+/** Streams a local media file (with Range support so <video>/<audio> can seek). */
+function serveFile(req, res, file) {
+  file = clean(file);
+  const type = MEDIA_TYPES[path.extname(file).toLowerCase()];
+  if (!file || !type) return json(res, 403, { error: 'Only media files can be previewed' });
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) return json(res, 404, { error: 'File not found' });
+    const headers = { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
+    const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    if (m && (m[1] || m[2])) {
+      let start = m[1] ? parseInt(m[1], 10) : st.size - parseInt(m[2], 10);
+      let end = m[1] && m[2] ? parseInt(m[2], 10) : st.size - 1;
+      start = Math.max(0, start);
+      end = Math.min(end, st.size - 1);
+      if (start > end) {
+        res.writeHead(416, { 'Content-Range': `bytes */${st.size}` });
+        return res.end();
+      }
+      res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${st.size}`, 'Content-Length': end - start + 1 });
+      fs.createReadStream(file, { start, end }).pipe(res);
+    } else {
+      res.writeHead(200, { ...headers, 'Content-Length': st.size });
+      fs.createReadStream(file).pipe(res);
+    }
+  });
+}
+
+function detached(cmd, args, opts = {}) {
+  const p = spawn(cmd, args, { detached: true, stdio: 'ignore', ...opts });
+  p.on('error', () => {});
+  p.unref();
+}
+
+function reveal(p) {
+  const isDir = fs.existsSync(p) && fs.statSync(p).isDirectory();
+  if (!fs.existsSync(p)) p = path.dirname(p);
+  if (process.platform === 'win32') detached('explorer.exe', [isDir ? `"${p}"` : `/select,"${p}"`], { windowsVerbatimArguments: true });
+  else if (process.platform === 'darwin') detached('open', isDir ? [p] : ['-R', p]);
+  else detached('xdg-open', [isDir ? p : path.dirname(p)]);
+}
+
+function openFile(p) {
+  if (!MEDIA_TYPES[path.extname(p).toLowerCase()] || !fs.existsSync(p)) throw new UserError('Can only open existing media files');
+  if (process.platform === 'win32') detached('explorer.exe', [`"${p}"`], { windowsVerbatimArguments: true });
+  else detached(process.platform === 'darwin' ? 'open' : 'xdg-open', [p]);
+}
+
+// ---------------------------------------------------------------- server-sent events
+
+const clients = new Set();
+function broadcast(event, data) {
+  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) res.write(msg);
+}
+jobs.on('job', (j) => broadcast('job', j));
+setInterval(() => {
+  for (const res of clients) res.write(': ping\n\n');
+}, 20000).unref();
+
+// ---------------------------------------------------------------- API
+
+async function api(req, res, url) {
+  const route = url.pathname;
+  if (req.method === 'GET') {
+    if (route === '/api/config') {
+      return json(res, 200, { version: await versionP, platform: process.platform, sep: path.sep, home: os.homedir(), concurrency: jobs.concurrency });
+    }
+    if (route === '/api/events') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.write(`event: snapshot\ndata: ${JSON.stringify(jobs.list())}\n\n`);
+      clients.add(res);
+      req.on('close', () => clients.delete(res));
+      return;
+    }
+    if (route === '/api/file') return serveFile(req, res, url.searchParams.get('path'));
+    const lm = route.match(/^\/api\/jobs\/(\w+)\/log$/);
+    if (lm) {
+      const job = jobs.jobs.get(lm[1]);
+      if (!job) return json(res, 404, { error: 'No such job' });
+      return json(res, 200, { commands: job.commands, log: job.log });
+    }
+    return json(res, 404, { error: 'Not found' });
+  }
+
+  if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
+  // JSON content type forces a CORS preflight for any cross-site caller.
+  if (!/^application\/json/i.test(req.headers['content-type'] || '')) return json(res, 415, { error: 'Expected JSON' });
+  const body = await readJson(req);
+
+  switch (route) {
+    case '/api/probe':
+      return json(res, 200, await media.probe(clean(body.path)));
+    case '/api/sequence':
+      return json(res, 200, await media.detectSequence(clean(body.path)));
+    case '/api/command':
+      try {
+        const plan = await buildPlan(body.op, body.params, { tmpRoot: APP_TMP });
+        return json(res, 200, { commands: plan.commands, notes: plan.notes || [], outputs: plan.outputs });
+      } catch (e) {
+        return json(res, 200, { error: e.message });
+      }
+    case '/api/jobs': {
+      const plan = await buildPlan(body.op, body.params, { tmpRoot: APP_TMP });
+      if (!body.overwrite) {
+        const check = plan.checkExists || plan.outputs;
+        const exists = check.filter((p) => fs.existsSync(p));
+        if (exists.length) return json(res, 409, { exists });
+      }
+      return json(res, 200, { job: jobs.public(jobs.create(plan, body.op)) });
+    }
+    case '/api/jobs/clear':
+      jobs.clearFinished();
+      broadcast('snapshot', jobs.list());
+      return json(res, 200, { ok: true });
+    case '/api/pick':
+      return json(res, 200, { paths: await pick(body) });
+    case '/api/reveal':
+      if (!clean(body.path)) throw new UserError('No path');
+      reveal(clean(body.path));
+      return json(res, 200, { ok: true });
+    case '/api/open':
+      openFile(clean(body.path));
+      return json(res, 200, { ok: true });
+  }
+  const cm = route.match(/^\/api\/jobs\/(\w+)\/cancel$/);
+  if (cm) return json(res, 200, { ok: jobs.cancel(cm[1]) });
+  return json(res, 404, { error: 'Not found' });
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (!hostOk(req)) return json(res, 403, { error: 'Forbidden host' });
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname.startsWith('/api/')) {
+      if (!sameOrigin(req)) return json(res, 403, { error: 'Cross-origin request blocked' });
+      return await api(req, res, url);
+    }
+    if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+    return serveStatic(req, res, url.pathname);
+  } catch (e) {
+    if (!(e instanceof UserError)) console.error(e);
+    if (!res.headersSent) json(res, 400, { error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------- startup
+
+function cleanTemp() {
+  // Remove leftovers from earlier runs (older than a day) in our own temp folder.
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  for (const dir of [APP_TMP, path.join(APP_TMP, 'waves')]) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e);
+      try {
+        const st = fs.statSync(p);
+        if (e !== 'waves' && st.mtimeMs < cutoff) fs.rmSync(p, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+}
+
+function openBrowser(url) {
+  if (process.platform === 'win32') detached('cmd', ['/c', 'start', '""', `"${url}"`], { windowsVerbatimArguments: true });
+  else detached(process.platform === 'darwin' ? 'open' : 'xdg-open', [url]);
+}
+
+function listen() {
+  server.once('error', (e) => {
+    if (e.code === 'EADDRINUSE' && port < START_PORT + 20) {
+      port++;
+      return listen();
+    }
+    console.error(e.message);
+    process.exit(1);
+  });
+  server.listen(port, '127.0.0.1', async () => {
+    const url = `http://127.0.0.1:${port}/`;
+    const v = await versionP;
+    console.log(`\n  ffmpeg helper  →  ${url}`);
+    console.log(v ? `  ${v}` : '  ⚠ ffmpeg was not found on PATH (set FFMPEG_PATH / FFPROBE_PATH)');
+    console.log('  Press Ctrl+C to stop.\n');
+    if (!NO_OPEN) openBrowser(url);
+  });
+}
+
+function shutdown() {
+  jobs.cancelAll();
+  setTimeout(() => process.exit(0), 300);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+fs.mkdirSync(APP_TMP, { recursive: true });
+cleanTemp();
+listen();

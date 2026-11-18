@@ -1,0 +1,33 @@
+/* Web version (ffmpeg.wasm) additions. Uses the color tokens from style.css. */
+
+.web-load {
+  display: flex; flex-direction: column; gap: 8px;
+  margin-bottom: 18px; padding: 12px 14px; border-radius: 10px;
+  border: 1px solid var(--border-strong); background: var(--surface-2);
+  font-size: 13px; color: var(--text-2);
+}
+.web-load.err { border-color: rgba(255, 107, 107, 0.4); background: rgba(255, 107, 107, 0.08); color: var(--text); }
+
+.web-get {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; margin: 0 0 6px; padding: 7px 10px;
+  border: 1px dashed var(--border-strong); border-radius: 8px; background: none;
+  color: var(--text-2); font-size: 12.5px; text-align: left;
+}
+.web-get:hover { border-color: var(--accent); color: var(--text); }
+.web-get .ico svg { width: 16px; height: 16px; }
+
+.toast a { color: inherit; font-weight: 600; text-decoration: underline; }
+
+/* Read-only "chosen file" fields act like a button. */
+body.web .pathrow input[readonly] { cursor: pointer; }
+
+.local { max-width: 640px; }
+.local-get { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 8px; }
+.local-get .btn.primary { display: inline-flex; align-items: center; gap: 8px; padding: 10px 16px; }
+.local h3 { margin: 22px 0 8px; font-size: 14px; }
+.local ul, .local ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; color: var(--text-2); }
+.local li b { color: var(--text); font-weight: 600; }
+.local p { margin: 12px 0 0; }
+.local code { font-family: var(--mono); font-size: 12.5px; padding: 1px 5px; border-radius: 5px; background: var(--surface-3); color: var(--text); }
+.local a { color: var(--accent); }

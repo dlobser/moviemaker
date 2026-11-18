@@ -1,0 +1,1427 @@
+'use strict';
+// Each operation turns form params into a plan: one or more ffmpeg steps plus progress estimators.
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { UserError, IMAGE_EXT, parseTime, isImagePath, probe, detectSequence } = require('./media');
+const FX = require('../public/fx');
+
+// ---------------------------------------------------------------- helpers
+
+const blank = (v) => v === undefined || v === null || String(v).trim() === '';
+const cleanPath = (v) => (blank(v) ? '' : String(v).trim().replace(/^"(.*)"$/, '$1'));
+const base = (p) => path.basename(p);
+/** Compact decimal for ffmpeg args/filters. */
+const f = (n) => String(+(+n).toFixed(6));
+
+function num(v, name, { def, min = -Infinity, max = Infinity, int = false } = {}) {
+  if (blank(v)) {
+    if (def === undefined) throw new UserError(`${name} is required`);
+    return def;
+  }
+  const n = Number(String(v).trim());
+  if (!Number.isFinite(n)) throw new UserError(`${name} must be a number`);
+  if (int && !Number.isInteger(n)) throw new UserError(`${name} must be a whole number`);
+  if (n < min || n > max) throw new UserError(`${name} must be between ${min} and ${max}`);
+  return n;
+}
+
+function time(v, name) {
+  try {
+    return parseTime(v);
+  } catch (e) {
+    throw new UserError(`${name}: ${e.message}`);
+  }
+}
+
+function fmtDur(s) {
+  if (s == null || !Number.isFinite(s)) return '?';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s - h * 3600 - m * 60;
+  const ss = sec.toFixed(sec < 10 && h === 0 && m === 0 ? 2 : 1).padStart(h || m ? 4 : 1, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : m ? `${m}:${ss}` : `${ss}s`;
+}
+
+function inFile(v, name = 'an input file') {
+  const p = cleanPath(v);
+  if (!p) throw new UserError(`Choose ${name}`);
+  return p;
+}
+
+function outFile(v, name = 'Output file') {
+  const p = cleanPath(v);
+  if (!p) throw new UserError(`Choose an output file`);
+  if (!path.isAbsolute(p)) throw new UserError(`${name} must be a full path (e.g. C:\\videos\\out.mp4)`);
+  if (!path.extname(p)) throw new UserError(`${name} needs a file extension`);
+  return path.resolve(p);
+}
+
+function outDir(v) {
+  const p = cleanPath(v);
+  if (!p) throw new UserError('Choose an output folder');
+  if (!path.isAbsolute(p)) throw new UserError('Output folder must be a full path');
+  return path.resolve(p);
+}
+
+const safeName = (s) => String(s || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+const extOf = (p) => path.extname(p).toLowerCase();
+const hexColor = (c, fallback = '000000') => '0x' + (/^#?[0-9a-f]{6}$/i.test(c || '') ? c.replace('#', '') : fallback);
+
+// progress estimators: state -> fraction (or null when unknown)
+const byTime = (d) => (s) => (d > 0 ? s.outTime / d : null);
+const byFrames = (n) => (s) => (n > 0 ? s.frame / n : null);
+
+// ---------------------------------------------------------------- codecs
+
+const VCODEC = {
+  h264: { name: 'H.264', exts: ['.mp4', '.mov', '.mkv', '.m4v'] },
+  h265: { name: 'H.265', exts: ['.mp4', '.mov', '.mkv', '.m4v'] },
+  vp9: { name: 'VP9', exts: ['.webm', '.mkv', '.mp4'] },
+  av1: { name: 'AV1', exts: ['.mp4', '.mkv', '.webm'] },
+  prores: { name: 'ProRes', exts: ['.mov', '.mkv'] },
+};
+
+function vcodecOf(p, out) {
+  const c = p.vcodec || 'h264';
+  if (!VCODEC[c]) throw new UserError(`Unknown codec ${c}`);
+  if (out && !VCODEC[c].exts.includes(extOf(out)))
+    throw new UserError(`${VCODEC[c].name} can't be saved as ${extOf(out) || 'that file type'} — use ${VCODEC[c].exts.join(', ')}`);
+  return c;
+}
+
+function videoEnc(p) {
+  const c = p.vcodec || 'h264';
+  const crf = (def, max) => String(num(p.crf, 'Quality (CRF)', { def, min: 0, max, int: true }));
+  switch (c) {
+    case 'h264':
+      return ['-c:v', 'libx264', '-preset', p.preset || 'medium', '-crf', crf(20, 51), '-pix_fmt', 'yuv420p'];
+    case 'h265':
+      return ['-c:v', 'libx265', '-preset', p.preset || 'medium', '-crf', crf(24, 51), '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1', '-x265-params', 'log-level=error'];
+    case 'vp9':
+      return ['-c:v', 'libvpx-vp9', '-crf', crf(32, 63), '-b:v', '0', '-row-mt', '1', '-deadline', 'good', '-cpu-used', '2', '-pix_fmt', p.alpha ? 'yuva420p' : 'yuv420p'];
+    case 'av1':
+      return ['-c:v', 'libsvtav1', '-crf', crf(35, 63), '-preset', '8', '-pix_fmt', 'yuv420p'];
+    case 'prores': {
+      const prof = num(p.proresProfile, 'ProRes profile', { def: 3, min: 0, max: 5, int: true });
+      const pix = prof >= 4 ? (p.alpha ? 'yuva444p10le' : 'yuv444p10le') : 'yuv422p10le';
+      return ['-c:v', 'prores_ks', '-profile:v', String(prof), '-pix_fmt', pix, '-vendor', 'apl0'];
+    }
+  }
+  throw new UserError(`Unknown codec ${c}`);
+}
+
+/** Resize filter. Most codecs need even dimensions, so odd sizes get rounded down. */
+function scaleFilter(p, even = true) {
+  let w = blank(p.width) ? null : num(p.width, 'Width', { min: 2, max: 16384, int: true });
+  let h = blank(p.height) ? null : num(p.height, 'Height', { min: 2, max: 16384, int: true });
+  if (w || h) {
+    if (even) {
+      if (w) w -= w % 2;
+      if (h) h -= h % 2;
+    }
+    return `scale=${w || (even ? -2 : -1)}:${h || (even ? -2 : -1)}:flags=lanczos`;
+  }
+  return even ? 'scale=trunc(iw/2)*2:trunc(ih/2)*2' : null;
+}
+
+const containerFlags = (out) => (['.mp4', '.mov', '.m4v'].includes(extOf(out)) ? ['-movflags', '+faststart'] : []);
+
+function bitrate(v, def) {
+  if (blank(v)) return `${def}k`;
+  const m = String(v).trim().match(/^(\d+)\s*k?$/i);
+  if (!m) throw new UserError('Bitrate should look like 192k');
+  return `${m[1]}k`;
+}
+
+/** Audio codec for an audio-only output, chosen by file extension. */
+function audioEncFor(out, p = {}) {
+  switch (extOf(out)) {
+    case '.mp3':
+      return ['-c:a', 'libmp3lame', '-b:a', bitrate(p.abitrate, 192)];
+    case '.wav':
+      return ['-c:a', p.format === 'wav24' ? 'pcm_s24le' : 'pcm_s16le'];
+    case '.aif':
+    case '.aiff':
+      return ['-c:a', p.format === 'wav24' ? 'pcm_s24be' : 'pcm_s16be'];
+    case '.flac':
+      return ['-c:a', 'flac'];
+    case '.m4a':
+    case '.aac':
+      return ['-c:a', 'aac', '-b:a', bitrate(p.abitrate, 192)];
+    case '.ogg':
+    case '.opus':
+      return ['-c:a', 'libopus', '-b:a', bitrate(p.abitrate, 160)];
+  }
+  throw new UserError(`Unsupported audio file type ${extOf(out)} — use .mp3, .wav, .flac, .m4a or .ogg`);
+}
+
+/** Audio codec for the audio track inside a video container. */
+const videoAudioEnc = (out, br) =>
+  extOf(out) === '.webm' ? ['-c:a', 'libopus', '-b:a', bitrate(br, 128)] : ['-c:a', 'aac', '-b:a', bitrate(br, 192)];
+
+/** Native VP8/VP9 decoders drop WebM alpha; libvpx keeps it. */
+function decoderArgs(info) {
+  if (info && info.video && info.video.alphaMode) {
+    if (info.video.codec === 'vp9') return ['-c:v', 'libvpx-vp9'];
+    if (info.video.codec === 'vp8') return ['-c:v', 'libvpx'];
+  }
+  return [];
+}
+
+function atempo(speed) {
+  const parts = [];
+  let s = speed;
+  while (s > 2) {
+    parts.push('atempo=2');
+    s /= 2;
+  }
+  while (s < 0.5) {
+    parts.push('atempo=0.5');
+    s /= 0.5;
+  }
+  parts.push(`atempo=${f(s)}`);
+  return parts.join(',');
+}
+
+/** Start/end (seconds) within a media file, validated against its duration. */
+function range(p, info) {
+  const S = time(p.start, 'Start') || 0;
+  const E = time(p.end, 'End');
+  const total = info.duration;
+  if (E != null && E <= S) throw new UserError('End must be after start');
+  if (total != null && S >= total) throw new UserError(`Start is past the end of the file (${fmtDur(total)})`);
+  const end = E != null && total != null ? Math.min(E, total) : E;
+  const D = end != null ? end - S : total != null ? total - S : null;
+  const args = [];
+  if (S > 0) args.push('-ss', f(S));
+  if (E != null) args.push('-t', f(E - S));
+  return { S, E: end, D, args };
+}
+
+/**
+ * A "visual" input is either a video or a numbered image sequence (any frame picked).
+ * Returns the input args plus duration/frames/size for progress and layout maths.
+ */
+async function visualInput(p, ctx, { defaultFps = 24 } = {}) {
+  const file = inFile(p.input);
+  if (isImagePath(file)) {
+    const seq = await ctx.sequence(file);
+    const fps = num(p.inFps, 'Sequence frame rate', { def: defaultFps, min: 0.01, max: 1000 });
+    const start = num(p.startFrame, 'Start frame', { def: seq.first, int: true });
+    const end = num(p.endFrame, 'End frame', { def: seq.runEnd, int: true });
+    if (start < seq.first || start > seq.last) throw new UserError(`Start frame must be between ${seq.first} and ${seq.last}`);
+    if (end < start) throw new UserError('End frame must be after the start frame');
+    if (end > seq.last) throw new UserError(`End frame can't be after the last frame (${seq.last})`);
+    const gap = (seq.gaps || []).find(([a, b]) => a <= end && b >= start);
+    if (gap) throw new UserError(`Frame ${gap[0]} is missing — ffmpeg stops at gaps. Set End frame to ${gap[0] - 1} or fill the gap.`);
+    const n = end - start + 1;
+    const args = [];
+    if (extOf(file) === '.exr') args.push('-apply_trc', 'iec61966_2_1'); // linear EXR -> sRGB
+    // -t bounds reading to the chosen range (half a frame of slack avoids float rounding).
+    args.push('-framerate', f(fps), '-start_number', String(start), '-t', f((n - 0.5) / fps), '-i', seq.pattern);
+    return { kind: 'seq', file, seq, args, frames: n, duration: n / fps, fps, width: seq.width, height: seq.height, hasAlpha: seq.hasAlpha, hasAudio: false };
+  }
+  const info = await ctx.probe(file);
+  if (!info.video) throw new UserError('Input has no video stream');
+  const r = range(p, { duration: info.video.duration || info.duration });
+  const fps = info.video.fps;
+  return {
+    kind: 'video',
+    file,
+    info,
+    args: [...decoderArgs(info), ...r.args, '-i', file],
+    duration: r.D,
+    start: r.S,
+    frames: r.D && fps ? Math.round(r.D * fps) : null,
+    fps,
+    width: info.video.width,
+    height: info.video.height,
+    hasAlpha: info.video.hasAlpha,
+    hasAudio: !!info.audio,
+  };
+}
+
+// ---------------------------------------------------------------- operations
+
+const OPS = {};
+
+OPS.seq2video = {
+  async build(p, ctx) {
+    const file = inFile(p.input, 'the first image of the sequence');
+    if (!isImagePath(file)) throw new UserError('Input must be an image (png, jpg, tif, exr, …)');
+    const vin = await visualInput({ ...p, inFps: p.fps }, ctx);
+    const out = outFile(p.output);
+    vcodecOf(p, out);
+    const args = [...vin.args, '-frames:v', String(vin.frames)];
+    const vf = scaleFilter(p);
+    if (vf) args.push('-vf', vf);
+    args.push(...videoEnc(p), ...containerFlags(out), out);
+    return {
+      title: `Images → ${base(out)}`,
+      inputs: [file],
+      outputs: [out],
+      notes: [`${vin.frames} frames at ${f(vin.fps)} fps → ${fmtDur(vin.duration)}`],
+      steps: [{ args, progress: byFrames(vin.frames), outputs: [out] }],
+    };
+  },
+};
+
+OPS.convert = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.video) throw new UserError('Input has no video stream (use Extract Audio for audio files)');
+    const out = outFile(p.output);
+    const codec = vcodecOf(p, out);
+    const speed = num(p.speed, 'Speed', { def: 1, min: 0.25, max: 8 });
+    const fps = blank(p.fps) ? null : num(p.fps, 'Frame rate', { min: 1, max: 240 });
+    const D = info.duration != null ? info.duration / speed : null;
+    const vf = [];
+    if (speed !== 1) vf.push(`setpts=PTS/${f(speed)}`);
+    if (fps) vf.push(`fps=${f(fps)}`);
+    const sc = scaleFilter(p);
+    if (sc) vf.push(sc);
+    const mute = !!p.mute || !info.audio;
+    const input = [...decoderArgs(info), '-i', file, '-map', '0:v:0', ...(mute ? [] : ['-map', '0:a:0'])];
+    const vfa = vf.length ? ['-vf', vf.join(',')] : [];
+    const audio = mute ? ['-an'] : [...(speed !== 1 ? ['-af', atempo(speed)] : []), ...videoAudioEnc(out, p.abitrate)];
+    const notes = [];
+    if (D) notes.push(`Output length ${fmtDur(D)}`);
+
+    if (p.qmode === 'size') {
+      if (codec !== 'h264') throw new UserError('Target-size mode uses H.264 — switch the codec to H.264');
+      if (!D) throw new UserError("Can't read the duration, so a target size can't be computed");
+      const mb = num(p.targetMB, 'Target size (MB)', { min: 0.1, max: 1e6 });
+      const abr = mute ? 0 : parseInt(bitrate(p.abitrate, 192), 10);
+      // ~4% headroom for container overhead
+      const vk = Math.floor(((mb * 1024 * 1024 * 8) / 1000 / D) * 0.96 - abr);
+      if (vk < 30) throw new UserError(`${mb} MB is too small for ${fmtDur(D)} of video (≈${vk} kbps)`);
+      const passlog = ctx.tmp('2pass');
+      const enc = ['-c:v', 'libx264', '-preset', p.preset || 'medium', '-b:v', `${vk}k`, '-pix_fmt', 'yuv420p'];
+      notes.push(`2-pass H.264 at ≈${vk} kbps video${abr ? ` + ${abr} kbps audio` : ''}`);
+      return {
+        title: `Compress → ${base(out)}`,
+        inputs: [file],
+        outputs: [out],
+        notes,
+        steps: [
+          { label: 'Pass 1 of 2', args: [...input, ...vfa, ...enc, '-pass', '1', '-passlogfile', passlog, '-an', '-f', 'null', '-'], progress: byTime(D) },
+          { label: 'Pass 2 of 2', args: [...input, ...vfa, ...enc, '-pass', '2', '-passlogfile', passlog, ...audio, ...containerFlags(out), out], progress: byTime(D), weight: 1.3, outputs: [out] },
+        ],
+      };
+    }
+    const args = [...input, ...vfa, ...videoEnc(p), ...audio, ...containerFlags(out), out];
+    return { title: `Convert → ${base(out)}`, inputs: [file], outputs: [out], notes, steps: [{ args, progress: byTime(D), outputs: [out] }] };
+  },
+};
+
+OPS.trim = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    const out = outFile(p.output);
+    const { S, E, D } = range(p, info);
+    const hasVideo = !!info.video;
+    if (!hasVideo && !info.audio) throw new UserError('Input has no audio or video');
+    const title = `Trim → ${base(out)}`;
+    if (p.mode !== 'reencode') {
+      const args = [];
+      if (S > 0) args.push('-ss', f(S));
+      args.push('-i', file);
+      if (E != null) args.push('-t', f(E - S));
+      args.push(...(hasVideo ? ['-map', '0:v:0', '-map', '0:a?'] : ['-map', '0:a']), '-c', 'copy', '-avoid_negative_ts', 'make_zero', ...containerFlags(out), out);
+      return {
+        title,
+        inputs: [file],
+        outputs: [out],
+        notes: [`${fmtDur(D)} clip${hasVideo ? ' · fast mode cuts on keyframes, so the start can land slightly early' : ''}`],
+        steps: [{ args, progress: byTime(D), outputs: [out] }],
+      };
+    }
+    const fi = num(p.fadeIn, 'Fade in', { def: 0, min: 0 });
+    const fo = num(p.fadeOut, 'Fade out', { def: 0, min: 0 });
+    if ((fi || fo) && !D) throw new UserError("Can't fade without knowing the clip length — set an End time");
+    if (fi + fo > D) throw new UserError('Fades are longer than the clip');
+    const args = [...decoderArgs(info)];
+    if (S > 0) args.push('-ss', f(S));
+    if (E != null) args.push('-t', f(E - S));
+    args.push('-i', file);
+    const af = [];
+    if (fi) af.push(`afade=t=in:st=0:d=${f(fi)}`);
+    if (fo) af.push(`afade=t=out:st=${f(D - fo)}:d=${f(fo)}`);
+    if (hasVideo) {
+      vcodecOf(p, out);
+      const vf = [];
+      if (fi) vf.push(`fade=t=in:st=0:d=${f(fi)}`);
+      if (fo) vf.push(`fade=t=out:st=${f(D - fo)}:d=${f(fo)}`);
+      const sc = scaleFilter(p);
+      if (sc) vf.push(sc);
+      args.push('-map', '0:v:0');
+      if (info.audio) args.push('-map', '0:a:0');
+      args.push('-vf', vf.join(','), ...videoEnc(p));
+      if (info.audio) args.push(...(af.length ? ['-af', af.join(',')] : []), ...videoAudioEnc(out, p.abitrate));
+    } else {
+      args.push('-map', '0:a:0', ...(af.length ? ['-af', af.join(',')] : []), ...audioEncFor(out, p));
+    }
+    args.push(...containerFlags(out), out);
+    return { title, inputs: [file], outputs: [out], notes: [`${fmtDur(D)} clip, frame-accurate`], steps: [{ args, progress: byTime(D), outputs: [out] }] };
+  },
+};
+
+OPS.addaudio = {
+  async build(p, ctx) {
+    const vfile = inFile(p.video, 'a video');
+    const afile = inFile(p.audio, 'an audio file');
+    const [vi, ai] = await Promise.all([ctx.probe(vfile), ctx.probe(afile)]);
+    if (!vi.video) throw new UserError('The video file has no video stream');
+    if (!ai.audio) throw new UserError('The audio file has no audio stream');
+    const out = outFile(p.output);
+    const offset = num(p.offset, 'Audio offset', { def: 0, min: -36000, max: 36000 });
+    const gain = num(p.gain, 'New audio volume', { def: 0, min: -60, max: 40 });
+    const origGain = num(p.origGain, 'Original audio volume', { def: 0, min: -60, max: 40 });
+    const mix = p.mode === 'mix' && !!vi.audio;
+    const loop = !!p.loop;
+    const endMode = loop ? 'video' : p.endMode || 'video';
+    const vdur = vi.duration;
+
+    const args = ['-i', vfile];
+    if (loop) args.push('-stream_loop', '-1');
+    if (offset < 0) args.push('-ss', f(-offset));
+    args.push('-i', afile);
+
+    const chain = [];
+    if (offset > 0) chain.push(`adelay=${Math.round(offset * 1000)}:all=1`);
+    if (gain) chain.push(`volume=${f(gain)}dB`);
+    const pad = endMode === 'video' ? ',apad' : '';
+    let graph;
+    if (mix) {
+      const dur = endMode === 'video' ? 'first' : endMode;
+      graph = `[1:a]${chain.join(',') || 'anull'}[n];[0:a]${origGain ? `volume=${f(origGain)}dB` : 'anull'}[o];[o][n]amix=inputs=2:duration=${dur}:dropout_transition=0:normalize=0${pad}[a]`;
+    } else {
+      graph = `[1:a]${chain.join(',') || 'anull'}${pad}[a]`;
+    }
+    args.push('-filter_complex', graph, '-map', '0:v:0', '-map', '[a]');
+    if (p.reencode) {
+      vcodecOf(p, out);
+      const sc = scaleFilter(p);
+      if (sc) args.push('-vf', sc);
+      args.push(...videoEnc(p));
+    } else {
+      args.push('-c:v', 'copy');
+    }
+    args.push(...videoAudioEnc(out, p.abitrate));
+    const adur = ai.duration != null ? ai.duration + offset : null;
+    let D = vdur;
+    if (endMode === 'video') {
+      if (vdur) args.push('-t', f(vdur));
+      else args.push('-shortest');
+    } else if (endMode === 'shortest') {
+      args.push('-shortest');
+      D = vdur && adur ? Math.min(vdur, adur) : vdur || adur;
+    } else {
+      D = vdur && adur ? Math.max(vdur, adur) : vdur || adur;
+    }
+    args.push(...containerFlags(out), out);
+    const notes = [];
+    if (p.mode === 'mix' && !vi.audio) notes.push('The video has no audio track, so the new audio simply replaces it.');
+    notes.push(p.reencode ? 'Video is re-encoded.' : 'Video is copied without re-encoding (fast, no quality loss).');
+    return { title: `Add audio → ${base(out)}`, inputs: [vfile, afile], outputs: [out], notes, steps: [{ args, progress: byTime(D), outputs: [out] }] };
+  },
+};
+
+const COPY_EXT = { aac: '.m4a', alac: '.m4a', mp3: '.mp3', opus: '.opus', vorbis: '.ogg', flac: '.flac', ac3: '.ac3', eac3: '.eac3' };
+
+OPS.extract = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.audio) throw new UserError('This file has no audio track');
+    const out = outFile(p.output);
+    const r = range(p, info);
+    const args = [...r.args, '-i', file, '-map', '0:a:0'];
+    if (p.format === 'copy') {
+      args.push('-c:a', 'copy');
+    } else {
+      args.push(...audioEncFor(out, p));
+      if (p.mono) args.push('-ac', '1');
+    }
+    args.push(out);
+    const notes = [`${info.audio.codec} · ${info.audio.sampleRate || '?'} Hz · ${info.audio.channels || '?'} ch → ${p.format === 'copy' ? 'copied as-is' : base(out)}`];
+    return { title: `Extract audio → ${base(out)}`, inputs: [file], outputs: [out], notes, steps: [{ args, progress: byTime(r.D), outputs: [out] }] };
+  },
+};
+
+/**
+ * Convert Audio targets. rates/maxCh: what the encoder accepts (anything else is resampled or mixed down);
+ * cover: the container can hold cover art; pcm: byte order of an uncompressed format.
+ */
+const AFMT = {
+  mp3: { name: 'MP3', ext: '.mp3', rates: [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000], maxCh: 2, cover: true },
+  wav: { name: 'WAV', ext: '.wav', pcm: 'le', lossless: true },
+  flac: { name: 'FLAC', ext: '.flac', cover: true, lossless: true },
+  m4a: { name: 'AAC', ext: '.m4a', rates: [7350, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000], cover: true },
+  opus: { name: 'Opus', ext: '.opus', rates: [8000, 12000, 16000, 24000, 48000] },
+  ogg: { name: 'Ogg Vorbis', ext: '.ogg' },
+  aiff: { name: 'AIFF', ext: '.aiff', pcm: 'be', lossless: true },
+  alac: { name: 'Apple Lossless', ext: '.m4a', cover: true, lossless: true },
+  wma: { name: 'WMA', ext: '.wma', rates: [8000, 11025, 16000, 22050, 32000, 44100, 48000], maxCh: 2 },
+  ac3: { name: 'AC3', ext: '.ac3', rates: [32000, 44100, 48000], maxCh: 6 },
+};
+const LOSSY_NAMES = { mp3: 'MP3', mp2: 'MP2', aac: 'AAC', opus: 'Opus', vorbis: 'Vorbis', wmav1: 'WMA', wmav2: 'WMA', wmapro: 'WMA', ac3: 'AC3', eac3: 'E-AC3', dts: 'DTS', amr_nb: 'AMR', amr_wb: 'AMR' };
+// libvorbis' bitrate mode rejects many rate/channel combinations (all of 96 kHz), so Vorbis uses quality mode:
+// these are the nominal kbps of -q:a 0…9.
+const VORBIS_KBPS = [64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const vorbisQ = (p) => VORBIS_KBPS.indexOf(nearest(VORBIS_KBPS, parseInt(bitrate(p.abitrate, 192), 10)));
+const khz = (r) => `${r / 1000} kHz`;
+const nearest = (list, r) => list.reduce((a, b) => (Math.abs(b - r) < Math.abs(a - r) ? b : a));
+
+/** '16' | '24' | '32' | '32f' — lossy sources count as 16-bit, like a CD rip. */
+function sourceDepth(a) {
+  if (/^pcm_f/.test(a.codec)) return '32f';
+  if (/^pcm_s32/.test(a.codec)) return '32';
+  return a.bits > 16 && !LOSSY_NAMES[a.codec] ? '24' : '16';
+}
+
+function convertEnc(key, p, depth) {
+  const pcm = AFMT[key].pcm;
+  if (pcm) return ['-c:a', `pcm_${depth === '32f' ? 'f32' : 's' + depth}${pcm}`];
+  switch (key) {
+    case 'mp3': {
+      const vbr = /^v(\d)$/.exec(p.mp3q || '');
+      return ['-c:a', 'libmp3lame', ...(vbr ? ['-q:a', vbr[1]] : ['-b:a', bitrate(p.mp3q, 192)]), '-id3v2_version', '3'];
+    }
+    case 'flac':
+      return ['-c:a', 'flac', '-sample_fmt', depth === '16' ? 's16' : 's32'];
+    case 'alac':
+      return ['-c:a', 'alac', '-sample_fmt', depth === '16' ? 's16p' : 's32p'];
+    case 'ogg':
+      return ['-c:a', 'libvorbis', '-q:a', String(vorbisQ(p))];
+  }
+  const codec = { m4a: 'aac', opus: 'libopus', wma: 'wmav2', ac3: 'ac3' }[key];
+  return ['-c:a', codec, '-b:a', bitrate(p.abitrate, 192)];
+}
+
+OPS.audioconvert = {
+  async build(p, ctx) {
+    const files = (Array.isArray(p.files) ? p.files : []).map(cleanPath).filter(Boolean);
+    if (!files.length) throw new UserError('Add one or more audio files');
+    files.forEach((x, i) => {
+      if (files.findIndex((y) => samePath(x, y)) !== i) throw new UserError(`${base(x)} is in the list twice`);
+    });
+    const key = p.format === 'other' ? 'other' : AFMT[p.format] ? p.format : 'mp3';
+    let fmt = AFMT[key];
+    if (key === 'other') {
+      const e = String(p.otherExt || '').trim().replace(/^\*?\./, '').toLowerCase();
+      if (!e) throw new UserError('Type the file extension to convert to (e.g. wv, caf, mka)');
+      if (!/^[a-z0-9]{1,8}$/.test(e)) throw new UserError('The extension should be just letters and numbers, like wv or caf');
+      fmt = { name: `.${e}`, ext: `.${e}` };
+    }
+    const folder = blank(p.folder) ? null : outDir(p.folder);
+    const rate = blank(p.rate) ? null : num(p.rate, 'Sample rate', { min: 1000, max: 768000, int: true });
+    const chans = blank(p.channels) ? null : num(p.channels, 'Channels', { min: 1, max: 8, int: true });
+    const depthPick = ['16', '24', '32f'].includes(p.depth) ? p.depth : null;
+    const keepMeta = p.meta !== false;
+    const infos = await Promise.all(files.map((x) => ctx.probe(x)));
+
+    const extra = new Set();
+    const lossySrc = new Set();
+    const depths = new Set();
+    const taken = new Map();
+    const outputs = [];
+    const steps = files.map((file, i) => {
+      const info = infos[i];
+      const a = info.audio;
+      if (!a) throw new UserError(`${base(file)} has no audio track`);
+      const dir = folder || path.dirname(file);
+      const name = path.parse(file).name;
+      let out = path.join(dir, name + fmt.ext);
+      if (files.some((x) => samePath(x, out))) out = path.join(dir, `${name}_converted${fmt.ext}`);
+      const id = process.platform === 'win32' ? out.toLowerCase() : out;
+      if (taken.has(id)) throw new UserError(`${base(taken.get(id))} and ${base(file)} would both be saved as ${base(out)} — convert them separately`);
+      taken.set(id, file);
+      outputs.push(out);
+
+      let depth = null;
+      if (fmt.lossless) {
+        depth = depthPick || sourceDepth(a);
+        if (!fmt.pcm && depth !== '16' && depth !== '24') {
+          extra.add(`${fmt.name} stores up to 24 bits, so ${depth === '32f' ? '32-bit float' : '32-bit'} audio is saved as 24-bit.`);
+          depth = '24';
+        }
+        depths.add(depth);
+      }
+      let ar = rate;
+      const want = rate || a.sampleRate;
+      if (fmt.rates && want && !fmt.rates.includes(want)) {
+        ar = nearest(fmt.rates, want);
+        extra.add(`${rate ? '⚠ ' : ''}${fmt.name} can't use ${khz(want)}, so ${rate ? 'it will use' : 'audio is resampled to'} ${khz(ar)}.`);
+      }
+      let ac = chans;
+      if (!ac && fmt.maxCh && a.channels > fmt.maxCh) {
+        ac = fmt.maxCh;
+        extra.add(`${fmt.name} holds at most ${fmt.maxCh === 2 ? 'stereo' : fmt.maxCh + ' channels'}, so ${a.channels}-channel audio is mixed down.`);
+      }
+      if (fmt.lossless && LOSSY_NAMES[a.codec]) lossySrc.add(LOSSY_NAMES[a.codec]);
+      let opts = p;
+      if (key === 'opus') {
+        const max = 256 * (ac || a.channels || 2);
+        if (parseInt(bitrate(p.abitrate, 192), 10) > max) {
+          opts = { ...p, abitrate: `${max}k` };
+          extra.add(`Opus allows at most 256 kbps per channel, so ${max} kbps is used.`);
+        }
+      }
+
+      const args = ['-i', file, '-map', '0:a:0'];
+      const cover = keepMeta && info.streams.find((s) => s.coverArt && ['mjpeg', 'png'].includes(s.codec));
+      if (cover && fmt.cover) args.push('-map', `0:${cover.index}`, '-c:v', 'copy', '-disposition:v', 'attached_pic');
+      else if (cover && key !== 'other') extra.add(`Cover art isn't copied to ${fmt.name} files (ffmpeg can't write it there).`);
+      if (key !== 'other') args.push(...convertEnc(key, opts, depth));
+      if (ar) args.push('-ar', String(ar));
+      if (ac) args.push('-ac', String(ac));
+      if (!keepMeta) args.push('-map_metadata', '-1');
+      args.push(out);
+      return { label: base(file), args, progress: byTime(info.duration), weight: (info.duration || 1) + 0.3, outputs: [out] };
+    });
+
+    let quality = null;
+    if (key === 'mp3') quality = /^v\d$/.test(p.mp3q || '') ? `VBR ${p.mp3q.toUpperCase()}` : `${parseInt(bitrate(p.mp3q, 192), 10)} kbps`;
+    else if (fmt.lossless) quality = depths.size === 1 ? { 16: '16-bit', 24: '24-bit', 32: '32-bit', '32f': '32-bit float' }[[...depths][0]] : 'same bit depth as source';
+    else if (key === 'ogg') quality = `VBR quality ${vorbisQ(p)} (≈${VORBIS_KBPS[vorbisQ(p)]} kbps)`;
+    else if (key !== 'other') quality = `${parseInt(bitrate(p.abitrate, 192), 10)} kbps`;
+    const target = [fmt.name, quality, rate && khz(rate), chans && (chans === 1 ? 'mono' : chans === 2 ? 'stereo' : `${chans} ch`)].filter(Boolean).join(' · ');
+    const N = files.length;
+    const a0 = infos[0].audio;
+    const src = N === 1 ? [a0.codec, a0.sampleRate && khz(a0.sampleRate), a0.channels === 1 ? 'mono' : a0.channels === 2 ? 'stereo' : `${a0.channels} ch`].filter(Boolean).join(' · ') : `${N} files`;
+    const notes = [
+      `${src} → ${target}`,
+      `Saved ${folder ? `in ${folder}` : `next to the original${N > 1 ? 's' : ''}`} as ${base(outputs[0])}${N > 1 ? ', …' : ''}`,
+      ...extra,
+    ];
+    if (lossySrc.size) notes.push(`${fmt.name} won't bring back detail the ${[...lossySrc].join('/')} encoding already lost, but nothing more is lost.`);
+    return {
+      title: N === 1 ? `Convert → ${base(outputs[0])}` : `Convert ${N} files → ${fmt.name}`,
+      inputs: files,
+      outputs,
+      mkdirs: folder ? [folder] : [],
+      notes,
+      steps,
+    };
+  },
+};
+
+const FADE_CURVES = new Set(['tri', 'qsin', 'hsin', 'esin', 'log', 'exp', 'cub', 'squ']);
+
+OPS.audiofade = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.audio) throw new UserError('This file has no audio track');
+    const out = outFile(p.output);
+    const r = range(p, info);
+    const D = r.D;
+    if (!D) throw new UserError("Can't read the duration — set an End time");
+    const fi = num(p.fadeIn, 'Fade in', { def: 0, min: 0 });
+    const fo = num(p.fadeOut, 'Fade out', { def: 0, min: 0 });
+    if (fi + fo > D + 1e-6) throw new UserError(`Fades (${f(fi + fo)}s) are longer than the clip (${fmtDur(D)})`);
+    const curve = FADE_CURVES.has(p.curve) ? p.curve : 'tri';
+    const gain = num(p.gain, 'Volume', { def: 0, min: -60, max: 40 });
+    const af = [];
+    // Normalize first so the fades aren't "corrected" by loudnorm afterwards.
+    if (p.normalize) af.push('loudnorm=I=-16:TP=-1.5:LRA=11', `aresample=${info.audio.sampleRate || 48000}`);
+    if (gain) af.push(`volume=${f(gain)}dB`);
+    if (fi) af.push(`afade=t=in:st=0:d=${f(fi)}:curve=${curve}`);
+    if (fo) af.push(`afade=t=out:st=${f(D - fo)}:d=${f(fo)}:curve=${curve}`);
+    const args = [...r.args, '-i', file, '-map', '0:a:0'];
+    if (af.length) args.push('-af', af.join(','));
+    args.push(...audioEncFor(out, p), out);
+    return {
+      title: `Fade/trim → ${base(out)}`,
+      inputs: [file],
+      outputs: [out],
+      notes: [`${fmtDur(r.S)} → ${fmtDur(r.S + D)} (${fmtDur(D)})`],
+      steps: [{ args, progress: byTime(D), outputs: [out] }],
+    };
+  },
+};
+
+OPS.loopaudio = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.audio) throw new UserError('This file has no audio track');
+    const L = info.duration;
+    if (!L) throw new UserError("Can't read the clip length");
+    const out = outFile(p.output);
+    const mode = p.mode || 'seamless';
+    const d = num(p.crossfade, 'Crossfade', { def: 1, min: 0.01 });
+    if (d * 2 >= L) throw new UserError(`Crossfade must be shorter than half the clip (${fmtDur(L / 2)})`);
+    const curve = p.curve === 'tri' ? 'tri' : 'qsin';
+    const loopLen = L - d;
+    // Seamless loop: drop the first d seconds and blend the tail into them, so end flows into start.
+    // (The file is opened twice: asplit + an early-ending atrim stalls the graph.)
+    const loopIn = ['-i', file, '-i', file];
+    const loopGraph =
+      `[0:a]atrim=start=${f(d)},asetpts=PTS-STARTPTS[body];` +
+      `[1:a]atrim=end=${f(d)},asetpts=PTS-STARTPTS[head];[body][head]acrossfade=d=${f(d)}:c1=${curve}:c2=${curve}`;
+
+    if (mode === 'seamless') {
+      const args = [...loopIn, '-filter_complex', loopGraph + '[out]', '-map', '[out]', ...audioEncFor(out, p), out];
+      return {
+        title: `Seamless loop → ${base(out)}`,
+        inputs: [file],
+        outputs: [out],
+        notes: [`Output is ${fmtDur(loopLen)} long; its last ${f(d)}s blend into its start, so it loops without a click.`],
+        steps: [{ args, progress: byTime(loopLen), outputs: [out] }],
+      };
+    }
+
+    const fi = num(p.fadeIn, 'Fade in', { def: 0, min: 0 });
+    const fo = num(p.fadeOut, 'Fade out', { def: mode === 'duration' ? 2 : 0, min: 0 });
+    let total;
+    let plays;
+    let tail;
+    if (mode === 'count') {
+      const N = num(p.count, 'Repeat count', { def: 4, min: 2, max: 100000, int: true });
+      total = N * L - (N - 1) * d;
+      plays = N - 1;
+      tail = true;
+    } else {
+      const T = time(p.duration, 'Target length');
+      if (!T) throw new UserError('Enter a target length (e.g. 3:00)');
+      total = T;
+      plays = Math.max(1, Math.ceil((T - d) / loopLen));
+      tail = false;
+    }
+    if (fi + fo > total) throw new UserError('Fades are longer than the output');
+    const loopWav = ctx.tmp('loop.wav');
+    // Step 2 = original intro + seamless loop repeated + (for counts) the natural ending.
+    const inputs = ['-i', file];
+    if (plays > 1) inputs.push('-stream_loop', String(plays - 1));
+    inputs.push('-i', loopWav);
+    if (tail) inputs.push('-ss', f(d), '-i', file);
+    const fmt = 'aformat=sample_fmts=fltp';
+    let g = `[0:a]atrim=end=${f(d)},asetpts=PTS-STARTPTS,${fmt}[i];[1:a]asetpts=PTS-STARTPTS,${fmt}[l];`;
+    g += tail ? `[2:a]asetpts=PTS-STARTPTS,${fmt}[t];[i][l][t]concat=n=3:v=0:a=1` : `[i][l]concat=n=2:v=0:a=1`;
+    const post = [];
+    if (!tail) post.push(`atrim=end=${f(total)}`);
+    if (fi) post.push(`afade=t=in:st=0:d=${f(fi)}`);
+    if (fo) post.push(`afade=t=out:st=${f(total - fo)}:d=${f(fo)}`);
+    g += (post.length ? ',' + post.join(',') : '') + '[out]';
+    return {
+      title: `Loop audio → ${base(out)}`,
+      inputs: [file],
+      outputs: [out],
+      notes: [`${fmtDur(L)} clip → ${fmtDur(total)}${tail ? ` (${plays + 1} plays)` : ''}, ${f(d)}s crossfade at each join`],
+      steps: [
+        { label: 'Building loop', args: [...loopIn, '-filter_complex', loopGraph + '[out]', '-map', '[out]', '-c:a', 'pcm_f32le', loopWav], progress: byTime(loopLen), weight: loopLen },
+        { label: 'Repeating', args: [...inputs, '-filter_complex', g, '-map', '[out]', ...audioEncFor(out, p), out], progress: byTime(total), weight: total * 0.6, outputs: [out] },
+      ],
+    };
+  },
+};
+
+/** The effect chain as a filter_complex graph ending in [aout]. */
+function fxGraph(p, info, dur, { tails }) {
+  try {
+    return FX.build(p.chain, { sr: info.audio.sampleRate || 48000, ch: info.audio.channels || 2, dur, tails, limiter: p.limiter !== false, input: '0:a:0' });
+  } catch (e) {
+    throw new UserError(e.message);
+  }
+}
+
+function fxNotes(fx, D) {
+  const notes = [`${fx.count} effect${fx.count === 1 ? '' : 's'}${fx.tail ? ` · ${f(+fx.tail.toFixed(2))}s added for reverb/echo tails` : ''}`];
+  if (D) notes[0] += ` · output ≈ ${fmtDur(D * fx.mult + fx.tail)}`;
+  return [...notes, ...fx.notes];
+}
+
+OPS.audiofx = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.audio) throw new UserError('This file has no audio track');
+    const out = outFile(p.output);
+    const r = range(p, info);
+    const asVideo = !!info.video && p.target === 'video';
+    const fx = fxGraph(p, info, r.D, { tails: !asVideo && p.tails !== false });
+    const args = [...r.args, '-i', file, '-filter_complex', fx.graph];
+    const notes = fxNotes(fx, r.D);
+    if (asVideo) {
+      if (['.mp3', '.wav', '.flac', '.m4a', '.ogg', '.opus', '.aac', '.aif', '.aiff'].includes(extOf(out))) throw new UserError('Saving as video needs a video file extension (.mp4, .mov, .mkv …)');
+      args.push('-map', '0:v:0', '-c:v', 'copy', '-map', '[aout]', ...videoAudioEnc(out, p.vabitrate), '-shortest', ...containerFlags(out), out);
+      notes.push('Video is copied without re-encoding; only the audio changes.');
+      if (r.S > 0) notes.push('⚠ With a start time and a copied video, the cut lands on the nearest keyframe, so audio and video can be slightly out of sync.');
+    } else {
+      args.push('-map', '[aout]', ...audioEncFor(out, p), out);
+    }
+    const D = r.D ? r.D * fx.mult + (asVideo ? 0 : fx.tail) : null;
+    return { title: `Effects → ${base(out)}`, inputs: [file], outputs: [out], notes, steps: [{ args, progress: byTime(D), outputs: [out] }] };
+  },
+};
+
+/** Renders a few seconds through the chain (plus the same seconds untouched) for listening in the browser. */
+OPS.audiofxPreview = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.audio) throw new UserError('This file has no audio track');
+    const total = info.duration;
+    let at = time(p.previewAt, 'Preview from');
+    if (at == null) at = time(p.start, 'Start') || 0;
+    if (total != null && at >= total) throw new UserError(`Preview start is past the end of the file (${fmtDur(total)})`);
+    const len = num(p.previewLen, 'Preview length', { def: 10, min: 0, max: 36000 });
+    const L = len > 0 ? (total != null ? Math.min(len, total - at) : len) : total != null ? total - at : null;
+    const fx = fxGraph(p, info, L, { tails: true });
+    const fxOut = ctx.previewFile('fx.wav');
+    const orig = ctx.previewFile('orig.wav');
+    ctx.prunePreviews();
+    const args = [];
+    if (at > 0) args.push('-ss', f(at));
+    if (len > 0) args.push('-t', f(len));
+    args.push('-i', file, '-filter_complex', fx.graph, '-map', '[aout]', '-c:a', 'pcm_s16le', fxOut, '-map', '0:a:0', '-c:a', 'pcm_s16le', orig);
+    return {
+      title: `Preview effects: ${base(file)}`,
+      inputs: [file],
+      outputs: [],
+      reveal: null,
+      steps: [{ args, progress: byTime(L ? L * fx.mult + fx.tail : null) }],
+      after: () => ({ fx: fxOut, orig, at, len: L }),
+    };
+  },
+};
+
+OPS.silenceAnalyze = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.audio) throw new UserError('This file has no audio track');
+    const thr = num(p.threshold, 'Silence threshold', { def: -40, min: -100, max: 0 });
+    const minSil = num(p.minSilence, 'Min silence length', { def: 0.3, min: 0.01, max: 600 });
+    const wave = ctx.waveFile();
+    const colors = Array(8).fill('0x6ea8fe').join('|');
+    const graph =
+      `[0:a]asplit=2[a][b];[a]silencedetect=noise=${f(thr)}dB:d=${f(minSil)}[s];` +
+      `[b]showwavespic=s=1600x240:split_channels=0:colors=${colors}:scale=sqrt:draw=full:filter=peak[w]`;
+    const args = ['-i', file, '-filter_complex', graph, '-map', '[s]', '-f', 'null', '-', '-map', '[w]', '-frames:v', '1', '-update', '1', wave];
+    const silences = [];
+    let cur = null;
+    return {
+      title: `Analyze silences: ${base(file)}`,
+      inputs: [file],
+      outputs: [],
+      reveal: null,
+      steps: [
+        {
+          args,
+          progress: byTime(info.duration),
+          onStderr(line) {
+            let m = line.match(/silence_start:\s*(-?[\d.]+)/);
+            if (m) return void (cur = Math.max(0, +m[1]));
+            m = line.match(/silence_end:\s*([\d.]+)/);
+            if (m) {
+              silences.push({ start: cur == null ? 0 : cur, end: +m[1] });
+              cur = null;
+            }
+          },
+        },
+      ],
+      after() {
+        if (cur != null) silences.push({ start: cur, end: info.duration });
+        return { file, duration: info.duration, silences, waveform: wave, threshold: thr, minSilence: minSil };
+      },
+    };
+  },
+};
+
+OPS.silenceExport = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    const info = await ctx.probe(file);
+    if (!info.audio) throw new UserError('This file has no audio track');
+    const segs = Array.isArray(p.segments) ? p.segments : [];
+    if (!segs.length) throw new UserError('Click "Find sounds" and keep at least one sound selected');
+    const folder = outDir(p.folder);
+    const ext = { mp3: '.mp3', wav: '.wav', wav24: '.wav', flac: '.flac', m4a: '.m4a', opus: '.ogg' }[p.format || 'wav'] || '.wav';
+    const prefix = safeName(blank(p.prefix) ? path.parse(file).name + '_' : p.prefix);
+    const fadeMs = num(p.fadeMs, 'Edge fade', { def: 5, min: 0, max: 10000 });
+    const digits = Math.max(3, String(segs.length).length);
+    const outputs = [];
+    const steps = segs.map((s, i) => {
+      const st = Number(s.start);
+      const en = Number(s.end);
+      if (!(en > st) || st < 0) throw new UserError(`Sound ${i + 1} has an invalid range`);
+      const len = en - st;
+      const out = path.join(folder, `${prefix}${String(i + 1).padStart(digits, '0')}${ext}`);
+      outputs.push(out);
+      const fd = Math.min(fadeMs / 1000, len / 2);
+      const af = fd > 0 ? ['-af', `afade=t=in:st=0:d=${f(fd)},afade=t=out:st=${f(len - fd)}:d=${f(fd)}`] : [];
+      return {
+        label: base(out),
+        args: ['-ss', f(st), '-t', f(len), '-i', file, '-map', '0:a:0', ...af, ...audioEncFor(out, p), out],
+        progress: byTime(len),
+        weight: len + 0.3,
+        outputs: [out],
+      };
+    });
+    return {
+      title: `Export ${segs.length} sound${segs.length === 1 ? '' : 's'} from ${base(file)}`,
+      inputs: [file],
+      outputs,
+      reveal: outputs[0],
+      notes: [`${segs.length} files → ${path.join(folder, `${prefix}${'0'.repeat(digits - 1)}1${ext}`)} …`],
+      steps,
+    };
+  },
+};
+
+OPS.anim = {
+  async build(p, ctx) {
+    const vin = await visualInput(p, ctx);
+    const out = outFile(p.output);
+    const ext = extOf(out);
+    if (ext !== '.gif' && ext !== '.webp') throw new UserError('Output must be .gif or .webp');
+    const fps = blank(p.fps) ? null : num(p.fps, 'Frame rate', { min: 1, max: 100 });
+    const width = blank(p.width) ? null : num(p.width, 'Width', { min: 8, max: 8192, int: true });
+    const once = p.loop === 'once';
+    const pingpong = !!p.pingpong;
+    const D = vin.duration;
+    const Dout = D ? D * (pingpong ? 2 : 1) : null;
+    const pre = [];
+    if (fps) pre.push(`fps=${f(fps)}`);
+    if (width) pre.push(`scale=${width}:-2:flags=lanczos`);
+    pre.push('showinfo');
+    let g = `[0:v]${pre.join(',')}`;
+    if (pingpong) g += ',split[fw][rv0];[rv0]reverse[rv];[fw][rv]concat=n=2:v=1:a=0';
+    const notes = [];
+    let args;
+    let progress;
+    if (ext === '.gif') {
+      const colors = num(p.colors, 'Colors', { def: 256, min: 2, max: 256, int: true });
+      const stats = p.statsMode === 'diff' ? 'diff' : 'full';
+      const dither = { sierra: 'dither=sierra2_4a', bayer: 'dither=bayer:bayer_scale=3', floyd: 'dither=floyd_steinberg', none: 'dither=none' }[p.dither] || 'dither=sierra2_4a';
+      g += `,split[pa][pb];[pa]palettegen=max_colors=${colors}:stats_mode=${stats}[pal];[pb][pal]paletteuse=${dither}${stats === 'diff' ? ':diff_mode=rectangle' : ''}[out]`;
+      args = [...vin.args, '-filter_complex', g, '-map', '[out]', '-loop', once ? '-1' : '0', out];
+      // The palette needs every frame first, so track reading (showinfo) then writing.
+      progress = (s) => (D ? 0.5 * Math.min(1, s.infoTime / D) + 0.5 * Math.min(1, s.outTime / Dout) : null);
+      notes.push('Two-step palette (palettegen → paletteuse) for clean colors.');
+    } else {
+      const lossless = !!p.lossless;
+      const q = num(p.quality, 'Quality', { def: 80, min: 0, max: 100, int: true });
+      const keepAlpha = p.alpha !== false && vin.hasAlpha;
+      g += `,format=${lossless ? 'bgra' : keepAlpha ? 'yuva420p' : 'yuv420p'}[out]`;
+      args = [...vin.args, '-filter_complex', g, '-map', '[out]', '-c:v', 'libwebp_anim', '-lossless', lossless ? '1' : '0', '-quality', String(q), '-compression_level', '4', '-loop', once ? '1' : '0', '-an', out];
+      progress = byTime(Dout);
+    }
+    const fpsLabel = fps ? f(fps) : vin.fps ? String(+vin.fps.toFixed(3)) : 'source';
+    if (Dout) notes.unshift(`${fmtDur(Dout)} at ${fpsLabel} fps${width ? `, ${width}px wide` : ''}`);
+    return { title: `${ext === '.gif' ? 'GIF' : 'WebP'} → ${base(out)}`, inputs: [vin.file], outputs: [out], notes, steps: [{ args, progress, outputs: [out] }] };
+  },
+};
+
+OPS.sprite = {
+  async build(p, ctx) {
+    const vin = await visualInput(p, ctx);
+    const out = outFile(p.output);
+    if (!['.png', '.webp'].includes(extOf(out))) throw new UserError('Output must be .png (or .webp)');
+    const cols = num(p.cols, 'Columns', { def: 8, min: 1, max: 256, int: true });
+    const rows = num(p.rows, 'Rows', { def: 8, min: 1, max: 256, int: true });
+    const k = cols * rows;
+    const pad = num(p.padding, 'Spacing', { def: 0, min: 0, max: 1024, int: true });
+    const W = blank(p.sheetWidth) ? null : num(p.sheetWidth, 'Sheet width', { min: 1, max: 32768, int: true });
+    const H = blank(p.sheetHeight) ? null : num(p.sheetHeight, 'Sheet height', { min: 1, max: 32768, int: true });
+    const srcW = vin.width;
+    const srcH = vin.height;
+    if (!srcW || !srcH) throw new UserError("Can't read the input's dimensions");
+    let cw = W ? Math.floor((W - (cols - 1) * pad) / cols) : null;
+    let ch = H ? Math.floor((H - (rows - 1) * pad) / rows) : null;
+    if (cw && !ch) ch = Math.max(1, Math.round((cw * srcH) / srcW));
+    if (ch && !cw) cw = Math.max(1, Math.round((ch * srcW) / srcH));
+    if (!cw && !ch) {
+      cw = srcW;
+      ch = srcH;
+    }
+    if (cw < 1 || ch < 1) throw new UserError('Sheet is too small for that many cells and spacing');
+    const sheetW = cols * cw + (cols - 1) * pad;
+    const sheetH = rows * ch + (rows - 1) * pad;
+    const finalW = W || sheetW;
+    const finalH = H || sheetH;
+    if (finalW * finalH > 400e6) throw new UserError('That sheet would be enormous — lower the resolution');
+    const bg = p.transparent === false ? hexColor(p.bgColor) + 'ff' : '0x00000000';
+    const spread = p.pick !== 'consecutive';
+    const vf = [];
+    if (spread) {
+      if (!vin.duration) throw new UserError("Can't read the duration to spread frames — use 'Consecutive frames'");
+      vf.push(`fps=${(k / vin.duration).toFixed(6)}`);
+    }
+    if (p.chroma) {
+      const sim = num(p.keySimilarity, 'Key similarity', { def: 0.3, min: 0.01, max: 1 });
+      vf.push(`colorkey=${hexColor(p.keyColor, '00ff00')}:${f(sim)}:0.1`);
+    }
+    vf.push('format=rgba');
+    const fit = p.fit || 'fit';
+    if (fit === 'fill') vf.push(`scale=${cw}:${ch}:force_original_aspect_ratio=increase:flags=lanczos`, `crop=${cw}:${ch}`);
+    else if (fit === 'stretch') vf.push(`scale=${cw}:${ch}:flags=lanczos`);
+    else vf.push(`scale=${cw}:${ch}:force_original_aspect_ratio=decrease:flags=lanczos`, `pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2:color=${bg}`);
+    vf.push('setsar=1', 'showinfo', `tile=${cols}x${rows}:padding=${pad}:color=${bg}`);
+    if (finalW !== sheetW || finalH !== sheetH) vf.push(`pad=${finalW}:${finalH}:0:0:color=${bg}`);
+    const args = [...vin.args, '-vf', vf.join(','), '-frames:v', '1', '-update', '1'];
+    if (extOf(out) === '.webp') args.push('-c:v', 'libwebp', '-lossless', '1');
+    args.push(out);
+
+    const avail = vin.frames;
+    const notes = [
+      `${cols}×${rows} = ${k} cells of ${cw}×${ch}px → sheet ${finalW}×${finalH}px`,
+      spread
+        ? `Frames sampled every ${f(vin.duration / k)}s across ${fmtDur(vin.duration)}${avail ? ` (${avail} frames available)` : ''}`
+        : `First ${k} consecutive frames${avail != null && avail < k ? ` — only ${avail} available, the rest stay empty` : ''}`,
+    ];
+    if (spread && avail != null && avail < k) notes.push(`Only ${avail} source frames for ${k} cells, so some frames repeat.`);
+    const jsonPath = p.json ? out.replace(/\.[^.\\/]+$/, '.json') : null;
+    const outputs = jsonPath ? [out, jsonPath] : [out];
+    return {
+      title: `Sprite sheet → ${base(out)}`,
+      inputs: [vin.file],
+      outputs,
+      notes,
+      steps: [{ args, progress: (s) => s.infoCount / k, outputs: [out] }],
+      async after(job, st) {
+        if (!jsonPath) return null;
+        const frames = Math.min(k, (st && st.infoCount) || k);
+        const meta = {
+          image: base(out),
+          width: finalW,
+          height: finalH,
+          columns: cols,
+          rows,
+          frames,
+          frameWidth: cw,
+          frameHeight: ch,
+          padding: pad,
+          fps: spread ? +(k / vin.duration).toFixed(4) : vin.fps ? +vin.fps.toFixed(4) : null,
+          frameRects: Array.from({ length: frames }, (_, i) => ({ x: (i % cols) * (cw + pad), y: Math.floor(i / cols) * (ch + pad), w: cw, h: ch })),
+        };
+        await fs.promises.writeFile(jsonPath, JSON.stringify(meta, null, 2));
+        return null;
+      },
+    };
+  },
+};
+
+OPS.frames = {
+  async build(p, ctx) {
+    const file = inFile(p.input);
+    if (isImagePath(file)) throw new UserError('Pick a video file');
+    const vin = await visualInput(p, ctx);
+    const folder = outDir(p.folder);
+    const fmt = ['png', 'jpg', 'webp'].includes(p.format) ? p.format : 'png';
+    const fps = blank(p.fps) ? null : num(p.fps, 'Frame rate', { min: 0.001, max: 240 });
+    const width = blank(p.width) ? null : num(p.width, 'Width', { min: 2, max: 16384, int: true });
+    const q = num(p.quality, 'Quality', { def: 92, min: 1, max: 100, int: true });
+    const prefix = safeName(blank(p.prefix) ? path.parse(file).name + '_' : p.prefix);
+    const vf = [];
+    if (fps) vf.push(`fps=${f(fps)}`);
+    if (width) vf.push(`scale=${width}:-1:flags=lanczos`);
+    const args = [...vin.args];
+    if (vf.length) args.push('-vf', vf.join(','));
+    if (!fps) args.push('-fps_mode', 'passthrough');
+    if (fmt === 'jpg') args.push('-q:v', String(Math.max(1, Math.round(2 + ((100 - q) * 29) / 100))));
+    if (fmt === 'webp') args.push('-c:v', 'libwebp', '-quality', String(q));
+    const pattern = path.join(folder, prefix.replace(/%/g, '%%') + `%05d.${fmt}`);
+    args.push('-start_number', '1', pattern);
+    const count = fps && vin.duration ? Math.round(vin.duration * fps) : vin.frames;
+    return {
+      title: `Frames → ${base(folder)}${path.sep}`,
+      inputs: [file],
+      outputs: [],
+      reveal: path.join(folder, `${prefix}00001.${fmt}`),
+      checkExists: [path.join(folder, `${prefix}00001.${fmt}`)],
+      mkdirs: [folder],
+      notes: [`≈${count || '?'} images → ${base(pattern)}`],
+      steps: [{ args, progress: byTime(vin.duration) }],
+    };
+  },
+};
+
+// ---------------------------------------------------------------- batch image conversion
+
+/** Output formats. alpha: the format can keep transparency. */
+const IMG_OUT = {
+  jpg: { name: 'JPG', ext: '.jpg', alpha: false },
+  png: { name: 'PNG', ext: '.png', alpha: true },
+  webp: { name: 'WebP', ext: '.webp', alpha: true },
+  tiff: { name: 'TIFF', ext: '.tif', alpha: true },
+  bmp: { name: 'BMP', ext: '.bmp', alpha: false },
+};
+/** "Which files" choices when converting a whole folder. */
+const IMG_IN = {
+  png: { name: 'PNG', exts: ['.png'] },
+  jpg: { name: 'JPG', exts: ['.jpg', '.jpeg'] },
+  webp: { name: 'WebP', exts: ['.webp'] },
+  tif: { name: 'TIFF', exts: ['.tif', '.tiff'] },
+  bmp: { name: 'BMP', exts: ['.bmp'] },
+  tga: { name: 'TGA', exts: ['.tga'] },
+  exr: { name: 'EXR', exts: ['.exr'] },
+  all: { name: 'image', exts: [...IMAGE_EXT] },
+};
+/** Inputs that may have transparency, which gets flattened onto the background for JPG/BMP. */
+const ALPHA_EXT = new Set(['.png', '.webp', '.tif', '.tiff', '.tga', '.exr', '.jxl']);
+const MAX_IMAGES = 20000;
+/** Images are quick, so ffmpeg's start-up dominates: run several at once. */
+const IMG_PARALLEL = Math.max(1, Math.min(6, os.cpus().length - 1));
+const SWS = 'flags=lanczos+accurate_rnd+full_chroma_int';
+const ANCHORS = { center: ['(iw-ow)/2', '(ih-oh)/2'], top: ['(iw-ow)/2', '0'], bottom: ['(iw-ow)/2', 'ih-oh'], left: ['0', '(ih-oh)/2'], right: ['iw-ow', '(ih-oh)/2'] };
+const natural = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+/** 1–100 quality → MJPEG -q:v (1 best … 31 worst). */
+const jpegQscale = (q) => Math.min(31, Math.max(1, Math.round(1 + ((100 - q) * 30) / 99)));
+const pathKey = (p) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+
+async function listImages(dir, exts, { recursive, skip }) {
+  const st = await fs.promises.stat(dir).catch(() => null);
+  if (!st || !st.isDirectory()) throw new UserError(`Folder not found: ${dir}`);
+  const found = [];
+  const walk = async (d) => {
+    const entries = await fs.promises.readdir(d, { withFileTypes: true }).catch(() => []);
+    entries.sort((a, b) => natural(a.name, b.name));
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        // Don't descend into the output folder, or a second run would convert the first run's results.
+        if (recursive && !(skip && pathKey(p) === pathKey(skip))) await walk(p);
+      } else if (e.isFile() && exts.includes(extOf(e.name))) {
+        found.push(p);
+        if (found.length > MAX_IMAGES) throw new UserError(`That's more than ${MAX_IMAGES} images — convert them in smaller batches`);
+      }
+    }
+  };
+  await walk(dir);
+  return found;
+}
+
+/** Encoder args for one output format, plus a description for the notes. */
+function imageEnc(key, p) {
+  switch (key) {
+    case 'jpg': {
+      const q = num(p.quality, 'Quality', { def: 90, min: 1, max: 100, int: true });
+      const qs = jpegQscale(q);
+      const full = p.chroma === '444';
+      return { pix: full ? 'yuvj444p' : 'yuvj420p', args: ['-c:v', 'mjpeg', '-q:v', String(qs), '-qmin', '1'], desc: `quality ${q} (-q:v ${qs})${full ? ' · full color detail (4:4:4)' : ''}` };
+    }
+    case 'png': {
+      const level = { small: ['-compression_level', '9', '-pred', 'mixed'], balanced: ['-pred', 'mixed'], fast: ['-compression_level', '1'] }[p.pngLevel] || ['-compression_level', '9', '-pred', 'mixed'];
+      return { args: ['-c:v', 'png', ...level], desc: { balanced: 'balanced compression', fast: 'fast compression' }[p.pngLevel] || 'smallest file (lossless)' };
+    }
+    case 'webp': {
+      if (p.lossless) return { args: ['-c:v', 'libwebp', '-lossless', '1', '-quality', '75'], desc: 'lossless' };
+      const q = num(p.quality, 'Quality', { def: 90, min: 0, max: 100, int: true });
+      return { args: ['-c:v', 'libwebp', '-lossless', '0', '-quality', String(q)], desc: `quality ${q}` };
+    }
+    case 'tiff': {
+      const algo = ['lzw', 'deflate', 'packbits', 'raw'].includes(p.tiffComp) ? p.tiffComp : 'lzw';
+      return { args: ['-c:v', 'tiff', '-compression_algo', algo], desc: algo === 'raw' ? 'uncompressed' : `${algo.toUpperCase()} compression` };
+    }
+    case 'bmp':
+      return { pix: 'bgr24', args: ['-c:v', 'bmp'], desc: '24-bit' };
+  }
+}
+
+/** Resize filters: fit inside a box (keeping the aspect ratio), stretch to it, or fill it and crop. */
+function imageResize(p, padColor) {
+  const mode = ['fit', 'stretch', 'crop'].includes(p.resize) ? p.resize : 'none';
+  if (mode === 'none') return { filters: [], desc: null };
+  const W = blank(p.width) ? null : num(p.width, 'Width', { min: 1, max: 32768, int: true });
+  const H = blank(p.height) ? null : num(p.height, 'Height', { min: 1, max: 32768, int: true });
+  if (mode === 'fit') {
+    if (!W && !H) throw new UserError('Enter a width, a height, or both');
+    const pad = !!p.pad;
+    if (pad && !(W && H)) throw new UserError('Padding to an exact size needs both a width and a height');
+    // 'min(W,iw)' caps the box at the image's own size, so small images stay as they are.
+    const cap = (v, own) => (p.noUpscale ? `'min(${v},${own})'` : String(v));
+    const filters = [
+      W && H
+        ? `scale=${cap(W, 'iw')}:${cap(H, 'ih')}:force_original_aspect_ratio=decrease:${SWS}`
+        : W
+          ? `scale=${cap(W, 'iw')}:-1:${SWS}`
+          : `scale=-1:${cap(H, 'ih')}:${SWS}`,
+    ];
+    if (pad) filters.push(...padColor.pre, `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${padColor.color}`);
+    const box = W && H ? `${W}×${H}` : W ? `${W}px wide` : `${H}px tall`;
+    return {
+      filters,
+      desc: `Fit inside ${box}, keeping the aspect ratio${pad ? `, padded to exactly ${W}×${H} with ${padColor.label} bars` : ''}${p.noUpscale ? ' · smaller images are left at their size' : ''}`,
+    };
+  }
+  if (!W || !H) throw new UserError(`${mode === 'crop' ? 'Cropping' : 'Stretching'} to a size needs both a width and a height`);
+  if (mode === 'stretch') return { filters: [`scale=${W}:${H}:${SWS}`], desc: `Stretched to exactly ${W}×${H} (the aspect ratio can change)` };
+  const anchor = ANCHORS[p.anchor] ? p.anchor : 'center';
+  const [x, y] = ANCHORS[anchor];
+  return {
+    filters: [`scale=${W}:${H}:force_original_aspect_ratio=increase:${SWS}`, `crop=${W}:${H}:${x}:${y}`],
+    desc: `Scaled to fill ${W}×${H}, then cropped${anchor === 'center' ? ' around the center' : ` from the ${anchor}`}`,
+  };
+}
+
+OPS.imageconvert = {
+  async build(p) {
+    const fmtKey = IMG_OUT[p.format] ? p.format : 'jpg';
+    const fmt = IMG_OUT[fmtKey];
+    const folder = blank(p.folder) ? null : outDir(p.folder);
+    let files;
+    let srcDir = null;
+    let srcDesc;
+    if (p.source === 'files') {
+      files = (Array.isArray(p.files) ? p.files : []).map(cleanPath).filter(Boolean);
+      if (!files.length) throw new UserError('Add one or more images');
+      const seen = new Set();
+      for (const x of files) {
+        if (seen.has(pathKey(x))) throw new UserError(`${base(x)} is in the list twice`);
+        seen.add(pathKey(x));
+        if (!fs.existsSync(x)) throw new UserError(`File not found: ${x}`);
+      }
+      srcDesc = files.length === 1 ? base(files[0]) : `${files.length} images`;
+    } else {
+      srcDir = cleanPath(p.inFolder);
+      if (!srcDir) throw new UserError('Choose a folder of images');
+      if (!path.isAbsolute(srcDir)) throw new UserError('Source folder must be a full path (e.g. C:\\images)');
+      srcDir = path.resolve(srcDir);
+      const kind = IMG_IN[p.inTypes] || IMG_IN.png;
+      const recursive = !!p.recursive;
+      files = await listImages(srcDir, kind.exts, { recursive, skip: folder });
+      const where = `${srcDir}${recursive ? ' (and its subfolders)' : ''}`;
+      if (!files.length) throw new UserError(`No ${kind.name} files in ${where}${recursive ? '' : ' — tick "Include subfolders" if they are further down'}`);
+      srcDesc = `${files.length} ${kind.name} file${files.length === 1 ? '' : 's'} in ${where}`;
+    }
+
+    const enc = imageEnc(fmtKey, p);
+    // Formats without transparency (or with "keep transparency" off) get flattened onto the background color.
+    const opaque = !fmt.alpha || p.keepAlpha === false;
+    const bgHex = /^#?[0-9a-f]{6}$/i.test(p.bg || '') ? p.bg.replace('#', '').toLowerCase() : 'ffffff';
+    const [R, G, B] = [0, 2, 4].map((i) => parseInt(bgHex.slice(i, i + 2), 16));
+    const flatten = `format=rgba,split[fg][b0];[b0]lutrgb=r=${R}:g=${G}:b=${B}:a=255[bg];[bg][fg]overlay=format=auto`;
+    const padColor = opaque ? { pre: [], color: `0x${bgHex}`, label: `#${bgHex}` } : { pre: ['format=rgba'], color: '0x00000000', label: 'transparent' };
+    const resize = imageResize(p, padColor);
+    const suffix = safeName(String(p.suffix ?? '').trim());
+
+    const inputKeys = new Set(files.map(pathKey));
+    const taken = new Set();
+    let renamed = 0;
+    let flattened = 0;
+    const outputs = [];
+    const steps = files.map((file) => {
+      const rel = srcDir && folder ? path.relative(srcDir, path.dirname(file)) : '';
+      const dir = folder ? path.join(folder, rel) : path.dirname(file);
+      const name = path.parse(file).name + suffix;
+      let out = path.join(dir, name + fmt.ext);
+      if (inputKeys.has(pathKey(out))) out = path.join(dir, `${name}_converted${fmt.ext}`);
+      if (taken.has(pathKey(out)) || inputKeys.has(pathKey(out))) {
+        // e.g. photo.png and photo.webp both becoming photo.jpg
+        renamed++;
+        let n = 2;
+        while (taken.has(pathKey(out)) || inputKeys.has(pathKey(out))) out = path.join(dir, `${name}_${n++}${fmt.ext}`);
+      }
+      taken.add(pathKey(out));
+      outputs.push(out);
+
+      const ext = extOf(file);
+      const args = [];
+      if (ext === '.exr') args.push('-apply_trc', 'iec61966_2_1'); // linear EXR -> sRGB
+      // A % in the name would be read as a sequence pattern by the image2 reader.
+      if (file.includes('%')) args.push('-f', 'image2', '-pattern_type', 'none');
+      args.push('-i', file);
+      const vf = [];
+      const flat = opaque && ALPHA_EXT.has(ext);
+      if (flat) {
+        vf.push(flatten);
+        flattened++;
+      }
+      vf.push(...resize.filters, 'setsar=1'); // square pixels, or viewers "undo" a stretch
+      if (enc.pix) vf.push(`format=${enc.pix}`);
+      else if (flat) vf.push('format=rgb24'); // drop the alpha channel, which is now solid
+      args.push('-vf', vf.join(','), ...enc.args, '-frames:v', '1', '-update', '1', out);
+      return { label: base(file), args, progress: () => 0, outputs: [out] };
+    });
+
+    const N = files.length;
+    const notes = [`${srcDesc} → ${fmt.name} · ${enc.desc}`];
+    if (resize.desc) notes.push(resize.desc);
+    if (flattened) notes.push(`Transparent areas are filled with #${bgHex}${fmt.alpha ? '' : ` (${fmt.name} can't store transparency)`}.`);
+    notes.push(`Saved ${folder ? `in ${folder}${srcDir && p.recursive ? ' (subfolders kept)' : ''}` : `next to the original${N > 1 ? 's' : ''}`} as ${base(outputs[0])}${N > 1 ? ', …' : ''}`);
+    if (renamed) notes.push(`⚠ ${renamed} file${renamed === 1 ? '' : 's'} would have had the same name as another, so ${renamed === 1 ? 'it gets' : 'they get'} _2, _3 … added.`);
+    if (N > 1 && IMG_PARALLEL > 1) notes.push(`Converts ${IMG_PARALLEL} images at a time; one bad file doesn't stop the rest.`);
+    return {
+      title: N === 1 ? `Convert → ${base(outputs[0])}` : `Convert ${N} images → ${fmt.name}`,
+      inputs: files,
+      outputs,
+      notes,
+      steps,
+      parallel: IMG_PARALLEL,
+      keepGoing: N > 1,
+    };
+  },
+};
+
+OPS.concat = {
+  async build(p, ctx) {
+    const files = (Array.isArray(p.files) ? p.files : []).map(cleanPath).filter(Boolean);
+    if (files.length < 2) throw new UserError('Add at least two files');
+    const infos = await Promise.all(files.map((x) => ctx.probe(x)));
+    const out = outFile(p.output);
+    const audioOnly = infos.every((i) => !i.video);
+    const durs = infos.map((i) => i.duration || 0);
+    const sum = durs.reduce((a, b) => a + b, 0);
+    const N = files.length;
+    const title = `Concat ${N} files → ${base(out)}`;
+
+    if (p.mode !== 'reencode') {
+      const esc = (x) => x.replace(/\\/g, '/').replace(/'/g, "'\\''");
+      const list = ctx.tmp('concat.txt', files.map((x) => `file '${esc(x)}'`).join('\n') + '\n');
+      const sig = (i) =>
+        [i.video && `${i.video.codec} ${i.video.width}x${i.video.height}`, i.audio && `${i.audio.codec} ${i.audio.sampleRate} ${i.audio.channels}ch`].filter(Boolean).join(' · ');
+      const sigs = new Set(infos.map(sig));
+      const notes = [`Total ${fmtDur(sum)} · stream copy (no re-encode)`];
+      if (sigs.size > 1) notes.push(`⚠ Files differ (${[...sigs].join(' | ')}) — if the result glitches, use Re-encode.`);
+      const args = ['-f', 'concat', '-safe', '0', '-i', list, ...(audioOnly ? ['-map', '0:a'] : []), '-c', 'copy', ...containerFlags(out), out];
+      return { title, inputs: files, outputs: [out], notes, steps: [{ args, progress: byTime(sum), outputs: [out] }] };
+    }
+
+    const inputs = files.flatMap((x, i) => [...decoderArgs(infos[i]), '-i', x]);
+    if (audioOnly) {
+      const first = infos[0].audio || {};
+      const sr = first.sampleRate || 44100;
+      const layout = first.channels === 1 ? 'mono' : 'stereo';
+      const xf = num(p.crossfade, 'Crossfade', { def: 0, min: 0, max: 60 });
+      const parts = infos.map((i, n) => {
+        if (!i.audio) throw new UserError(`${base(files[n])} has no audio`);
+        return `[${n}:a]aformat=sample_fmts=fltp:sample_rates=${sr}:channel_layouts=${layout}[a${n}]`;
+      });
+      if (xf > 0) {
+        durs.forEach((d, n) => {
+          if (d && d <= xf) throw new UserError(`${base(files[n])} is shorter than the crossfade`);
+        });
+        let prev = 'a0';
+        for (let n = 1; n < N; n++) {
+          const next = n === N - 1 ? 'out' : `x${n}`;
+          parts.push(`[${prev}][a${n}]acrossfade=d=${f(xf)}:c1=qsin:c2=qsin[${next}]`);
+          prev = next;
+        }
+      } else {
+        parts.push(`${infos.map((_, n) => `[a${n}]`).join('')}concat=n=${N}:v=0:a=1[out]`);
+      }
+      const total = sum - (N - 1) * xf;
+      const args = [...inputs, '-filter_complex', parts.join(';'), '-map', '[out]', ...audioEncFor(out, p), out];
+      return { title, inputs: files, outputs: [out], notes: [`Total ${fmtDur(total)}${xf ? `, ${f(xf)}s crossfades` : ''}`], steps: [{ args, progress: byTime(total), outputs: [out] }] };
+    }
+
+    infos.forEach((i, n) => {
+      if (!i.video) throw new UserError(`${base(files[n])} has no video — all files need video when joining videos`);
+    });
+    vcodecOf(p, out);
+    const fv = infos[0].video;
+    let W = blank(p.width) ? null : num(p.width, 'Width', { min: 16, max: 16384, int: true });
+    let H = blank(p.height) ? null : num(p.height, 'Height', { min: 16, max: 16384, int: true });
+    if (W && !H) H = Math.round((W * fv.height) / fv.width);
+    if (H && !W) W = Math.round((H * fv.width) / fv.height);
+    W = (W || fv.width) & ~1;
+    H = (H || fv.height) & ~1;
+    const F = blank(p.fps) ? Math.round((fv.fps || 30) * 1000) / 1000 : num(p.fps, 'Frame rate', { min: 1, max: 240 });
+    const anyAudio = infos.some((i) => i.audio);
+    const parts = [];
+    let labels = '';
+    infos.forEach((info, n) => {
+      parts.push(`[${n}:v]scale=${W}:${H}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${f(F)}[v${n}]`);
+      if (anyAudio) {
+        parts.push(
+          info.audio
+            ? `[${n}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${n}]`
+            : `anullsrc=r=48000:cl=stereo,atrim=duration=${f(info.duration || 0)}[a${n}]`
+        );
+      }
+      labels += `[v${n}]` + (anyAudio ? `[a${n}]` : '');
+    });
+    parts.push(`${labels}concat=n=${N}:v=1:a=${anyAudio ? 1 : 0}[v]${anyAudio ? '[a]' : ''}`);
+    const args = [...inputs, '-filter_complex', parts.join(';'), '-map', '[v]'];
+    if (anyAudio) args.push('-map', '[a]');
+    args.push(...videoEnc(p));
+    if (anyAudio) args.push(...videoAudioEnc(out, p.abitrate));
+    args.push(...containerFlags(out), out);
+    return {
+      title,
+      inputs: files,
+      outputs: [out],
+      notes: [`Total ${fmtDur(sum)} · ${W}×${H} @ ${f(F)} fps (letterboxed where sizes differ)`],
+      steps: [{ args, progress: byTime(sum), outputs: [out] }],
+    };
+  },
+};
+
+// ---------------------------------------------------------------- plan building
+
+const GLOBAL_ARGS = ['-hide_banner', '-y'];
+
+function quoteArg(a) {
+  a = String(a);
+  return a === '' || /[\s"&|<>^;,()'[\]]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
+}
+const commandString = (args) => ['ffmpeg', ...GLOBAL_ARGS, ...args].map(quoteArg).join(' ');
+
+const samePath = (a, b) =>
+  process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
+
+async function buildPlan(op, params, { tmpRoot }) {
+  const def = OPS[op];
+  if (!def) throw new UserError(`Unknown operation "${op}"`);
+  const id = crypto.randomBytes(5).toString('hex');
+  const tmpDir = path.join(tmpRoot, `job-${id}`);
+  const files = [];
+  const dirs = new Set();
+  const ctx = {
+    probe,
+    sequence: detectSequence,
+    tmp(name, content) {
+      const p = path.join(tmpDir, name);
+      dirs.add(tmpDir);
+      if (content !== undefined) files.push({ path: p, content });
+      return p;
+    },
+    waveFile() {
+      dirs.add(path.join(tmpRoot, 'waves'));
+      return path.join(tmpRoot, 'waves', `${id}.png`);
+    },
+    previewFile(name) {
+      dirs.add(path.join(tmpRoot, 'previews'));
+      return path.join(tmpRoot, 'previews', `${id}-${name}`);
+    },
+    /** Effect previews pile up while tweaking; drop the ones nobody is listening to any more. */
+    prunePreviews() {
+      const dir = path.join(tmpRoot, 'previews');
+      fs.promises
+        .readdir(dir)
+        .then((names) =>
+          Promise.all(
+            names.map(async (n) => {
+              const p = path.join(dir, n);
+              const st = await fs.promises.stat(p);
+              if (Date.now() - st.mtimeMs > 20 * 60 * 1000) await fs.promises.rm(p, { force: true });
+            })
+          )
+        )
+        .catch(() => {});
+    },
+  };
+  const plan = await def.build(params || {}, ctx);
+  plan.inputs = plan.inputs || [];
+  plan.outputs = plan.outputs || [];
+  plan.mkdirs = [...(plan.mkdirs || []), ...dirs];
+  const inputKeys = new Set(plan.inputs.map(pathKey)); // a Set, since batches can hold thousands of files
+  for (const o of plan.outputs) {
+    if (inputKeys.has(pathKey(o))) throw new UserError('The output would overwrite an input file — pick a different output name');
+  }
+  plan.files = files;
+  plan.tmpDir = tmpDir;
+  plan.commands = plan.steps.map((s) => commandString(s.args));
+  if (plan.reveal === undefined) plan.reveal = plan.outputs[0] || null;
+  return plan;
+}
+
+module.exports = { OPS, buildPlan, GLOBAL_ARGS, UserError };

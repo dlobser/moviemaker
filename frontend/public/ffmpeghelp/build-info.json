@@ -1,0 +1,5 @@
+{
+  "builtAt": "2026-11-18T20:54:36.807Z",
+  "core": "0.12.10",
+  "note": "Built by ffmpeg-helper/scripts/build-web.js; the whole folder is replaced on each build."
+}
